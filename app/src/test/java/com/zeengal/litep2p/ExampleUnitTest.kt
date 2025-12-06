@@ -1,4 +1,4 @@
-package com.example.Libp2p
+package com.zeengal.litep2p
 
 import org.junit.Test
 

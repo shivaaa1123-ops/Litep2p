@@ -1,38 +1,35 @@
+cmake_minimum_required(VERSION 3.10.2)
+project("litep2p_native")
 
-# For more information about using CMake with Android Studio, read the
-# documentation: https://d.android.com/studio/projects/add-native-code.html.
-# For more examples on how to use CMake, see https://github.com/android/ndk-samples.
+# set library name
+set(LIB_NAME litep2p)
 
-# Sets the minimum CMake version required for this project.
-cmake_minimum_required(VERSION 3.22.1)
+add_library(litep2p SHARED
+        src/p2p_api.cpp
+        src/discovery.cpp
+        src/network.cpp
+        src/peer_manager.cpp
+        src/logger.cpp
+        src/heartbeat.cpp
+        src/jni_glue.cpp
+        src/jni_helpers.cpp
+        src/message_router.cpp
+        src/protocol.cpp
+)
 
-# Declares the project name. The project name can be accessed via ${ PROJECT_NAME},
-# Since this is the top level CMakeLists.txt, the project name is also accessible
-# with ${CMAKE_PROJECT_NAME} (both CMake variables are in-sync within the top level
-# build script scope).
-project("myapplication")
 
-# Creates and names a library, sets it as either STATIC
-# or SHARED, and provides the relative paths to its source code.
-# You can define multiple libraries, and CMake builds them for you.
-# Gradle automatically packages shared libraries with your APK.
-#
-# In this top level CMakeLists.txt, ${CMAKE_PROJECT_NAME} is used to define
-# the target library name; in the sub-module's CMakeLists.txt, ${PROJECT_NAME}
-# is preferred for the same purpose.
-#
-# In order to load a library into your app from Java/Kotlin, you must call
-# System.loadLibrary() and pass the name of the library defined here;
-# for GameActivity/NativeActivity derived applications, the same library name must be
-# used in the AndroidManifest.xml file.
-add_library(${CMAKE_PROJECT_NAME} SHARED
-    # List C/C++ source files with relative paths to this CMakeLists.txt.
-    myapplication.cpp)
+# include directories
+target_include_directories(${LIB_NAME} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 
-# Specifies libraries CMake should link to your target library. You
-# can link libraries from various origins, such as libraries defined in this
-# build script, prebuilt third-party libraries, or Android system libraries.
-target_link_libraries(${CMAKE_PROJECT_NAME}
-    # List libraries link to the target library
-    android
-    log)
+# c++ settings
+set_target_properties(${LIB_NAME} PROPERTIES
+        CXX_STANDARD 17
+        CXX_EXTENSIONS OFF
+)
+
+find_library(log-lib log)
+target_link_libraries(${LIB_NAME}
+        ${log-lib}
+)
