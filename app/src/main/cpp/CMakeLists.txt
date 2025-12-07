@@ -42,3 +42,6 @@ set(LITEP2P_EXTRA_SRCS
 
 target_sources(${LIB_NAME} PRIVATE ${LITEP2P_EXTRA_SRCS})
 target_include_directories(${LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# session global accessor
+target_sources(${LIB_NAME} PRIVATE src/session_global.cpp)

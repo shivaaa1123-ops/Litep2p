@@ -46,7 +46,7 @@ static jstring safeNewStringUTF(JNIEnv* env, const char* s) {
 // -----------------------------------------------------------------------------
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_zeengal_litep2p_hook_P2P_init(JNIEnv* env, jclass clazz) {
+Java_com_zeengal_litep2p_hook_P2P_init(JNIEnv* env, jobject thiz) {
     std::lock_guard<std::mutex> lock(g_initMutex);
 
     // Store JavaVM if not stored (some modules expect g_vm to be filled by jni_helpers)
@@ -56,7 +56,9 @@ Java_com_zeengal_litep2p_hook_P2P_init(JNIEnv* env, jclass clazz) {
 
     // Keep a global ref to the P2P class so we can call static callbacks later
     if (g_p2pClass == nullptr) {
-        g_p2pClass = reinterpret_cast<jclass>(env->NewGlobalRef(clazz));
+        jclass cls = env->GetObjectClass(thiz);
+        g_p2pClass = reinterpret_cast<jclass>(env->NewGlobalRef(cls));
+        env->DeleteLocalRef(cls);
     }
 
     // Find static method: onPeersUpdated([Lcom/zeengal/litep2p/PeerInfo;)V
