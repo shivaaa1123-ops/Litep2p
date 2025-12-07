@@ -1,19 +1,23 @@
 package com.zeengal.litep2p.hook
 
+import androidx.lifecycle.LiveData
+import androidx.lifecycle.MutableLiveData
+import com.zeengal.litep2p.PeerInfo
+
 object P2P {
-    init { System.loadLibrary("litep2p") }
+    private val _peers = MutableLiveData<List<PeerInfo>>()
+    val peers: LiveData<List<PeerInfo>> = _peers
 
-    external fun init()
-    external fun startServer(port: Int)
-    external fun connect(ip: String, port: Int)
-    external fun sendMessage(peerId: String, data: ByteArray)
-    external fun stop()
-
-    // UI-facing callback - must exist and be static
+    // --- THIS IS THE FIX ---
+    // The connect method now takes the alphanumeric peer ID.
     @JvmStatic
-    fun onPeersUpdated(peers: Array<com.zeengal.litep2p.PeerInfo>) {
-        // This is called from native threads; post to main thread / LiveData
-        // Example:
-        // runOnUiThread { /* update UI */ }
+    external fun connect(peerId: String)
+
+    @JvmStatic
+    external fun sendMessage(peerId: String, message: ByteArray)
+
+    @JvmStatic
+    fun onPeersUpdated(peers: Array<PeerInfo>) {
+        _peers.postValue(peers.toList())
     }
 }

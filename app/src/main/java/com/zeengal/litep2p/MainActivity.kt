@@ -1,26 +1,23 @@
 package com.zeengal.litep2p
 
 import android.os.Bundle
+import android.widget.Button
+import android.widget.Spinner
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.zeengal.litep2p.databinding.ActivityMainBinding
+import java.net.Inet4Address
+import java.net.NetworkInterface
+import android.widget.ArrayAdapter
+import com.zeengal.litep2p.ui.home.HomeFragment
+import com.zeengal.litep2p.ui.logs.LogsFragment
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
-
-    companion object {
-        init {
-            try {
-                System.loadLibrary("litep2p")
-            } catch (t: Throwable) {
-                t.printStackTrace()
-            }
-        }
-    }
-
-    // Native methods
-    private external fun nativeStartLiteP2P(): String
-    private external fun nativeStopLiteP2P()
+    private lateinit var statusText: TextView
+    private lateinit var ipAddressText: TextView
+    private lateinit var commsModeSpinner: Spinner
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -28,60 +25,68 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.statusText.text = "Idle"
+        supportFragmentManager.beginTransaction()
+            .replace(R.id.home_fragment_container, HomeFragment())
+            .replace(R.id.logs_fragment_container, LogsFragment())
+            .commit()
 
-        // No more nativeSetLogger() — removed to avoid UnsatisfiedLinkError
-        appendLog("Logger bridge ready.")
+        statusText = findViewById(R.id.statusText)
+        ipAddressText = findViewById(R.id.ipAddressText)
+        commsModeSpinner = findViewById(R.id.comms_mode_spinner)
 
-        binding.startButton.setOnClickListener {
-            binding.statusText.text = "Starting…"
-            appendLog("Starting LiteP2P (native) ...")
-
-            Thread {
-                try {
-                    val res = nativeStartLiteP2P()
-                    runOnUiThread {
-                        binding.statusText.text = "Running"
-                        appendLog("Native start returned: $res")
-                    }
-                } catch (e: Throwable) {
-                    runOnUiThread {
-                        binding.statusText.text = "Error"
-                        appendLog("Error starting native engine: ${e.message}")
-                    }
-                }
-            }.start()
+        ArrayAdapter.createFromResource(
+            this,
+            R.array.comms_modes_array,
+            android.R.layout.simple_spinner_item
+        ).also { adapter ->
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            commsModeSpinner.adapter = adapter
         }
 
-        binding.startButton.isEnabled = true
+        val startButton: Button = findViewById(R.id.startButton)
+        startButton.setOnClickListener {
+            val selectedMode = commsModeSpinner.selectedItem.toString()
+            val peerId = PeerIdManager.getPeerId(this)
+            nativeStartLiteP2PWithPeerId(selectedMode, peerId)
+            statusText.text = "Running"
+        }
 
-        binding.stopButton.setOnClickListener {
-            appendLog("Stopping LiteP2P (native) ...")
+        val stopButton: Button = findViewById(R.id.stopButton)
+        stopButton.setOnClickListener {
             nativeStopLiteP2P()
-            binding.statusText.text = "Stopped"
+            statusText.text = "Idle"
         }
-    }
 
-    // Called from native via JNI
-    fun onNativeLog(message: String) {
-        runOnUiThread {
-            appendLog(message)
-        }
-    }
-
-    private fun appendLog(msg: String) {
-        val old = binding.logText.text.toString()
-        val next = if (old.isEmpty()) msg else "$old\n$msg"
-        binding.logText.text = next
-        binding.logScroll.post {
-            binding.logScroll.fullScroll(android.view.View.FOCUS_DOWN)
-        }
+        updateIpAddress()
     }
 
     override fun onDestroy() {
-        try {
-            nativeStopLiteP2P()
-        } catch (_: Throwable) { }
         super.onDestroy()
+        nativeStopLiteP2P()
+    }
+
+    private fun updateIpAddress() {
+        try {
+            for (ni in NetworkInterface.getNetworkInterfaces()) {
+                for (ip in ni.inetAddresses) {
+                    if (!ip.isLoopbackAddress && ip is Inet4Address) {
+                        ipAddressText.text = "IP: ${ip.hostAddress}"
+                        return
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            ipAddressText.text = "IP: Error"
+        }
+        ipAddressText.text = "IP: N/A"
+    }
+
+    external fun nativeStartLiteP2PWithPeerId(commsMode: String, peerId: String): String
+    external fun nativeStopLiteP2P()
+
+    companion object {
+        init {
+            System.loadLibrary("litep2p")
+        }
     }
 }

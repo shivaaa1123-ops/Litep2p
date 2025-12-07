@@ -5,5 +5,6 @@ data class PeerInfo(
     val ip: String,
     val port: Int,
     val latency: Int,
-    val connected: Boolean
+    val connected: Boolean,
+    val networkId: String // --- Add networkId field ---
 )

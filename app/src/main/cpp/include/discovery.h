@@ -1,24 +1,17 @@
-#ifndef LITEP2P_DISCOVERY_H
-#define LITEP2P_DISCOVERY_H
+#ifndef DISCOVERY_H
+#define DISCOVERY_H
 
+#include <string>
 #include <functional>
-#include "peer.h"
-
-using DiscoveryCb = std::function<void(const Peer&)>;
-
-class DiscoveryImpl;   // internal, hidden
 
 class Discovery {
 public:
-    Discovery();
-    ~Discovery();
-
-    bool start(int port);
-    void stop();
-    void setCallback(DiscoveryCb cb);
+    virtual ~Discovery() {}
+    virtual void start(int port, const std::string& peer_id) = 0;
+    virtual void stop() = 0;
+    virtual void setCallback(std::function<void(const std::string&, const std::string&)> cb) = 0;
 };
 
-// Exported factory method used by JNI layer
 Discovery* getGlobalDiscoveryInstance();
 
-#endif
+#endif // DISCOVERY_H

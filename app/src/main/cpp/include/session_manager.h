@@ -1,55 +1,29 @@
-#ifndef LITEP2P_SESSION_MANAGER_H
-#define LITEP2P_SESSION_MANAGER_H
+#ifndef SESSION_MANAGER_H
+#define SESSION_MANAGER_H
 
+#include "peer.h"
+#include "connection_manager.h"
+#include "udp_connection_manager.h"
+#include <vector>
 #include <string>
 #include <functional>
-#include <memory>
-#include <unordered_map>
 #include <mutex>
-#include <vector>
-#include <cstdint>
+#include <condition_variable>
 
-// forward declare Peer
-struct Peer;
-
-struct SessionInfo {
-    std::string peer_id;
-    std::string addr; // transport address e.g. tcp://1.2.3.4:9000
-    int socket_fd;    // connected socket (or -1)
-    bool established; // true after handshake
-    int64_t created_ms;
-};
-
-using SessionCallback = std::function<void(const SessionInfo&)>;
-
-// Simple SessionManager: manages sessions (connect, close) and performs a handshake via HandshakeInterface.
 class SessionManager {
 public:
     SessionManager();
     ~SessionManager();
 
-    // Start manager background threads if needed
-    bool start();
-
-    // Stop and close sessions
+    void start(int port, std::function<void(const std::vector<Peer>&)> peer_update_cb, const std::string& comms_mode, const std::string& peer_id);
     void stop();
 
-    // Create outbound session: connects to addr and performs handshake with peer_id (non-blocking)
-    // Returns a temporary session id (or empty string on immediate failure)
-    std::string connectToPeer(const std::string& peer_id, const std::string& addr);
-
-    // Close session by peer id
-    void closeSession(const std::string& peer_id);
-
-    // Get snapshot of sessions
-    std::vector<SessionInfo> listSessions();
-
-    // Set callback when session established/updated
-    void setCallback(SessionCallback cb);
+    void connectToPeer(const std::string& peer_id);
+    void sendMessageToPeer(const std::string& peer_id, const std::string& message);
 
 private:
-    struct Impl;
-    Impl* p;
+    class Impl;
+    Impl* m_impl;
 };
 
-#endif // LITEP2P_SESSION_MANAGER_H
+#endif // SESSION_MANAGER_H

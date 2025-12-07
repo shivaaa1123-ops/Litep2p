@@ -1,92 +1,98 @@
+
 #include "jni_glue.h"
 #include "jni_helpers.h"
 #include "logger.h"
 #include <android/log.h>
-#include <string>
 
-static jclass g_p2pClass = nullptr;       // global ref to com.zeengal.litep2p.P2P class
+static jclass g_p2pClass = nullptr;
 static jmethodID g_onPeersUpdated = nullptr;
 
-bool jniGlueInit(JNIEnv* env, jclass p2pClass) {
-    if (!env || !p2pClass) {
-        nativeLog("jniGlueInit: invalid args");
+// --- FIX: Add global references for PeerInfo ---
+static jclass g_peerInfoClass = nullptr;
+static jmethodID g_peerInfoCtor = nullptr;
+
+bool jniGlueInit(JNIEnv* env) {
+    nativeLog("JNI_GLUE: Initializing and caching class references...");
+    
+    // Cache P2P class and method
+    jclass localP2pClass = env->FindClass("com/zeengal/litep2p/hook/P2P");
+    if (!localP2pClass) {
+        nativeLog("JNI_GLUE: FATAL - Could not find P2P class during init.");
         return false;
     }
+    g_p2pClass = (jclass)env->NewGlobalRef(localP2pClass);
+    env->DeleteLocalRef(localP2pClass);
 
-    // Keep a global ref to the class (we call static method on it)
-    g_p2pClass = reinterpret_cast<jclass>(env->NewGlobalRef(p2pClass));
-    if (!g_p2pClass) {
-        nativeLog("jniGlueInit: NewGlobalRef failed");
-        return false;
-    }
-
-    loggerSetJavaVM(vm);
-
-    g_onPeersUpdated = env->GetStaticMethodID(
-            p2pClass,
-            "onPeersUpdated",
-            "([Lcom/zeengal/litep2p/PeerInfo;)V"
-    );
-
+    g_onPeersUpdated = env->GetStaticMethodID(g_p2pClass, "onPeersUpdated", "([Lcom/zeengal/litep2p/PeerInfo;)V");
     if (!g_onPeersUpdated) {
-        nativeLog("jniGlueInit: failed to find onPeersUpdated");
-        env->DeleteGlobalRef(g_p2pClass);
-        g_p2pClass = nullptr;
+        nativeLog("JNI_GLUE: FATAL - Could not find onPeersUpdated method during init.");
         return false;
     }
 
-    nativeLog("jniGlueInit: OK");
+    // --- FIX: Cache PeerInfo class and constructor ---
+    jclass localPeerInfoClass = env->FindClass("com/zeengal/litep2p/PeerInfo");
+    if (!localPeerInfoClass) {
+        nativeLog("JNI_GLUE: FATAL - Could not find PeerInfo class during init.");
+        return false;
+    }
+    g_peerInfoClass = (jclass)env->NewGlobalRef(localPeerInfoClass);
+    env->DeleteLocalRef(localPeerInfoClass);
+
+    g_peerInfoCtor = env->GetMethodID(g_peerInfoClass, "<init>", "(Ljava/lang/String;Ljava/lang/String;IIZ)V");
+    if (!g_peerInfoCtor) {
+        nativeLog("JNI_GLUE: FATAL - Could not find PeerInfo constructor during init.");
+        return false;
+    }
+
+    nativeLog("JNI_GLUE: Initialization complete. All references cached.");
     return true;
 }
 
 void jniGlueCleanup(JNIEnv* env) {
-    if (!env) return;
     if (g_p2pClass) {
         env->DeleteGlobalRef(g_p2pClass);
         g_p2pClass = nullptr;
     }
-    g_onPeersUpdated = nullptr;
-    nativeLog("jniGlueCleanup: cleaned");
+    if (g_peerInfoClass) {
+        env->DeleteGlobalRef(g_peerInfoClass);
+        g_peerInfoClass = nullptr;
+    }
 }
 
 void sendPeersToUI(const std::vector<Peer>& peers) {
     JNIEnv* env = getJNIEnv();
     if (!env) {
-        nativeLog("sendPeersToUI: cannot get JNIEnv");
+        nativeLog("JNI_GLUE: ERROR - JNIEnv not found for sendPeersToUI");
+        return;
+    }
+    
+    // --- FIX: Check all cached references ---
+    if (!g_p2pClass || !g_onPeersUpdated || !g_peerInfoClass || !g_peerInfoCtor) {
+        nativeLog("JNI_GLUE: ERROR - JNI references not initialized.");
         return;
     }
 
-    if (!g_p2pClass || !g_onPeersUpdated) {
-        nativeLog("sendPeersToUI: JNI not initialized");
+    // --- FIX: Use the cached class reference ---
+    jobjectArray arr = env->NewObjectArray((jsize)peers.size(), g_peerInfoClass, nullptr);
+    if (!arr) {
+        nativeLog("JNI_GLUE: ERROR - Failed to create PeerInfo array");
         return;
     }
 
-    // Find PeerInfo class and ctor
-    jclass peerInfoCls = env->FindClass("com/zeengal/litep2p/PeerInfo");
-    if (!peerInfoCls) {
-        nativeLog("sendPeersToUI: cannot find PeerInfo class");
-        return;
-    }
-
-    jmethodID ctor = env->GetMethodID(peerInfoCls, "<init>",
-                                      "(Ljava/lang/String;Ljava/lang/String;IIZ)V");
-    if (!ctor) {
-        nativeLog("sendPeersToUI: cannot find PeerInfo ctor");
-        env->DeleteLocalRef(peerInfoCls);
-        return;
-    }
-
-    jobjectArray arr = env->NewObjectArray(static_cast<jsize>(peers.size()), peerInfoCls, nullptr);
     for (size_t i = 0; i < peers.size(); ++i) {
         const Peer& p = peers[i];
         jstring jid = env->NewStringUTF(p.id.c_str());
         jstring jip = env->NewStringUTF(p.ip.c_str());
 
-        jobject obj = env->NewObject(peerInfoCls, ctor,
-                                     jid, jip,
-                                     (jint)p.port,
-                                     (jint)p.latency,
-                                     (jboolean)p.connected);
+        // --- FIX: Use the cached constructor method ID ---
+        jobject obj = env->NewObject(g_peerInfoClass, g_peerInfoCtor, jid, jip, (jint)p.port, (jint)p.latency, (jboolean)p.connected);
+        if (!obj) {
+            nativeLog("JNI_GLUE: ERROR - Failed to create PeerInfo object for peer " + p.id);
+            env->DeleteLocalRef(jid);
+            env->DeleteLocalRef(jip);
+            continue;
+        }
+
         env->SetObjectArrayElement(arr, (jsize)i, obj);
 
         env->DeleteLocalRef(jid);
@@ -95,12 +101,5 @@ void sendPeersToUI(const std::vector<Peer>& peers) {
     }
 
     env->CallStaticVoidMethod(g_p2pClass, g_onPeersUpdated, arr);
-
     env->DeleteLocalRef(arr);
-    env->DeleteLocalRef(peerInfoCls);
-}
-
-JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
-    g_vm = vm;
-    return JNI_VERSION_1_6;
 }

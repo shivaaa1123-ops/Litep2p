@@ -1,20 +1,41 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:padding="8dp"
-    android:orientation="vertical"
     android:layout_width="match_parent"
-    android:layout_height="wrap_content">
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:background="@drawable/peer_item_background">
 
     <TextView
-        android:id="@+id/peerTitle"
-        android:textSize="16sp"
-        android:textStyle="bold"
+        android:id="@+id/peerIdText"
         android:layout_width="wrap_content"
-        android:layout_height="wrap_content"/>
+        android:layout_height="wrap_content"
+        android:textSize="20sp"
+        android:textStyle="bold" />
 
     <TextView
-        android:id="@+id/peerSubtitle"
-        android:textSize="13sp"
+        android:id="@+id/peerIpText"
         android:layout_width="wrap_content"
-        android:layout_height="wrap_content"/>
+        android:layout_height="wrap_content" />
+
+    <TextView
+        android:id="@+id/peerPortText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content" />
+
+    <TextView
+        android:id="@+id/peerStatusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content" />
+
+    <TextView
+        android:id="@+id/peerLatencyText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content" />
+        
+    <TextView
+        android:id="@+id/peerNetworkIdText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content" />
+
 </LinearLayout>

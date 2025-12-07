@@ -1,47 +1,23 @@
-cmake_minimum_required(VERSION 3.10.2)
-project("litep2p_native")
+cmake_minimum_required(VERSION 3.22.1)
 
-# set library name
-set(LIB_NAME litep2p)
+project("litep2p")
 
 add_library(litep2p SHARED
-        src/p2p_api.cpp
+        src/jni_bridge.cpp
         src/discovery.cpp
-        src/network.cpp
-        src/peer_manager.cpp
+        src/session_manager.cpp
+        src/connection_manager.cpp
+        src/udp_connection_manager.cpp
         src/logger.cpp
-        src/heartbeat.cpp
-        src/jni_glue.cpp
-        src/jni_helpers.cpp
-        src/message_router.cpp
-        src/protocol.cpp
-)
+        src/aes.c
+        src/aes.cpp
+        src/jni_helpers.cpp)
 
+target_include_directories(litep2p PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# include directories
-target_include_directories(${LIB_NAME} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
+find_library(log-lib
+        log)
 
-# c++ settings
-set_target_properties(${LIB_NAME} PROPERTIES
-        CXX_STANDARD 17
-        CXX_EXTENSIONS OFF
-)
-
-find_library(log-lib log)
-target_link_libraries(${LIB_NAME}
-        ${log-lib}
-)
-
-# --- added LiteP2P session & handshake implementation ---
-set(LITEP2P_EXTRA_SRCS
-    src/session_manager.cpp
-    src/handshake_server.cpp
-)
-
-target_sources(${LIB_NAME} PRIVATE ${LITEP2P_EXTRA_SRCS})
-target_include_directories(${LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-
-# session global accessor
-target_sources(${LIB_NAME} PRIVATE src/session_global.cpp)
+target_link_libraries(litep2p
+        ${log-lib})

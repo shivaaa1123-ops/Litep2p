@@ -1,12 +1,10 @@
-#pragma once
+#ifndef LOGGER_H
+#define LOGGER_H
+
 #include <string>
-#include <jni.h>
 
-// Called by MainActivity to register itself as log receiver
-void setLoggerTarget(JNIEnv* env, jobject activityObj);
+// --- Add a function to set the session ID ---
+void setSessionId(const std::string& session_id);
+void nativeLog(const std::string& message);
 
-// Called internally by native code to send a log to UI
-void nativeLog(const std::string& msg);
-
-// Init function to store VM pointer
-void loggerSetJavaVM(JavaVM* vm);
+#endif // LOGGER_H

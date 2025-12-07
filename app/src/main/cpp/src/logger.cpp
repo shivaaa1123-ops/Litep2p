@@ -1,56 +1,46 @@
 #include "logger.h"
+#include "jni_bridge.h"
 #include <mutex>
-#include <android/log.h>
+#include <random>
+#include <algorithm>
+#include <string>
+#include <android/log.h> // --- Include the Android logging library ---
 
-static JavaVM* g_vm = nullptr;
-static jobject g_loggerTarget = nullptr;     // Global ref to MainActivity
-static jmethodID g_onNativeLog = nullptr;    // MainActivity.onNativeLog(String)
-static std::mutex g_mutex;
+static std::string g_sessionId = "NO_SESSION";
+static std::mutex g_logMutex;
 
-void loggerSetJavaVM(JavaVM* vm) {
-    g_vm = vm;
+std::string generate_session_id(size_t len) {
+    static const char alphanum[] =
+        "0123456789"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz";
+    std::string tmp_s;
+    tmp_s.reserve(len);
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> distrib(0, sizeof(alphanum) - 2);
+
+    for (size_t i = 0; i < len; ++i) {
+        tmp_s += alphanum[distrib(gen)];
+    }
+
+    return tmp_s;
 }
 
-void setLoggerTarget(JNIEnv* env, jobject activityObj) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-
-    if (!g_vm) return;
-
-    // Remove previous instance if exists
-    if (g_loggerTarget) {
-        env->DeleteGlobalRef(g_loggerTarget);
-        g_loggerTarget = nullptr;
-    }
-
-    // Store new global ref
-    g_loggerTarget = env->NewGlobalRef(activityObj);
-
-    // Lookup onNativeLog(String)
-    jclass cls = env->GetObjectClass(activityObj);
-    g_onNativeLog = env->GetMethodID(cls, "onNativeLog", "(Ljava/lang/String;)V");
-
-    if (!g_onNativeLog) {
-        // If missing, log into Logcat but avoid recursion
-        __android_log_print(ANDROID_LOG_ERROR, "LiteP2P",
-                            "ERROR: MainActivity.onNativeLog(String) not found");
-    }
+void setSessionId(const std::string& session_id) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    g_sessionId = session_id;
 }
 
-void nativeLog(const std::string& msg) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+void nativeLog(const std::string& message) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::string log_message = "[" + g_sessionId + "] " + message;
+    
+    // --- THIS IS THE FIX ---
+    // 1. Send the log to Logcat.
+    __android_log_print(ANDROID_LOG_INFO, "LiteP2P_Native", "%s", log_message.c_str());
 
-    if (!g_vm || !g_loggerTarget || !g_onNativeLog)
-        return; // No logger registered yet
-
-    JNIEnv* env = nullptr;
-    jint res = g_vm->GetEnv((void**)&env, JNI_VERSION_1_6);
-
-    if (res == JNI_EDETACHED) {
-        if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK)
-            return;
-    }
-
-    jstring jmsg = env->NewStringUTF(msg.c_str());
-    env->CallVoidMethod(g_loggerTarget, g_onNativeLog, jmsg);
-    env->DeleteLocalRef(jmsg);
+    // 2. Also, send the log to the UI.
+    sendToLogUI(log_message);
 }
