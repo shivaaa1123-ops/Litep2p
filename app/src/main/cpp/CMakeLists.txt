@@ -33,3 +33,12 @@ find_library(log-lib log)
 target_link_libraries(${LIB_NAME}
         ${log-lib}
 )
+
+# --- added LiteP2P session & handshake implementation ---
+set(LITEP2P_EXTRA_SRCS
+    src/session_manager.cpp
+    src/handshake_server.cpp
+)
+
+target_sources(${LIB_NAME} PRIVATE ${LITEP2P_EXTRA_SRCS})
+target_include_directories(${LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
