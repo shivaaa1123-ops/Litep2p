@@ -8,6 +8,7 @@
 #include "peer.h"
 #include "peer_manager.h"
 #include "discovery.h"
+#include "session_manager.h"
 #include "logger.h"      // nativeLog()
 
 // NOTE: This file intentionally DOES NOT re-define globals or helper functions
@@ -90,6 +91,15 @@ Java_com_zeengal_litep2p_hook_P2P_init(JNIEnv* env, jclass clazz) {
             disc->setCallback([](const Peer& p) {
                 try {
                     sendPeersToUI(std::vector<Peer>{p});
+                // Auto-connect: ask session manager to connect to discovered peer
+                try {
+                    extern SessionManager* getGlobalSessionManager();
+                    SessionManager* sm = getGlobalSessionManager();
+                    if (sm) {
+                        sm->connectToPeer(p.id, p.addr);
+                    }
+                } catch(...) { nativeLog("p2p_api: session connect failed"); }
+
                 } catch (...) {
                     nativeLog("p2p_api.init: discovery callback threw");
                 }
@@ -215,8 +225,19 @@ Java_com_zeengal_litep2p_MainActivity_nativeStartLiteP2P(JNIEnv* env, jobject /*
     const int defaultPort = 9999;
     try {
         g_peerManager.startServer(defaultPort);
+        // Start global session manager
+        try {
+            extern SessionManager* getGlobalSessionManager();
+            SessionManager* sm = getGlobalSessionManager();
+            if (!sm) {
+                // create and start
+                sm = new SessionManager();
+            }
+            sm->start();
+        } catch(...) { nativeLog("p2p_api: session manager start failed"); }
         Discovery* disc = getGlobalDiscoveryInstance();
         if (disc) disc->start(defaultPort);
+
     } catch (...) {
         nativeLog("nativeStartLiteP2P: exception starting engine");
         return safeNewStringUTF(env, "Error");
