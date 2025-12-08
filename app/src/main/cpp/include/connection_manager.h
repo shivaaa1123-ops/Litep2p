@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <memory>
 
 class ConnectionManager {
 public:
@@ -21,7 +22,7 @@ public:
 
 private:
     class Impl;
-    Impl* m_impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 #endif // CONNECTION_MANAGER_H

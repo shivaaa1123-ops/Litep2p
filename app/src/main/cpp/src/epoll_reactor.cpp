@@ -163,15 +163,19 @@ private:
                 while (it != m_timers.end() && it->first <= now) {
                     Timer t = it->second;
                     it = m_timers.erase(it);
-                    m_timerMutex.unlock();
+                    
+                    // Release lock before executing task to prevent deadlock
+                    lock.~lock_guard();
                     if(t.task) t.task();
-                    m_timerMutex.lock();
+                    
+                    // Reacquire lock for multimap operations
+                    new (&lock) std::lock_guard<std::mutex>(m_timerMutex);
+                    
+                    // If this is a repeating timer, reschedule it
                     if (t.intervalMs > 0) {
                         t.expirationMs = now + t.intervalMs;
                         m_timers.insert({t.expirationMs, t});
-                        it = m_timers.begin(); 
-                    } else {
-                        it = m_timers.begin();
+                        it = m_timers.lower_bound(now);
                     }
                 }
             }
@@ -190,7 +194,7 @@ private:
     int m_timerSeq;
 };
 
-EpollReactor::EpollReactor() : m_impl(new EpollReactorImpl()) {}
+EpollReactor::EpollReactor() : m_impl(std::make_unique<EpollReactorImpl>()) {}
 EpollReactor::~EpollReactor() = default;
 void EpollReactor::start() { m_impl->start(); }
 void EpollReactor::stop() { m_impl->stop(); }

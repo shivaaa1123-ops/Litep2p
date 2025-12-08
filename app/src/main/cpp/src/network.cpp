@@ -1,7 +1,7 @@
 
 #include "network.h"
 #include "logger.h"
-#include "aes.h"
+#include "crypto_utils.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -16,37 +16,6 @@
 using DataCb = std::function<void(const std::string&, const std::string&)>;
 using DisconnectCb = std::function<void(const std::string&)>;
 
-static const uint8_t g_aes_key[] = { 
-    0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 
-    0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
-};
-
-std::string encrypt_message(const std::string& plain_text) {
-    struct AES_ctx ctx;
-    AES_init_ctx(&ctx, g_aes_key);
-    std::string encrypted_text = plain_text;
-    int padding = AES_BLOCKLEN - (encrypted_text.length() % AES_BLOCKLEN);
-    encrypted_text.append(padding, (char)padding);
-    AES_CBC_encrypt_buffer(&ctx, (uint8_t*)encrypted_text.data(), encrypted_text.length());
-    return encrypted_text;
-}
-
-std::string decrypt_message(const std::string& encrypted_text) {
-    if (encrypted_text.length() % AES_BLOCKLEN != 0) {
-        nativeLog("Network Error: Received malformed (non-padded) encrypted message.");
-        return "";
-    }
-    struct AES_ctx ctx;
-    AES_init_ctx(&ctx, g_aes_key);
-    std::string decrypted_text = encrypted_text;
-    AES_CBC_decrypt_buffer(&ctx, (uint8_t*)decrypted_text.data(), decrypted_text.length());
-    int padding = decrypted_text.back();
-    if (padding > 0 && padding <= AES_BLOCKLEN) {
-        decrypted_text.resize(decrypted_text.length() - padding);
-    }
-    return decrypted_text;
-}
 
 class NetworkImpl {
 public:

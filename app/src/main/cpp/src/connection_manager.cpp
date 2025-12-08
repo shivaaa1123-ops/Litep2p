@@ -1,7 +1,7 @@
 #include "connection_manager.h"
 #include "logger.h"
-#include "aes.h" 
-
+#include "crypto_utils.h"
+#include "constants.h"
 #include <thread>
 #include <atomic>
 #include <sys/socket.h>
@@ -14,10 +14,6 @@
 #include <vector>
 #include <mutex>
 #include <algorithm>
-
-// AES functions are now declared in aes.h and defined in aes.cpp
-std::string encrypt_message(const std::string& plain_text);
-std::string decrypt_message(const std::string& encrypted_text);
 
 class ConnectionManager::Impl {
 public:
@@ -39,12 +35,14 @@ public:
         if (setsockopt(m_server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
             nativeLog("TCP Error: setsockopt(SO_REUSEADDR) failed: " + std::string(strerror(errno)));
             close(m_server_sock);
+            m_server_sock = -1;
             return false;
         }
 
         if (fcntl(m_server_sock, F_SETFL, O_NONBLOCK) < 0) {
             nativeLog("TCP Error: fcntl(O_NONBLOCK) failed for server socket: " + std::string(strerror(errno)));
             close(m_server_sock);
+            m_server_sock = -1;
             return false;
         }
 
@@ -55,12 +53,14 @@ public:
         if (bind(m_server_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
             nativeLog("TCP Error: Failed to bind server socket to port " + std::to_string(port) + ": " + std::string(strerror(errno)));
             close(m_server_sock);
+            m_server_sock = -1;
             return false;
         }
 
-        if (listen(m_server_sock, 5) < 0) {
+        if (listen(m_server_sock, DEFAULT_LISTEN_BACKLOG) < 0) {
             nativeLog("TCP Error: Failed to listen on server socket: " + std::string(strerror(errno)));
             close(m_server_sock);
+            m_server_sock = -1;
             return false;
         }
 
@@ -142,7 +142,7 @@ public:
             fd_set write_fds;
             FD_ZERO(&write_fds);
             FD_SET(sock, &write_fds);
-            timeval timeout = {10, 0}; 
+            timeval timeout = {TCP_CONNECT_TIMEOUT_SEC, 0}; 
 
             int select_res = select(sock + 1, nullptr, &write_fds, nullptr, &timeout);
             if (select_res <= 0) {
@@ -190,7 +190,7 @@ private:
             fd_set read_fds;
             FD_ZERO(&read_fds);
             FD_SET(m_server_sock, &read_fds);
-            timeval timeout = {1, 0}; 
+            timeval timeout = {TCP_SELECT_TIMEOUT_SEC, 0}; 
 
             int select_res = select(m_server_sock + 1, &read_fds, nullptr, nullptr, &timeout);
 
@@ -232,7 +232,7 @@ private:
     }
 
     void handleClient(int client_sock, std::string network_id) {
-        std::vector<char> buf(4096); 
+        std::vector<char> buf(TCP_BUFFER_SIZE); 
         while (m_running) {
             ssize_t n = recv(client_sock, buf.data(), buf.size(), 0);
             if (n > 0) {
@@ -276,8 +276,8 @@ private:
     OnDisconnectCallback m_on_disconnect;
 };
 
-ConnectionManager::ConnectionManager() : m_impl(new Impl()) {}
-ConnectionManager::~ConnectionManager() { delete m_impl; }
+ConnectionManager::ConnectionManager() : m_impl(std::make_unique<Impl>()) {}
+ConnectionManager::~ConnectionManager() = default;
 bool ConnectionManager::startServer(int p, OnDataCallback d, OnDisconnectCallback c) { return m_impl->startServer(p, d, c); }
 void ConnectionManager::stop() { m_impl->stop(); }
 bool ConnectionManager::connectToPeer(const std::string& ip, int port) { return m_impl->connectToPeer(ip, port); }

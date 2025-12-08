@@ -1,6 +1,7 @@
 #include "udp_connection_manager.h"
 #include "logger.h"
-#include "aes.h" 
+#include "crypto_utils.h"
+#include "constants.h"
 
 #include <thread>
 #include <atomic>
@@ -12,9 +13,6 @@
 #include <cstring>
 #include <mutex>
 #include <map>
-
-std::string encrypt_message_udp(const std::string& plain_text);
-std::string decrypt_message_udp(const std::string& encrypted_text);
 
 class UdpConnectionManager::UdpImpl {
 public:
@@ -97,12 +95,12 @@ public:
 
 private:
     void listenLoop() {
-        std::vector<char> buf(4096);
+        std::vector<char> buf(UDP_BUFFER_SIZE);
         while (m_running) {
             fd_set read_fds;
             FD_ZERO(&read_fds);
             FD_SET(m_sock, &read_fds);
-            timeval timeout = {1, 0}; 
+            timeval timeout = {UDP_SELECT_TIMEOUT_SEC, 0}; 
 
             int select_res = select(m_sock + 1, &read_fds, nullptr, nullptr, &timeout);
             if (select_res < 0) {
@@ -143,8 +141,8 @@ private:
     OnDisconnectCallback m_on_disconnect;
 };
 
-UdpConnectionManager::UdpConnectionManager() : m_impl(new UdpImpl()) {}
-UdpConnectionManager::~UdpConnectionManager() { delete m_impl; }
+UdpConnectionManager::UdpConnectionManager() : m_impl(std::make_unique<UdpImpl>()) {}
+UdpConnectionManager::~UdpConnectionManager() = default;
 bool UdpConnectionManager::startServer(int port, OnDataCallback on_data, OnDisconnectCallback on_disconnect) { return m_impl->startServer(port, on_data, on_disconnect); }
 void UdpConnectionManager::stop() { m_impl->stop(); }
 void UdpConnectionManager::sendMessageToPeer(const std::string& peer_id, const std::string& message) { m_impl->sendMessageToPeer(peer_id, message); }

@@ -1,8 +1,10 @@
 
+
 #include "jni_bridge.h"
 #include "jni_helpers.h"
 #include "logger.h"
 #include "session_manager.h"
+#include "constants.h"
 #include <android/log.h>
 
 static SessionManager g_sessionManager;
@@ -20,20 +22,29 @@ Java_com_zeengal_litep2p_MainActivity_nativeStartLiteP2PWithPeerId(JNIEnv* env, 
     
     if (!jniBridgeInit(env)) {
         nativeLog("NATIVE: FATAL - JNI Bridge initialization failed.");
+        if (env->ExceptionCheck()) env->ExceptionClear();
         return env->NewStringUTF("JNI Bridge Init Failed");
     }
 
     const char* commsModeStr = env->GetStringUTFChars(commsMode, nullptr);
-    if (commsModeStr == nullptr) return env->NewStringUTF("Failed to get comms mode");
+    if (commsModeStr == nullptr) {
+        nativeLog("NATIVE: Failed to get comms mode string");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return env->NewStringUTF("Failed to get comms mode");
+    }
     std::string commsModeCpp(commsModeStr);
     env->ReleaseStringUTFChars(commsMode, commsModeStr);
 
     const char* peerIdStr = env->GetStringUTFChars(peerId, nullptr);
-    if (peerIdStr == nullptr) return env->NewStringUTF("Failed to get peer ID");
+    if (peerIdStr == nullptr) {
+        nativeLog("NATIVE: Failed to get peer ID string");
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return env->NewStringUTF("Failed to get peer ID");
+    }
     std::string peerIdCpp(peerIdStr);
     env->ReleaseStringUTFChars(peerId, peerIdStr);
 
-    int port = 30001; 
+    int port = DEFAULT_SERVER_PORT; 
     g_sessionManager.start(port, [](const std::vector<Peer>& peers) {
         sendPeersToUI(peers);
     }, commsModeCpp, peerIdCpp);

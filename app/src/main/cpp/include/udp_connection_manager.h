@@ -4,6 +4,7 @@
 #include <string>
 #include <functional>
 #include <vector>
+#include <memory>
 
 class UdpConnectionManager {
 public:
@@ -26,7 +27,7 @@ public:
 
 private:
     class UdpImpl;
-    UdpImpl* m_impl;
+    std::unique_ptr<UdpImpl> m_impl;
 };
 
 #endif // UDP_CONNECTION_MANAGER_H

@@ -1,5 +1,6 @@
 #include "discovery.h"
 #include "logger.h"
+#include "constants.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -7,9 +8,6 @@
 #include <thread>
 #include <atomic>
 #include <cstring>
-
-static const int DISCOVERY_PORT = 30000;
-static const char* DISCOVERY_MSG = "LITEP2P_DISCOVERY";
 
 class DiscoveryImpl : public Discovery {
 public:
@@ -70,16 +68,16 @@ private:
             broadcast_addr.sin_port = htons(DISCOVERY_PORT);
             broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
 
-            std::string msg = std::string(DISCOVERY_MSG) + ":" + m_peer_id;
+            std::string msg = std::string(DISCOVERY_MESSAGE_PREFIX) + ":" + m_peer_id;
             sendto(m_sock, msg.c_str(), msg.length(), 0, (sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
             nativeLog("Discovery: Sent discovery packet.");
             
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            std::this_thread::sleep_for(std::chrono::seconds(DISCOVERY_BROADCAST_INTERVAL_SEC));
         }
     }
 
     void listenLoop() {
-        char buf[1024];
+        char buf[DISCOVERY_MSG_MAX];
         while (m_running) {
             sockaddr_in from_addr{};
             socklen_t from_len = sizeof(from_addr);
@@ -87,10 +85,10 @@ private:
             if (n > 0) {
                 buf[n] = 0;
                 std::string msg(buf);
-                if (msg.rfind(DISCOVERY_MSG, 0) == 0) {
+                if (msg.rfind(DISCOVERY_MESSAGE_PREFIX, 0) == 0) {
                     char sender_ip[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &from_addr.sin_addr, sender_ip, sizeof(sender_ip));
-                    std::string peer_id = msg.substr(strlen(DISCOVERY_MSG) + 1);
+                    std::string peer_id = msg.substr(strlen(DISCOVERY_MESSAGE_PREFIX) + 1);
                     if (m_callback) {
                         nativeLog("Discovery: Received discovery packet from " + peer_id);
                         m_callback(std::string(sender_ip), peer_id);
