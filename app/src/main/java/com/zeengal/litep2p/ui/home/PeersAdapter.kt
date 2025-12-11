@@ -34,39 +34,44 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
 
     override fun onBindViewHolder(holder: Holder, position: Int) {
         val p = items[position]
-        holder.id.text = "ID: ${p.id}"
+        holder.id.text = "ID: ${p.id.substring(0, 8)}..."
         holder.ip.text = "IP: ${p.ip}"
         holder.port.text = "Port: ${p.port}"
         holder.status.text = "Status: ${if (p.connected) "Connected" else "Disconnected"}"
-        holder.latency.text = "Latency: ${p.latency}ms"
+        holder.latency.text = "Latency: ${if (p.latency >= 0) "${p.latency}ms" else "N/A"}"
         holder.networkId.text = "Network ID: ${p.networkId}"
 
-        holder.itemView.isActivated = !p.connected
-
         holder.itemView.setOnClickListener {
-            val context = holder.itemView.context
-            
-            if (!p.connected) {
-                Toast.makeText(context, "Connecting to ${p.id}...", Toast.LENGTH_SHORT).show()
-                P2P.connect(p.id)
-            } else {
-                val dialogView = LayoutInflater.from(context).inflate(R.layout.dialog_send_message, null)
-                val editText = dialogView.findViewById<EditText>(R.id.messageEditText)
+            val currentPosition = holder.adapterPosition
+            if (currentPosition != RecyclerView.NO_POSITION) {
+                val currentPeer = items[currentPosition]
+                val context = holder.itemView.context
 
-                AlertDialog.Builder(context)
-                    .setTitle("Send Message to ${p.id}")
-                    .setView(dialogView)
-                    .setPositiveButton("Send") { dialog, _ ->
-                        val message = editText.text.toString()
-                        if (message.isNotEmpty()) {
-                            P2P.sendMessage(p.id, message.toByteArray())
+                if (!currentPeer.connected) {
+                    Toast.makeText(context, "Connecting to ${currentPeer.id.substring(0, 8)}...", Toast.LENGTH_SHORT).show()
+                    // Log connection type and peer info
+                    val connectionType = P2P.getConnectionType() // Assume this returns "TCP" or "UDP"
+                    Log.i("LiteP2P_UI", "User requested $connectionType connection to peer ${currentPeer.id} (IP: ${currentPeer.ip}, Port: ${currentPeer.port})")
+                    P2P.connect(currentPeer.id)
+                } else {
+                    val dialogView = LayoutInflater.from(context).inflate(R.layout.dialog_send_message, null)
+                    val editText = dialogView.findViewById<EditText>(R.id.messageEditText)
+
+                    AlertDialog.Builder(context)
+                        .setTitle("Send Message to ${currentPeer.id.substring(0, 8)}")
+                        .setView(dialogView)
+                        .setPositiveButton("Send") { dialog, _ ->
+                            val message = editText.text.toString()
+                            if (message.isNotEmpty()) {
+                                P2P.sendMessage(currentPeer.id, message.toByteArray())
+                            }
+                            dialog.dismiss()
                         }
-                        dialog.dismiss()
-                    }
-                    .setNegativeButton("Cancel") { dialog, _ ->
-                        dialog.cancel()
-                    }
-                    .show()
+                        .setNegativeButton("Cancel") { dialog, _ ->
+                            dialog.cancel()
+                        }
+                        .show()
+                }
             }
         }
     }
@@ -79,5 +84,31 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
         
         this.items = newItems
         diffResult.dispatchUpdatesTo(this)
+    }
+
+    class PeerDiffCallback(
+        private val oldList: List<PeerInfo>,
+        private val newList: List<PeerInfo>
+    ) : DiffUtil.Callback() {
+        private val TAG = "PeerDiffCallback"
+
+        override fun getOldListSize(): Int = oldList.size
+        override fun getNewListSize(): Int = newList.size
+        
+        override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+            return oldList[oldItemPosition].id == newList[newItemPosition].id
+        }
+        
+        override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int): Boolean {
+            val oldPeer = oldList[oldItemPosition]
+            val newPeer = newList[newItemPosition]
+            val areSame = oldPeer == newPeer
+            if (!areSame) {
+                Log.d(TAG, "areContentsTheSame: false for peer ${oldPeer.id}")
+                Log.d(TAG, "  Old: connected=${oldPeer.connected}, latency=${oldPeer.latency}")
+                Log.d(TAG, "  New: connected=${newPeer.connected}, latency=${newPeer.latency}")
+            }
+            return areSame
+        }
     }
 }

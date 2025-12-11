@@ -28,6 +28,8 @@ class HomeFragment : Fragment() {
 
         P2P.peers.observe(viewLifecycleOwner) { peers ->
             peersAdapter.update(peers)
+            // REMOVED: Automatic connection logic
+            // Connections now require explicit user clicks only
         }
         
         return root
