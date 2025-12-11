@@ -1,6 +1,8 @@
 package com.zeengal.litep2p
 
 import android.os.Bundle
+import android.view.View
+import android.widget.AdapterView
 import android.widget.Button
 import android.widget.Spinner
 import android.widget.TextView
@@ -42,21 +44,30 @@ class MainActivity : AppCompatActivity() {
             adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
             commsModeSpinner.adapter = adapter
         }
-
-        val startButton: Button = findViewById(R.id.startButton)
-        startButton.setOnClickListener {
-            val selectedMode = commsModeSpinner.selectedItem.toString()
-            val peerId = PeerIdManager.getPeerId(this)
-            nativeStartLiteP2PWithPeerId(selectedMode, peerId)
-            statusText.text = "Running"
+        
+        // Set listener to update connection type when spinner selection changes
+        commsModeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
+                val selectedMode = parent.getItemAtPosition(position).toString()
+                com.zeengal.litep2p.hook.P2P.setConnectionType(selectedMode)
+            }
+            
+            override fun onNothingSelected(parent: AdapterView<*>) {
+                // Do nothing
+            }
         }
-
+        
+        // Automatically start the server when the app launches
+        val selectedMode = commsModeSpinner.selectedItem.toString()
+        com.zeengal.litep2p.hook.P2P.setConnectionType(selectedMode)
+        val peerId = PeerIdManager.getPeerId(this)
+        nativeStartLiteP2PWithPeerId(selectedMode, peerId)
+        statusText.text = "Running"
         val stopButton: Button = findViewById(R.id.stopButton)
         stopButton.setOnClickListener {
             nativeStopLiteP2P()
             statusText.text = "Idle"
         }
-
         updateIpAddress()
     }
 

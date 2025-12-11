@@ -20,11 +20,28 @@ android {
             cmake {
                 cppFlags += "-std=c++17"
                 cppFlags += "-fexceptions"
+                cppFlags += "-DHAVE_JNI"
             }
         }
     }
 
-    // ✅ KEEP ONLY ONE buildFeatures BLOCK
+    buildTypes {
+        debug {
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DBUILD_TESTING=ON"
+                }
+            }
+        }
+        release {
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DBUILD_TESTING=OFF"
+                }
+            }
+        }
+    }
+
     buildFeatures {
         viewBinding = true
         dataBinding = false
@@ -56,6 +73,10 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.ktx)
     implementation(libs.androidx.navigation.fragment.ktx)
     implementation(libs.androidx.navigation.ui.ktx)
+
+    // Use libsodium from Maven Central
+    implementation("com.goterl:lazysodium-java:5.1.4")
+    implementation("net.java.dev.jna:jna:5.13.0")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
