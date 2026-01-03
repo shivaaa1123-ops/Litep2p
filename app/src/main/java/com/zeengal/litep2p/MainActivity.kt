@@ -109,10 +109,10 @@ class MainActivity : AppCompatActivity() {
             // Keep default
         }
         
-        val message = "Peer ID:\n$peerId\n\nApp Version:\n$versionName"
+        val message = "${getString(R.string.profile_peer_id_label)}:\n$peerId\n\n${getString(R.string.profile_app_info_label)}:\n$versionName"
         
         AlertDialog.Builder(this)
-            .setTitle("User Profile")
+            .setTitle(R.string.profile_title)
             .setMessage(message)
             .setPositiveButton("OK", null)
             .show()
