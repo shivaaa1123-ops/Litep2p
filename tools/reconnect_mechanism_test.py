@@ -466,8 +466,17 @@ def main() -> int:
 
         msg0 = f"baseline-hello t={now_ms()}"
         print(f"[test] sending baseline message A -> B: {msg0}")
-        send_cmd(a, f"send {args.id_b} {msg0}")
-        require(b, re.compile(re.escape(msg0)), timeout_s=args.timeout, msg="B did not receive baseline message")
+        # UDP can drop packets under loss/jitter. Retry a few times to distinguish
+        # "message lost" from "engine stuck/hung".
+        got0 = False
+        for attempt in range(1, 6):
+            send_cmd(a, f"send {args.id_b} {msg0}")
+            if wait_for_line(b, re.compile(re.escape(msg0)), timeout_s=min(args.timeout, 5.0)):
+                got0 = True
+                break
+            print(f"[test] warn: baseline message not observed yet (attempt {attempt}/5)")
+        if not got0:
+            raise RuntimeError("B did not receive baseline message after retries")
 
         for i in range(1, args.cycles + 1):
             print(f"\n[test] === cycle {i}/{args.cycles} ===")
@@ -526,8 +535,15 @@ def main() -> int:
 
                 msg = f"after-A-restart-{i} t={now_ms()}"
                 print(f"[test] sending message A -> B after restart: {msg}")
-                send_cmd(a, f"send {args.id_b} {msg}")
-                require(b, re.compile(re.escape(msg)), timeout_s=args.timeout, msg="B did not receive message after A restart")
+                got = False
+                for attempt in range(1, 6):
+                    send_cmd(a, f"send {args.id_b} {msg}")
+                    if wait_for_line(b, re.compile(re.escape(msg)), timeout_s=min(args.timeout, 5.0)):
+                        got = True
+                        break
+                    print(f"[test] warn: post-A-restart message not observed yet (attempt {attempt}/5)")
+                if not got:
+                    raise RuntimeError("B did not receive message after A restart (after retries)")
 
             if args.restart in ("b", "both"):
                 # Restart B quickly and have it attempt a fresh connect to A.
@@ -573,8 +589,15 @@ def main() -> int:
 
                 msg = f"after-B-restart-{i} t={now_ms()}"
                 print(f"[test] sending message B -> A after restart: {msg}")
-                send_cmd(b, f"send {args.id_a} {msg}")
-                require(a, re.compile(re.escape(msg)), timeout_s=args.timeout, msg="A did not receive message after B restart")
+                got = False
+                for attempt in range(1, 6):
+                    send_cmd(b, f"send {args.id_a} {msg}")
+                    if wait_for_line(a, re.compile(re.escape(msg)), timeout_s=min(args.timeout, 5.0)):
+                        got = True
+                        break
+                    print(f"[test] warn: post-B-restart message not observed yet (attempt {attempt}/5)")
+                if not got:
+                    raise RuntimeError("A did not receive message after B restart (after retries)")
 
             # Quick "no deadlock" sanity: both processes should still respond to 'peers'.
             for p in (a, b):
