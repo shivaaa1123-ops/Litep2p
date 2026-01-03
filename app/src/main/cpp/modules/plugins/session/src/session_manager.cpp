@@ -1834,8 +1834,20 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
 
             case PeerAction::RETRY_HANDSHAKE:
 #if HAVE_NOISE_PROTOCOL
-                if (m_use_noise_protocol)
+                if (m_use_noise_protocol) {
+                    // If we are retrying, ensure we don't reuse a half-initialized SecureSession
+                    // that refuses to start_handshake() again (m_handshake_initiated=true).
+                    // This can happen under loss/jitter where handshake packets drop and the
+                    // watchdog marks HANDSHAKE_FAILED. Without resetting, we can get stuck in
+                    // "Handshake already initiated" and never recover.
+                    {
+                        std::lock_guard<std::mutex> ssl(m_secure_session_mutex);
+                        if (m_secure_session_manager) {
+                            m_secure_session_manager->remove_session(event.peerId);
+                        }
+                    }
                     initializeNoiseHandshake(event.peerId);
+                }
 #endif
                 break;
 
