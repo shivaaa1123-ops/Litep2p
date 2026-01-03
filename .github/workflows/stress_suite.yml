@@ -1,0 +1,57 @@
+name: Stress suite (self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      loss_prob:
+        description: "UDP drop probability (0.0-1.0)"
+        required: false
+        default: "0.10"
+      loss_duration_sec:
+        description: "How long to keep loss rules installed"
+        required: false
+        default: "30"
+      reconnect_cycles:
+        description: "Reconnect restart cycles"
+        required: false
+        default: "8"
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: sg
+            runner_label: litep2p-sg
+          - name: us
+            runner_label: litep2p-us
+    runs-on: [self-hosted, "${{ matrix.runner_label }}"]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run stress suite
+        shell: bash
+        env:
+          LOSS_PROB: ${{ inputs.loss_prob || '0.10' }}
+          LOSS_DURATION_SEC: ${{ inputs.loss_duration_sec || '30' }}
+          RECONNECT_CYCLES: ${{ inputs.reconnect_cycles || '8' }}
+          OUT_DIR: /tmp/litep2p_stress_${{ matrix.name }}_${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          sudo bash tools/harness/stress_suite.sh
+          sudo chown -R "$(id -u):$(id -g)" "${OUT_DIR}" || true
+          echo "OUT_DIR=${OUT_DIR}" >> "${GITHUB_ENV}"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-${{ matrix.name }}
+          path: ${{ env.OUT_DIR }}
+
+
