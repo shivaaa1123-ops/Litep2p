@@ -209,7 +209,10 @@ def send_cmd(peer: PeerProc, cmd: str) -> None:
 
 def wait_for_line(peer: PeerProc, pattern: re.Pattern, timeout_s: float) -> Optional[str]:
     deadline = time.time() + timeout_s
-    start_idx = len(peer.lines)
+    # NOTE: Do not start scanning strictly from "now". Some events can be emitted
+    # immediately after a command (especially on localhost/VPS) and can be missed
+    # due to a small race between send_cmd() and entering this function.
+    start_idx = max(0, len(peer.lines) - 400)
     while time.time() < deadline:
         if peer.proc.poll() is not None:
             return None
