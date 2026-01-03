@@ -4,7 +4,7 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:id="@+id/mobile_navigation"
     app:startDestination="@+id/nav_home">
-<!--
+
     <fragment
         android:id="@+id/nav_home"
         android:name="com.zeengal.litep2p.ui.home.HomeFragment"
@@ -13,15 +13,14 @@
 
     <fragment
         android:id="@+id/nav_gallery"
-        android:name="com.example.Libp2p.ui.gallery.GalleryFragment"
+        android:name="com.zeengal.litep2p.ui.peers.PeersFragment"
         android:label="@string/menu_gallery"
-        tools:layout="@layout/fragment_gallery" />
+        tools:layout="@layout/fragment_peers" />
 
     <fragment
-        android:id="@+id/nav_slideshow"
-        android:name="com.example.Libp2p.ui.slideshow.SlideshowFragment"
-        android:label="@string/menu_slideshow"
-        tools:layout="@layout/fragment_slideshow" />
+        android:id="@+id/nav_profile"
+        android:name="com.zeengal.litep2p.ui.profile.ProfileFragment"
+        android:label="@string/menu_profile"
+        tools:layout="@layout/fragment_profile" />
 
-        -->
 </navigation>

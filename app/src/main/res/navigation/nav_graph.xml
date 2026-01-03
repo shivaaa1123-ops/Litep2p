@@ -13,4 +13,9 @@
         android:name="com.zeengal.litep2p.ui.peers.PeersFragment"
         android:label="Peers" />
 
+    <fragment
+        android:id="@+id/nav_profile"
+        android:name="com.zeengal.litep2p.ui.profile.ProfileFragment"
+        android:label="Profile" />
+
 </navigation>

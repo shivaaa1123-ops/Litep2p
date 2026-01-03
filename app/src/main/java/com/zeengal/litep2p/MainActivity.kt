@@ -1,11 +1,13 @@
 package com.zeengal.litep2p
 
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.View
 import android.widget.AdapterView
 import android.widget.Button
 import android.widget.Spinner
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.zeengal.litep2p.databinding.ActivityMainBinding
 import java.net.Inet4Address
@@ -68,6 +70,11 @@ class MainActivity : AppCompatActivity() {
             nativeStopLiteP2P()
             statusText.text = "Idle"
         }
+        
+        val profileButton: Button = findViewById(R.id.profileButton)
+        profileButton.setOnClickListener {
+            showProfileDialog()
+        }
         updateIpAddress()
     }
 
@@ -90,6 +97,25 @@ class MainActivity : AppCompatActivity() {
             ipAddressText.text = "IP: Error"
         }
         ipAddressText.text = "IP: N/A"
+    }
+
+    private fun showProfileDialog() {
+        val peerId = PeerIdManager.getPeerId(this)
+        var versionName = "Unknown"
+        try {
+            val packageInfo = packageManager.getPackageInfo(packageName, 0)
+            versionName = packageInfo.versionName
+        } catch (e: PackageManager.NameNotFoundException) {
+            // Keep default
+        }
+        
+        val message = "Peer ID:\n$peerId\n\nApp Version:\n$versionName"
+        
+        AlertDialog.Builder(this)
+            .setTitle("User Profile")
+            .setMessage(message)
+            .setPositiveButton("OK", null)
+            .show()
     }
 
     external fun nativeStartLiteP2PWithPeerId(commsMode: String, peerId: String): String
