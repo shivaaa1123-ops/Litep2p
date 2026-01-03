@@ -416,27 +416,13 @@ namespace detail {
                 }
 #endif
 
-                // Clear any old Noise session before starting fresh handshake
-                // This ensures we start with a clean state after restart.
-                // IMPORTANT: Do NOT clear an in-progress (not-ready) session here.
-                // The CLI/test harness may trigger handshake initiation before the CONNECT_ACK arrives,
-                // and clearing would destroy the initiator state (ephemeral keys), causing handshake loops.
-#if HAVE_NOISE_PROTOCOL
-                if (m_sm->m_secure_session_manager) {
-                    std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
-                    auto existing = m_sm->m_secure_session_manager->get_session(peer_id);
-                    if (existing && existing->is_ready()) {
-                        m_sm->m_secure_session_manager->remove_session(peer_id);
-                        LOG_INFO("MH: Cleared READY Noise session for peer " + peer_id + " upon CONTROL_CONNECT_ACK");
-
-                        // If we invalidated a READY session, drop any queued/batched messages encrypted under it.
-                        m_sm->clearQueuedMessages(peer_id);
-                        if (m_sm->m_message_batcher) {
-                            (void)m_sm->m_message_batcher->flush_peer(peer_id);
-                        }
-                    }
-                }
-#endif
+                // IMPORTANT:
+                // Do NOT clear an existing READY Noise session on CONTROL_CONNECT_ACK.
+                // A CONNECT_ACK can arrive after the handshake completed (reordering / fast paths),
+                // and clearing here causes READY->HANDSHAKING loops and breaks stable messaging.
+                //
+                // Restart safety is handled on inbound CONTROL_CONNECT (fresh connect) where the receiver
+                // can deterministically clear READY sessions and re-handshake.
                 
                 m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_SUCCESS});
 #if HAVE_NOISE_PROTOCOL
