@@ -5,8 +5,9 @@
 #include <vector>
 #include <functional>
 #include <memory>
+#include "../../../plugins/session/include/itcp_connection_manager.h"
 
-class ConnectionManager {
+class ConnectionManager : public ITcpConnectionManager {
 public:
     using OnDataCallback = std::function<void(const std::string&, const std::string&)>;
     using OnDisconnectCallback = std::function<void(const std::string&)>;

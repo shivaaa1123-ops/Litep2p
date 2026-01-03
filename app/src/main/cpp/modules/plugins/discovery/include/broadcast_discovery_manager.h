@@ -11,6 +11,7 @@
 #include <chrono>
 #include <vector>
 #include <atomic>
+#include <condition_variable>
 
 /**
  * BROADCAST DISCOVERY MANAGER
@@ -391,6 +392,10 @@ private:
     std::atomic<bool> m_running{false};
     std::thread m_cleanup_thread;
     std::thread m_response_timeout_thread;
+
+    // Used to interrupt background thread waits during shutdown.
+    mutable std::mutex m_wait_mutex;
+    std::condition_variable m_wait_cv;
     
     // Statistics tracking
     struct InternalStats {

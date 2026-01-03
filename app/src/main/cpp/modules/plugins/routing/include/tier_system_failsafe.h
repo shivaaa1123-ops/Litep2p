@@ -8,6 +8,7 @@
 #include <atomic>
 #include <mutex>
 #include <memory>
+#include <unordered_map>
 
 /**
  * FAILSAFE & ERROR HANDLING SYSTEM

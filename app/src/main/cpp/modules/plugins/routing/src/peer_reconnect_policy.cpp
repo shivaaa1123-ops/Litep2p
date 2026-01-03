@@ -1,5 +1,6 @@
 #include "peer_reconnect_policy.h"
 #include "logger.h"
+#include "config_manager.h"
 #include <algorithm>
 #include <cmath>
 #include <random>
@@ -7,7 +8,25 @@
 #include <iomanip>
 #include <sstream>
 
-static std::mt19937 g_random_engine(std::chrono::steady_clock::now().time_since_epoch().count());
+namespace {
+uint64_t steady_now_ms() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+std::string to_lower_ascii(std::string s) {
+    for (char& c : s) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return s;
+}
+}
+
+PeerReconnectPolicy::PeerReconnectPolicy()
+    : random_engine_(std::chrono::steady_clock::now().time_since_epoch().count()) {
+}
 
 PeerReconnectPolicy& PeerReconnectPolicy::getInstance() {
     static PeerReconnectPolicy instance;
@@ -22,12 +41,17 @@ void PeerReconnectPolicy::initialize(int battery_level_percent, bool network_wif
     is_network_available_ = true;
     is_charging_ = false;
     
+    // Get battery thresholds from config
+    int level_critical = ConfigManager::getInstance().getBatteryLevelCritical();
+    int level_low = ConfigManager::getInstance().getBatteryLevelLow();
+    int level_medium = ConfigManager::getInstance().getBatteryLevelMedium();
+    
     // Determine battery level
-    if (battery_percent_ < 10) {
+    if (battery_percent_ < level_critical) {
         current_battery_level_ = BatteryLevel::CRITICAL;
-    } else if (battery_percent_ < 20) {
+    } else if (battery_percent_ < level_low) {
         current_battery_level_ = BatteryLevel::LOW;
-    } else if (battery_percent_ < 80) {
+    } else if (battery_percent_ < level_medium) {
         current_battery_level_ = BatteryLevel::NORMAL;
     } else {
         current_battery_level_ = BatteryLevel::HIGH;
@@ -35,12 +59,56 @@ void PeerReconnectPolicy::initialize(int battery_level_percent, bool network_wif
     
     // Determine initial network condition
     current_network_condition_ = NetworkCondition::EXCELLENT;
-    
-    // Aggressive mode if on WiFi with good battery
-    use_aggressive_reconnect_ = is_wifi_ && (battery_percent_ > 80 || is_charging_);
-    use_battery_aware_mode_ = !is_wifi_ && battery_percent_ < 30;
-    
-    nativeLog("PeerReconnectPolicy: Initialized, battery=" + std::to_string(battery_percent_) + "%, aggressive=" + std::to_string(use_aggressive_reconnect_));
+
+    // Allow config.json to select a mode unless a runtime override was applied.
+    if (!reconnect_mode_overridden_) {
+        reconnect_mode_ = parse_reconnect_mode_string_(ConfigManager::getInstance().getReconnectPolicyMode());
+    }
+    recompute_effective_mode_flags_locked_();
+
+    nativeLog("PeerReconnectPolicy: Initialized, battery=" + std::to_string(battery_percent_) +
+              "%, wifi=" + std::to_string(is_wifi_) +
+              ", mode=" + std::to_string(static_cast<int>(reconnect_mode_)) +
+              ", aggressive=" + std::to_string(use_aggressive_reconnect_));
+}
+
+void PeerReconnectPolicy::set_reconnect_mode(ReconnectMode mode) {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    reconnect_mode_ = mode;
+    reconnect_mode_overridden_ = true;
+    recompute_effective_mode_flags_locked_();
+    nativeLog("PeerReconnectPolicy: Mode override set to " + std::to_string(static_cast<int>(reconnect_mode_)));
+}
+
+void PeerReconnectPolicy::set_reconnect_mode_string(const std::string& mode) {
+    set_reconnect_mode(parse_reconnect_mode_string_(mode));
+}
+
+ReconnectMode PeerReconnectPolicy::get_reconnect_mode() const {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+    return reconnect_mode_;
+}
+
+uint32_t PeerReconnectPolicy::get_reconnect_attempt_interval_ms() const {
+    std::lock_guard<std::mutex> lock(peers_mutex_);
+
+    if (!is_network_available_) {
+        return 60000;
+    }
+
+    switch (reconnect_mode_) {
+        case ReconnectMode::AGGRESSIVE:
+            return 250;
+        case ReconnectMode::POWER_SAVER:
+            return 5000;
+        case ReconnectMode::BALANCED:
+            return 1000;
+        case ReconnectMode::AUTO:
+        default:
+            if (use_aggressive_reconnect_) return 250;
+            if (use_battery_aware_mode_) return 5000;
+            return 1000;
+    }
 }
 
 void PeerReconnectPolicy::track_peer(const std::string& peer_id) {
@@ -89,13 +157,16 @@ void PeerReconnectPolicy::on_connection_success(const std::string& peer_id,
     if (it == peer_stats_.end()) return;
     
     PeerConnectionStats& stats = it->second;
+	const uint64_t now_ms = steady_now_ms();
     stats.connected = true;
     stats.attempting_reconnect = false;
     stats.consecutive_failures = 0;
     stats.retry_count_current_cycle = 0;
     stats.backoff_level = 1;
     stats.successful_connections++;
-    stats.last_successful_connection_ms = 0;  // Reset timer
+    stats.last_successful_connection_ms = now_ms;
+    stats.last_connection_attempt_ms = now_ms;
+    stats.next_retry_time_ms = 0;
     stats.last_used_method = method;
     
     // Update RTT statistics (exponential moving average)
@@ -122,29 +193,34 @@ void PeerReconnectPolicy::on_connection_failure(const std::string& peer_id,
     if (it == peer_stats_.end()) return;
     
     PeerConnectionStats& stats = it->second;
+	const uint64_t now_ms = steady_now_ms();
     stats.connected = false;
     stats.consecutive_failures++;
     stats.total_failures++;
     stats.packet_loss_rate = packet_loss_rate;
     stats.attempting_reconnect = true;
+    stats.last_connection_attempt_ms = now_ms;
     stats.current_condition = detect_network_condition(stats.average_rtt_ms, packet_loss_rate);
     
-    // Don't retry if too many consecutive failures (circuit breaker)
     RetryConfig config = get_retry_config_for_battery();
+    stats.retry_count_current_cycle++;
+
+    // Exponential backoff level (keep historical field bounded)
+    const int exponent = std::min(std::max(stats.consecutive_failures - 1, 0), 10);
+    stats.backoff_level = 1 << std::min(exponent, 4);  // 1..16
+
+    // Calculate next retry moment with jitter
+    const uint32_t backoff_delay_ms = calculate_backoff_with_jitter(exponent);
+    stats.next_retry_time_ms = now_ms + backoff_delay_ms;
+
     if (stats.consecutive_failures > config.max_retries) {
-    nativeLog("PeerReconnectPolicy: Connection failed for " + peer_id + " (" + std::to_string(stats.consecutive_failures) + " failures)");
-        stats.backoff_level = std::min(stats.backoff_level * 2, 16);  // Cap at 16
-        stats.consecutive_failures = 1;  // Reset counter for next backoff level
-    } else {
-        stats.retry_count_current_cycle++;
-        stats.backoff_level = 1 << std::min(stats.consecutive_failures, 5);  // 1, 2, 4, 8, 16, 32...
+        nativeLog("PeerReconnectPolicy: Connection failed for " + peer_id + " (" + std::to_string(stats.consecutive_failures) + " failures) - circuit breaker open");
     }
-    
-    // Calculate next retry time with jitter
-    uint32_t backoff_ms = calculate_backoff_with_jitter(std::log2(stats.backoff_level));
-    stats.next_retry_time_ms = backoff_ms;
-    
-    nativeLog("PeerReconnectPolicy: Connection failure - " + peer_id + " via " + attempted_method + " (failures=" + std::to_string(stats.consecutive_failures) + ", backoff=" + std::to_string(stats.backoff_level) + "ms, next_retry_in=" + std::to_string(stats.next_retry_time_ms) + "ms)");
+
+    nativeLog("PeerReconnectPolicy: Connection failure - " + peer_id + " via " + attempted_method +
+            " (failures=" + std::to_string(stats.consecutive_failures) +
+            ", backoff_level=" + std::to_string(stats.backoff_level) +
+            ", next_retry_in=" + std::to_string(backoff_delay_ms) + "ms)");
 }
 
 bool PeerReconnectPolicy::should_reconnect_now(const std::string& peer_id) {
@@ -154,12 +230,21 @@ bool PeerReconnectPolicy::should_reconnect_now(const std::string& peer_id) {
     if (it == peer_stats_.end()) return false;
     
     PeerConnectionStats& stats = it->second;
+    const uint64_t now_ms = steady_now_ms();
+    const RetryConfig config = get_retry_config_for_battery();
     
     // Don't reconnect if already connected
     if (stats.connected) return false;
+
+    // Circuit breaker
+    if (stats.consecutive_failures > config.max_retries) {
+        return false;
+    }
     
     // Check if enough time has passed
-    if (stats.next_retry_time_ms > 0) return false;
+    if (stats.next_retry_time_ms != 0 && now_ms < stats.next_retry_time_ms) {
+        return false;
+    }
     
     // Check battery constraints
     if (!is_reconnect_battery_safe(peer_id)) {
@@ -178,22 +263,23 @@ std::string PeerReconnectPolicy::get_next_peer_to_reconnect() {
     std::string best_peer;
     float best_priority = -1.0f;
     
-    auto now = std::chrono::steady_clock::now().time_since_epoch();
-    uint32_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+	const uint64_t now_ms = steady_now_ms();
+	const RetryConfig config = get_retry_config_for_battery();
     
     for (auto& pair : peer_stats_) {
         PeerConnectionStats& stats = pair.second;
         
         // Skip connected peers
         if (stats.connected) continue;
+
+		// Circuit breaker
+		if (stats.consecutive_failures > config.max_retries) continue;
         
         // Skip if not ready to retry yet
-        if (stats.next_retry_time_ms > 0 && stats.last_connection_attempt_ms + stats.next_retry_time_ms > now_ms) {
-            continue;
-        }
+		if (stats.next_retry_time_ms != 0 && now_ms < stats.next_retry_time_ms) continue;
         
         // Calculate priority (higher = more urgent)
-        float priority = calculate_peer_priority(stats);
+		float priority = calculate_peer_priority(stats, now_ms);
         
         if (priority > best_priority) {
             best_priority = priority;
@@ -216,12 +302,17 @@ PeerReconnectPolicy::RetryStrategy PeerReconnectPolicy::get_retry_strategy(const
     if (it == peer_stats_.end()) return strategy;
     
     PeerConnectionStats& stats = it->second;
+	const uint64_t now_ms = steady_now_ms();
     
     // Determine retry strategy based on network condition
     RetryConfig config = get_retry_config_for_battery();
     
     strategy.should_retry = (stats.consecutive_failures <= config.max_retries);
-    strategy.backoff_ms = stats.next_retry_time_ms;
+    if (stats.next_retry_time_ms == 0 || now_ms >= stats.next_retry_time_ms) {
+        strategy.backoff_ms = 0;
+    } else {
+        strategy.backoff_ms = static_cast<uint32_t>(std::min<uint64_t>(stats.next_retry_time_ms - now_ms, UINT32_MAX));
+    }
     
     // Decide which methods to try based on what worked before
     strategy.methods.clear();
@@ -267,11 +358,12 @@ void PeerReconnectPolicy::set_battery_level(int percent, bool is_charging) {
         current_battery_level_ = BatteryLevel::HIGH;
     }
     
-    // Update aggressive/battery-aware modes
-    use_aggressive_reconnect_ = is_wifi_ && (percent > 80 || is_charging_);
-    use_battery_aware_mode_ = !is_wifi_ && percent < 30;
-    
-    nativeLog("PeerReconnectPolicy: Battery update - " + std::to_string(percent) + "% (" + std::string(is_charging_ ? "charging" : "on_battery") + "), aggressive=" + (use_aggressive_reconnect_ ? "true" : "false"));
+    recompute_effective_mode_flags_locked_();
+
+    nativeLog("PeerReconnectPolicy: Battery update - " + std::to_string(percent) + "% (" +
+              std::string(is_charging_ ? "charging" : "on_battery") + "), mode=" +
+              std::to_string(static_cast<int>(reconnect_mode_)) + ", aggressive=" +
+              (use_aggressive_reconnect_ ? "true" : "false"));
 }
 
 void PeerReconnectPolicy::set_network_type(bool is_wifi, bool is_available) {
@@ -280,10 +372,12 @@ void PeerReconnectPolicy::set_network_type(bool is_wifi, bool is_available) {
     is_wifi_ = is_wifi;
     is_network_available_ = is_available;
     
-    use_aggressive_reconnect_ = is_wifi && (battery_percent_ > 80 || is_charging_);
-    use_battery_aware_mode_ = !is_wifi && battery_percent_ < 30;
-    
-    nativeLog("PeerReconnectPolicy: Network update - " + std::string(is_wifi ? "WiFi" : "Mobile") + " (" + std::string(is_available ? "available" : "unavailable") + "), aggressive=" + (use_aggressive_reconnect_ ? "true" : "false"));
+    recompute_effective_mode_flags_locked_();
+
+    nativeLog("PeerReconnectPolicy: Network update - " + std::string(is_wifi ? "WiFi" : "Mobile") +
+              " (" + std::string(is_available ? "available" : "unavailable") + "), mode=" +
+              std::to_string(static_cast<int>(reconnect_mode_)) + ", aggressive=" +
+              (use_aggressive_reconnect_ ? "true" : "false"));
 }
 
 NetworkCondition PeerReconnectPolicy::detect_network_condition(uint32_t rtt_ms, float packet_loss_rate) {
@@ -332,6 +426,8 @@ void PeerReconnectPolicy::reset_peer_stats(const std::string& peer_id) {
         stats.retry_count_current_cycle = 0;
         stats.backoff_level = 1;
         stats.next_retry_time_ms = 0;
+        stats.last_connection_attempt_ms = 0;
+        stats.last_successful_connection_ms = 0;
         stats.average_rtt_ms = 100;
         
         nativeLog("PeerReconnectPolicy: Reset stats for peer " + peer_id);
@@ -396,20 +492,29 @@ uint32_t PeerReconnectPolicy::get_keepalive_interval_seconds() const {
     // Mobile + Low Battery: 30-45s
     // Critical Battery: 60-120s (very conservative)
     
+    uint32_t base = 10;
     if (current_battery_level_ == BatteryLevel::CRITICAL) {
-        return 120;
+        base = 120;
+    } else if (current_battery_level_ == BatteryLevel::LOW) {
+        base = is_wifi_ ? 20 : 45;
+    } else if (current_battery_level_ == BatteryLevel::NORMAL) {
+        base = is_wifi_ ? 10 : 15;
+    } else {
+        // HIGH battery
+        base = is_wifi_ ? 5 : 10;
     }
-    
-    if (current_battery_level_ == BatteryLevel::LOW) {
-        return is_wifi_ ? 20 : 45;
+
+    // Mode-based adjustment (bounded).
+    switch (reconnect_mode_) {
+        case ReconnectMode::AGGRESSIVE:
+            return std::max<uint32_t>(3, base / 2);
+        case ReconnectMode::POWER_SAVER:
+            return std::min<uint32_t>(300, base * 3);
+        case ReconnectMode::BALANCED:
+        case ReconnectMode::AUTO:
+        default:
+            return base;
     }
-    
-    if (current_battery_level_ == BatteryLevel::NORMAL) {
-        return is_wifi_ ? 10 : 15;
-    }
-    
-    // HIGH battery
-    return is_wifi_ ? 5 : 10;
 }
 
 std::string PeerReconnectPolicy::get_status_json() const {
@@ -417,7 +522,8 @@ std::string PeerReconnectPolicy::get_status_json() const {
     
     std::stringstream ss;
     ss << "{\"battery\":" << battery_percent_ << ",\"network\":\"" 
-       << (is_wifi_ ? "WiFi" : "Mobile") << "\",\"peers\":[";
+       << (is_wifi_ ? "WiFi" : "Mobile") << "\",\"mode\":"
+       << static_cast<int>(reconnect_mode_) << ",\"peers\":[";
     
     bool first = true;
     for (const auto& pair : peer_stats_) {
@@ -447,8 +553,22 @@ void PeerReconnectPolicy::shutdown() {
 
 PeerReconnectPolicy::RetryConfig PeerReconnectPolicy::get_retry_config_for_battery() {
     RetryConfig config;
-    
-    if (use_aggressive_reconnect_) {
+
+    if (reconnect_mode_ == ReconnectMode::AGGRESSIVE) {
+        // Reliability-first.
+        config.initial_backoff_ms = 250;
+        config.max_backoff_ms = 8000;
+        config.max_retries = 8;
+        config.aggressive_mode = true;
+        config.battery_drain_threshold = 0.07f;
+    } else if (reconnect_mode_ == ReconnectMode::POWER_SAVER) {
+        // Mobile-first / battery-first.
+        config.initial_backoff_ms = 8000;
+        config.max_backoff_ms = 600000; // 10 min
+        config.max_retries = 3;
+        config.aggressive_mode = false;
+        config.battery_drain_threshold = 0.01f;
+    } else if (use_aggressive_reconnect_) {
         // WiFi + Good Battery: Aggressive retry every 500ms, 1s, 2s, 4s, 8s
         config.initial_backoff_ms = 500;
         config.max_backoff_ms = 8000;
@@ -493,20 +613,22 @@ uint32_t PeerReconnectPolicy::calculate_backoff_with_jitter(int backoff_level) {
     
     // Add random jitter (±20%)
     std::uniform_real_distribution<float> dist(0.8f, 1.2f);
-    float jitter = dist(g_random_engine);
+    float jitter = dist(random_engine_);
     
     uint32_t result = static_cast<uint32_t>(base_backoff * jitter);
     return std::min(result, config.max_backoff_ms);
 }
 
-float PeerReconnectPolicy::calculate_peer_priority(const PeerConnectionStats& stats) {
+float PeerReconnectPolicy::calculate_peer_priority(const PeerConnectionStats& stats, uint64_t now_ms) {
     float priority = 0.0f;
     
     // Higher priority = more urgent to reconnect
     // Factor 1: Time since last success (longer = more urgent)
-    if (stats.last_successful_connection_ms > 0) {
-        priority += (stats.last_successful_connection_ms / 1000.0f) * 0.3f;
-    }
+	if (stats.last_successful_connection_ms > 0 && now_ms >= stats.last_successful_connection_ms) {
+		priority += (static_cast<float>(now_ms - stats.last_successful_connection_ms) / 1000.0f) * 0.3f;
+	} else if (stats.last_successful_connection_ms == 0) {
+		priority += 10.0f;  // Never connected: give a small boost
+	}
     
     // Factor 2: Network condition (poor condition = higher priority)
     priority += static_cast<float>(stats.current_condition) * 0.2f;
@@ -519,9 +641,48 @@ float PeerReconnectPolicy::calculate_peer_priority(const PeerConnectionStats& st
     }
     
     // Factor 4: Time since last attempt (prevent thrashing)
-    if (stats.last_connection_attempt_ms > 0) {
-        priority -= (stats.last_connection_attempt_ms / 5000.0f) * 0.2f;
-    }
+	if (stats.last_connection_attempt_ms > 0 && now_ms >= stats.last_connection_attempt_ms) {
+		priority -= (static_cast<float>(now_ms - stats.last_connection_attempt_ms) / 5000.0f) * 0.2f;
+	}
     
     return priority;
+}
+
+ReconnectMode PeerReconnectPolicy::parse_reconnect_mode_string_(std::string mode) {
+    mode = to_lower_ascii(std::move(mode));
+    if (mode == "aggressive" || mode == "reliability" || mode == "reliable" || mode == "fast") {
+        return ReconnectMode::AGGRESSIVE;
+    }
+    if (mode == "power_saver" || mode == "powersaver" || mode == "eco" || mode == "mobile") {
+        return ReconnectMode::POWER_SAVER;
+    }
+    if (mode == "balanced" || mode == "normal") {
+        return ReconnectMode::BALANCED;
+    }
+    return ReconnectMode::AUTO;
+}
+
+void PeerReconnectPolicy::recompute_effective_mode_flags_locked_() {
+    // Battery thresholds are config-driven.
+    const int level_medium = ConfigManager::getInstance().getBatteryLevelMedium();
+
+    switch (reconnect_mode_) {
+        case ReconnectMode::AGGRESSIVE:
+            use_aggressive_reconnect_ = true;
+            use_battery_aware_mode_ = false;
+            break;
+        case ReconnectMode::POWER_SAVER:
+            use_aggressive_reconnect_ = false;
+            use_battery_aware_mode_ = true;
+            break;
+        case ReconnectMode::BALANCED:
+            use_aggressive_reconnect_ = false;
+            use_battery_aware_mode_ = false;
+            break;
+        case ReconnectMode::AUTO:
+        default:
+            use_aggressive_reconnect_ = is_wifi_ && (battery_percent_ > level_medium || is_charging_);
+            use_battery_aware_mode_ = !is_wifi_ && battery_percent_ < 30;
+            break;
+    }
 }

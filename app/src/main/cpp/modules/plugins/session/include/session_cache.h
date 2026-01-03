@@ -20,15 +20,13 @@ struct CachedSession {
     std::chrono::steady_clock::time_point last_used;
     int usage_count = 0;
     bool is_valid = true;
-    
-    // Session lifetime in seconds
-    static constexpr int SESSION_LIFETIME_SEC = 3600;  // 1 hour
+    int session_lifetime_sec = 3600;  // Default, can be set from config
     
     bool is_expired() const {
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - created_at
         ).count();
-        return elapsed > SESSION_LIFETIME_SEC;
+        return elapsed > session_lifetime_sec;
     }
 };
 

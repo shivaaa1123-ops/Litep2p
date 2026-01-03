@@ -9,21 +9,44 @@
 #include <thread>
 #include <condition_variable>
 #include <atomic>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <cstdio>
+#include <ctime>
+#include <unistd.h>
 
-#ifdef HAVE_JNI
+#if HAVE_JNI
 #include "jni_bridge.h"
 #include <android/log.h>
+#else
+// Forward declaration for desktop builds
+void sendToLogUI(const std::string& message) {
+    // No-op on desktop
+}
 #endif
 
 /**
  * @brief The session ID for logging.
  */
+#if HAVE_JNI
 static std::string g_sessionId = "NO_SESSION";
+#else
+static std::string g_sessionId = "DESKTOP";
+#endif
 
 /**
  * @brief Mutex for protecting the logger.
  */
-static std::mutex g_logMutex;
+// NOTE: We intentionally allocate the logger mutex dynamically and never destroy it.
+// This avoids static destruction order issues where other global/static destructors
+// attempt to log after the logger has been torn down, which can throw
+// `std::system_error: mutex lock failed` on some platforms/libc++ builds.
+static std::mutex& log_mutex() {
+    static std::mutex* m = new std::mutex();
+    return *m;
+}
+static std::function<void(const std::string&)> g_logCallback;
 
 /**
  * @brief Global log level (for conditional logging)
@@ -70,8 +93,17 @@ std::string generate_session_id(size_t len) {
  * @param session_id The session ID to set.
  */
 void setSessionId(const std::string& session_id) {
-    std::lock_guard<std::mutex> lock(g_logMutex);
+#if HAVE_JNI
+    std::lock_guard<std::mutex> lock(log_mutex());
+#endif
     g_sessionId = session_id;
+}
+
+void setLogCallback(std::function<void(const std::string&)> callback) {
+#if HAVE_JNI
+    std::lock_guard<std::mutex> lock(log_mutex());
+#endif
+    g_logCallback = callback;
 }
 
 /**
@@ -79,7 +111,9 @@ void setSessionId(const std::string& session_id) {
  * @param level The log level to set.
  */
 void set_log_level(LogLevel level) {
-    std::lock_guard<std::mutex> lock(g_logMutex);
+#if HAVE_JNI
+    std::lock_guard<std::mutex> lock(log_mutex());
+#endif
     g_log_level = level;
 }
 
@@ -88,8 +122,51 @@ void set_log_level(LogLevel level) {
  * @return The current log level.
  */
 LogLevel get_log_level() {
-    std::lock_guard<std::mutex> lock(g_logMutex);
+#if HAVE_JNI
+    std::lock_guard<std::mutex> lock(log_mutex());
+#endif
     return g_log_level;
+}
+
+/**
+ * @brief Get current timestamp for logging (used on desktop)
+ */
+static std::string get_timestamp() {
+#if HAVE_JNI
+    return "";  // Android uses system timestamp
+#else
+    // Avoid iostream/locale machinery here: during shutdown, locale/iostream internals may be
+    // partially torn down and can throw std::system_error related to mutex locking.
+    auto now = std::chrono::system_clock::now();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    auto t = std::chrono::system_clock::to_time_t(now);
+
+    struct tm tm_buf;
+    localtime_r(&t, &tm_buf);
+
+    char time_buf[16]; // HH:MM:SS\0
+    if (std::strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &tm_buf) == 0) {
+        return "00:00:00.000";
+    }
+
+    char out[32];
+    std::snprintf(out, sizeof(out), "%s.%03d", time_buf, static_cast<int>(ms.count()));
+    return std::string(out);
+#endif
+}
+
+static std::string sanitize_log_message(const std::string& input) {
+    std::ostringstream oss;
+    for (unsigned char c : input) {
+        if (c < 32 && c != '\t' && c != '\n' && c != '\r') {
+            oss << "\\x" << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+        } else if (c >= 127) {
+            oss << "\\x" << std::hex << std::setw(2) << std::setfill('0') << (int)c;
+        } else {
+            oss << c;
+        }
+    }
+    return oss.str();
 }
 
 /**
@@ -107,11 +184,18 @@ void async_log_worker() {
             
             // Send log message without holding lock
             // This allows new messages to be queued while we're logging
-#ifdef HAVE_JNI
+#if HAVE_JNI
             __android_log_print(ANDROID_LOG_INFO, "LiteP2P_Native", "%s", msg.c_str());
-            sendToLogUI(msg);
+            sendToLogUI(sanitize_log_message(msg));
 #else
-            std::cerr << msg << std::endl;
+            // Desktop: output with timestamp
+            // Desktop: best-effort logging without mutex to avoid shutdown-order issues.
+            if (g_logCallback) {
+                g_logCallback(sanitize_log_message(msg));
+            } else {
+                std::cout << sanitize_log_message(msg) << std::endl;
+                std::cout.flush();
+            }
 #endif
         }
     }
@@ -123,7 +207,9 @@ void async_log_worker() {
 void enable_async_logging() {
     if (g_async_logging_enabled) return;
     
-    std::lock_guard<std::mutex> lock(g_logMutex);
+#if HAVE_JNI
+    std::lock_guard<std::mutex> lock(log_mutex());
+#endif
     g_async_logging_enabled = true;
     g_log_thread_running = true;
     g_log_thread = std::make_unique<std::thread>(async_log_worker);
@@ -149,7 +235,13 @@ void disable_async_logging() {
  * @brief Check if async logging is enabled
  */
 bool is_async_logging_enabled() {
+#if HAVE_JNI
     return g_async_logging_enabled.load();
+#else
+    // Desktop build: keep logging synchronous to avoid shutdown-order issues with
+    // the async queue mutex/condition_variable.
+    return false;
+#endif
 }
 
 /**
@@ -157,7 +249,16 @@ bool is_async_logging_enabled() {
  * @param message The message to log.
  */
 void nativeLog(const std::string& message) {
+    // Logging must never be allowed to terminate the process.
+    // In particular, shutdown ordering issues can cause mutex operations to fail.
+    try {
+#if HAVE_JNI
+    // Android: Use session ID format
     std::string log_message = "[" + g_sessionId + "] " + message;
+#else
+    // Desktop: Add timestamp
+    std::string log_message = "[" + get_timestamp() + "] " + message;
+#endif
     
     if (is_async_logging_enabled()) {
         // OPTIMIZATION: Non-blocking push to queue
@@ -168,13 +269,26 @@ void nativeLog(const std::string& message) {
         g_log_queue_cv.notify_one();
     } else {
         // Synchronous logging (original behavior)
-        std::lock_guard<std::mutex> lock(g_logMutex);
-#ifdef HAVE_JNI
+#if HAVE_JNI
+        std::lock_guard<std::mutex> lock(log_mutex());
         __android_log_print(ANDROID_LOG_INFO, "LiteP2P_Native", "%s", log_message.c_str());
         sendToLogUI(log_message);
 #else
-        std::cerr << log_message << std::endl;
+        // Desktop: output raw message to stdout or callback
+        if (g_logCallback) {
+            g_logCallback(log_message);
+        } else {
+            const std::string out = log_message + "\n";
+            (void)::write(1, out.c_str(), out.size());
+        }
 #endif
+    }
+    } catch (const std::exception& e) {
+        // Best-effort fallback: avoid throwing from logger and avoid iostreams during shutdown.
+        const std::string out = std::string("[LOGGER_ERROR] ") + e.what() + "\n";
+        (void)::write(2, out.c_str(), out.size());
+    } catch (...) {
+        // Swallow all exceptions to prevent termination.
     }
 }
 

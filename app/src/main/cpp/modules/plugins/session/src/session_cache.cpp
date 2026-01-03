@@ -1,5 +1,6 @@
 #include "session_cache.h"
 #include "logger.h"
+#include "config_manager.h"
 
 SessionCache::SessionCache() = default;
 
@@ -23,6 +24,7 @@ void SessionCache::cache_session(const std::string& peer_id,
     session->last_used = session->created_at;
     session->usage_count = 0;
     session->is_valid = true;
+    session->session_lifetime_sec = ConfigManager::getInstance().getSessionCacheLifetimeSec();
     
     m_cache[peer_id] = session;
     nativeLog("SessionCache: Cached session for " + peer_id + " (saves handshake on reconnect)");

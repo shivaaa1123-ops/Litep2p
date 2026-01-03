@@ -1,0 +1,32 @@
+WAN multi-node test plan (copy/paste friendly)
+
+Prereqs:
+- India VPS already running signaling+TURN (per config.json).
+- Two peer VPS: Singapore + US.
+- Repo checked out on both peer VPS (same commit) and `config.json` points at India signaling+TURN.
+
+Step 1 (on Singapore VPS):
+  PEER_ID=peer-sg PEER_PORT=30001 sudo bash tools/harness/vps_bootstrap_and_run.sh
+
+Step 2 (on US VPS):
+  PEER_ID=peer-us PEER_PORT=30001 sudo bash tools/harness/vps_bootstrap_and_run.sh
+
+Step 3 (optional) netem stress on one peer VPS (example: add loss/jitter for 10 minutes):
+  # install tc is already done by bootstrap
+  sudo tc qdisc replace dev eth0 root netem loss 5% delay 200ms 50ms distribution normal
+  # later reset:
+  sudo tc qdisc del dev eth0 root || true
+
+Step 4 (connectivity assertions)
+Run the peer binaries with CLI / admin commands (depends on your current CLI commands) to:
+- ensure both peers REGISTER to signaling
+- list peers
+- connect peer-sg <-> peer-us
+- validate CONNECT_SUCCESS and that we never remain CONNECTING/HANDSHAKING beyond watchdog timeouts
+
+Artifacts to collect after each run:
+- tools/harness/vps_peer_peer-sg.log
+- tools/harness/vps_peer_peer-us.log
+- tools/harness/vps_session_manager_test.log (should be PASS)
+
+

@@ -1,10 +1,6 @@
 
 #include "epoll_reactor.h"
 #include "logger.h"
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <vector>
 #include <unordered_map>
 #include <map>
@@ -12,6 +8,13 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+
+#if !BUILD_TARGET_DESKTOP
+
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 struct Timer {
     int id;
@@ -204,3 +207,21 @@ void EpollReactor::post(Task t) { m_impl->post(t); }
 TimerId EpollReactor::runAfter(int ms, Task t) { return m_impl->runAfter(ms, t); }
 TimerId EpollReactor::runEvery(int ms, Task t) { return m_impl->runEvery(ms, t); }
 void EpollReactor::cancelTimer(TimerId id) { m_impl->cancelTimer(id); }
+
+#else
+
+// Desktop/macOS stub implementation
+class EpollReactorImpl {};
+
+EpollReactor::EpollReactor() : m_impl(std::make_unique<EpollReactorImpl>()) {}
+EpollReactor::~EpollReactor() = default;
+void EpollReactor::start() {}
+void EpollReactor::stop() {}
+bool EpollReactor::add(int fd, uint32_t events, EventCallback cb) { return false; }
+bool EpollReactor::remove(int fd) { return false; }
+void EpollReactor::post(Task t) {}
+TimerId EpollReactor::runAfter(int ms, Task t) { return 0; }
+TimerId EpollReactor::runEvery(int ms, Task t) { return 0; }
+void EpollReactor::cancelTimer(TimerId id) {}
+
+#endif

@@ -2,9 +2,11 @@
 #define PEER_TIER_MANAGER_H
 
 #include "peer.h"
+#include "peer_tier.h"
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <chrono>
 #include <memory>
@@ -23,13 +25,6 @@
  * Tier 2 (WARM):  100-300ms, 5,000 max, kept while active
  * Tier 3 (COLD):  >300ms or unknown, broadcast-only, zero memory
  */
-
-enum class PeerTier {
-    TIER_1,     // Hot - direct connection, <100ms latency
-    TIER_2,     // Warm - occasional connection, 100-300ms
-    TIER_3,     // Cold - unknown or broadcast only
-    TIER_UNKNOWN // Not yet classified
-};
 
 /**
  * Latency statistics for a peer
@@ -478,6 +473,10 @@ private:
     std::thread m_promotion_thread;
     std::chrono::steady_clock::time_point m_last_cleanup;
     
+    // Thread synchronization for shutdown
+    std::mutex m_thread_mutex;
+    std::condition_variable m_thread_cv;
+    
     // Metrics
     PeerTierMetrics m_metrics;
     std::string m_last_error;
@@ -508,6 +507,16 @@ private:
      * Find best peer to evict from tier (LRU)
      */
     std::string find_lru_peer_in_tier(PeerTier tier) const;
+
+    // ==================== LOCKED INTERNAL HELPERS ====================
+    // These helpers MUST only be called while holding m_mutex.
+    ManagedPeer* get_peer_locked(const std::string& peer_id);
+    const ManagedPeer* get_peer_locked(const std::string& peer_id) const;
+    bool tier_has_capacity_locked(PeerTier tier) const;
+    std::string find_lru_peer_in_tier_locked(PeerTier tier) const;
+    bool move_peer_to_tier_locked(const std::string& peer_id, PeerTier new_tier);
+    bool should_promote_locked(const std::string& peer_id) const;
+    int cleanup_idle_tier2_locked();
     
     /**
      * Safely move peer to new tier

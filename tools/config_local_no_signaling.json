@@ -1,0 +1,79 @@
+{
+  "network": {
+    "default_server_port": 30001,
+    "discovery_port": 30000,
+    "listen_backlog": 5,
+    "select_max_retries": 3
+  },
+  "communication": {
+    "default_protocol": "UDP",
+    "udp": {
+      "enabled": true,
+      "port": 30001,
+      "buffer_size": 65535,
+      "timeout_ms": 5000,
+      "select_timeout_sec": 1
+    },
+    "tcp": {
+      "enabled": false,
+      "port": 30001,
+      "nodelay": true,
+      "buffer_size": 4096,
+      "connect_timeout_sec": 5,
+      "select_timeout_sec": 1
+    },
+    "quic": {
+      "enabled": false,
+      "port": 30001,
+      "buffer_size": 1048576
+    }
+  },
+  "peer_management": {
+    "peer_timeout_sec": 30,
+    "timer_tick_interval_sec": 10,
+    "ping_interval_sec": 10,
+    "heartbeat_interval_sec": 10,
+    "peer_expiration_timeout_ms": 30000,
+    "max_queued_messages": 100,
+    "max_message_size": 10485760,
+    "max_handshake_retries": 3
+  },
+  "discovery": {
+    "message_prefix": "LITEP2P_DISCOVERY",
+    "max_message_size": 1024,
+    "broadcast_interval_sec": 2
+  },
+  "security": {
+    "noise_nk_protocol": {
+      "enabled": true,
+      "mandatory": true,
+      "key_store_path": "keystore",
+      "key_rotation_interval_hours": 24
+    },
+    "selective_encryption_enabled": true
+  },
+  "nat_traversal": {
+    "enabled": false,
+    "mode": "off",
+    "stun_enabled": false,
+    "hole_punching_enabled": false,
+    "turn_enabled": false
+  },
+  "signaling": {
+    "enabled": false,
+    "url": "ws://127.0.0.1:8765",
+    "reconnect_interval_ms": 5000
+  },
+  "remote_control": {
+    "enabled": false,
+    "allowed_senders": []
+  },
+  "logging": {
+    "level": "debug",
+    "format": "text",
+    "file_path": "litep2p.log",
+    "max_file_size_mb": 10,
+    "retention_days": 7,
+    "console_output": true
+  }
+}

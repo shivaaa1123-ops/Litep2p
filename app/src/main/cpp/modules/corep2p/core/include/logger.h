@@ -6,17 +6,23 @@
 #include <mutex>
 #include <thread>
 #include <memory>
+#include <functional>
 
 // Log level enumeration for conditional logging
 enum class LogLevel {
     DEBUG = 0,     // Every message (most verbose)
     INFO = 1,      // Important events
-    WARNING = 2,   // Problems only (least verbose)
+    WARNING = 2,   // Problems only
+    ERROR = 3,     // Errors only
+    NONE = 4,      // Disable all logging (best performance)
 };
 
 // --- Add a function to set the session ID ---
 void setSessionId(const std::string& session_id);
 void nativeLog(const std::string& message);
+
+// Set a callback for log messages (useful for desktop CLI)
+void setLogCallback(std::function<void(const std::string&)> callback);
 
 // Set global log level for production optimization
 // Default: INFO (skips debug messages)
@@ -33,5 +39,6 @@ bool is_async_logging_enabled();
 #define LOG_DEBUG(msg) if (get_log_level() <= LogLevel::DEBUG) nativeLog(msg)
 #define LOG_INFO(msg)  if (get_log_level() <= LogLevel::INFO) nativeLog(msg)
 #define LOG_WARN(msg)  if (get_log_level() <= LogLevel::WARNING) nativeLog(msg)
+#define LOG_ERROR(msg) if (get_log_level() <= LogLevel::ERROR) nativeLog(msg)
 
 #endif // LOGGER_H

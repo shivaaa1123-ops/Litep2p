@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "contextstream": {
+      "command": "npx",
+      "args": ["-y", "@contextstream/mcp-server"],
+      "env": {
+        "CONTEXTSTREAM_API_URL": "https://api.contextstream.io",
+        "CONTEXTSTREAM_API_KEY": "cbiq_DrbVICcjR8bkSDwHmZ3GKVGuz1IfJZa7lTp5zDSyojM"
+      }
+    }
+  }
+}

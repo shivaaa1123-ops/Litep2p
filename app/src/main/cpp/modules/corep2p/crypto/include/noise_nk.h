@@ -44,8 +44,9 @@ public:
     NoiseNKSession(
         const std::string& peer_id,
         Role role,
-        const std::vector<uint8_t>& initiator_static_pk,  // 32 bytes, Initiator's static public key
-        const std::vector<uint8_t>& responder_static_pk   // 32 bytes, Responder's static public key
+        const std::vector<uint8_t>& peer_ephemeral_or_static_pk,  // Peer's key (initiator's ephemeral for responder, responder's static for initiator)
+        const std::vector<uint8_t>& local_static_pk,              // Our static public key
+        const std::vector<uint8_t>& local_static_sk = {}          // Our static secret key (only needed for responder)
     );
 
     ~NoiseNKSession() = default;
@@ -115,8 +116,8 @@ private:
     State m_state;
 
     // Static keys (32 bytes each, Curve25519)
-    std::vector<uint8_t> m_initiator_static_pk;  // Initiator's public key (known by both)
-    std::vector<uint8_t> m_responder_static_pk;  // Responder's public key (known by responder)
+    std::vector<uint8_t> m_responder_static_pk;  // Responder's static public key
+    std::vector<uint8_t> m_responder_static_sk;  // Responder's static secret key (only for responder role)
 
     // Ephemeral keys (generated fresh per handshake)
     std::vector<uint8_t> m_local_ephemeral_sk;   // Our ephemeral secret key (32 bytes)

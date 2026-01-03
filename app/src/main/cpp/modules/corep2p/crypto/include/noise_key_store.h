@@ -128,6 +128,11 @@ public:
 private:
     mutable std::mutex m_mutex;
 
+    // Resolved file path used for persistence (best-effort).
+    // Note: On Android this should be set to an app-private directory (e.g., filesDir)
+    // via ConfigManager so it is writable.
+    std::string m_storage_file_path;
+
     // Local static keys (32 bytes each for Curve25519)
     std::vector<uint8_t> m_local_private_key;
     std::vector<uint8_t> m_local_public_key;

@@ -7,7 +7,7 @@ constexpr int DISCOVERY_PORT = 30000;
 constexpr int DEFAULT_LISTEN_BACKLOG = 5;
 
 // Timeouts (in seconds/milliseconds)
-constexpr int TCP_CONNECT_TIMEOUT_SEC = 10;
+constexpr int TCP_CONNECT_TIMEOUT_SEC = 3;
 constexpr int TCP_SELECT_TIMEOUT_SEC = 1;
 constexpr int UDP_SELECT_TIMEOUT_SEC = 1;
 constexpr int PEER_TIMEOUT_SEC = 30;  // Increased from 20 for battery savings

@@ -1,18 +1,23 @@
 #ifndef SECURE_SESSION_H
 #define SECURE_SESSION_H
 
-#include "noise_protocol.h"
+#include "noise_nk.h"
+#include "noise_key_store.h"
 #include <string>
 #include <memory>
 #include <map>
 #include <mutex>
+#include <vector>
 
-// SecureSession wraps NoiseSession for easy integration with SessionManager
+// SecureSession wraps Noise NK sessions for integration with SessionManager
 // Handles Noise handshakes transparently and encrypts all messages
 
 class SecureSession {
 public:
-    SecureSession(const std::string& peer_id, NoiseSession::Role role);
+    SecureSession(const std::string& peer_id,
+                  NoiseNKSession::Role role,
+                  NoiseNKManager* manager,
+                  NoiseKeyStore* key_store);
     ~SecureSession();
 
     // Initialize handshake and return first message to send
@@ -34,12 +39,26 @@ public:
     // Get peer ID
     const std::string& get_peer_id() const { return m_peer_id; }
 
+    // Get role
+    NoiseNKSession::Role get_role() const { return m_role; }
+
+    // True if this session has already sent the first initiator handshake message.
+    // Used to distinguish valid responder responses from simultaneous-initiation glare.
+    bool handshake_initiated() const { return m_handshake_initiated; }
+
     // Get session status
     std::string get_status() const;
 
 private:
+    std::shared_ptr<NoiseNKSession> ensure_session();
+    static std::string vector_to_string(const std::vector<uint8_t>& data);
+    static std::vector<uint8_t> string_to_vector(const std::string& data);
+
     std::string m_peer_id;
-    std::unique_ptr<NoiseSession> m_noise_session;
+    NoiseNKSession::Role m_role;
+    NoiseNKManager* m_noise_manager;
+    NoiseKeyStore* m_key_store;
+    mutable std::shared_ptr<NoiseNKSession> m_noise_session;
     bool m_handshake_initiated;
 };
 
@@ -49,10 +68,12 @@ public:
     SecureSessionManager();
     ~SecureSessionManager();
 
+    void set_noise_backend(NoiseNKManager* manager, NoiseKeyStore* key_store);
+
     // Get or create a secure session with a peer
     std::shared_ptr<SecureSession> get_or_create_session(
         const std::string& peer_id, 
-        NoiseSession::Role role
+        NoiseNKSession::Role role
     );
 
     // Remove a session
@@ -68,7 +89,12 @@ public:
     void clear_all();
 
 private:
+    SecureSessionManager(const SecureSessionManager&) = delete;
+    SecureSessionManager& operator=(const SecureSessionManager&) = delete;
+
     std::map<std::string, std::shared_ptr<SecureSession>> m_sessions;
+    NoiseNKManager* m_noise_manager;
+    NoiseKeyStore* m_key_store;
     mutable std::mutex m_mutex;
 };
 

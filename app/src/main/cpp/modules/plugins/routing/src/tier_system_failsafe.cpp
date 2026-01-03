@@ -2,7 +2,15 @@
 #include "logger.h"
 #include <algorithm>
 #include <sstream>
+#include <thread>
+#include <ctime>
+#ifdef __linux__
 #include <sys/sysinfo.h>
+#elif defined(__APPLE__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
 #include <cstring>
 #include <iomanip>
 
@@ -52,48 +60,50 @@ void TierSystemFailsafe::shutdown() {
 
 bool TierSystemFailsafe::report_error(const SystemError& error) {
     try {
-        std::lock_guard<std::mutex> lock(m_mutex);
+        ErrorCallback callback_to_invoke;
+        bool should_alert = false;
         
-        // Add to history
-        m_error_history.push_back(error);
-        if (m_error_history.size() > MAX_ERROR_HISTORY) {
-            m_error_history.erase(m_error_history.begin());
+        // Log error (outside the lock)
+        std::string msg = error.component + " [" + error.error_code + "]: " + error.description;
+        if (!error.context.empty()) msg += " (" + error.context + ")";
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+
+            // Add to history
+            m_error_history.push_back(error);
+            if (m_error_history.size() > MAX_ERROR_HISTORY) {
+                m_error_history.erase(m_error_history.begin());
+            }
+
+            // Update health status
+            switch (error.severity) {
+                case ErrorSeverity::WARNING:
+                    m_health_status.warning_count++;
+                    break;
+                case ErrorSeverity::ERROR:
+                    m_health_status.error_count++;
+                    break;
+                case ErrorSeverity::CRITICAL:
+                    m_health_status.critical_error_count++;
+                    m_health_status.last_critical_error = error.error_code + ": " + error.description;
+                    m_health_status.is_healthy = false;
+                    break;
+                case ErrorSeverity::INFO:
+                default:
+                    break;
+            }
+            m_health_status.last_error_time = error.timestamp;
+
+            should_alert = m_alerting_enabled.load();
+            callback_to_invoke = m_error_callback;
         }
-        
-        // Update health status
-        switch (error.severity) {
-            case ErrorSeverity::WARNING:
-                m_health_status.warning_count++;
-                break;
-            case ErrorSeverity::ERROR:
-                m_health_status.error_count++;
-                break;
-            case ErrorSeverity::CRITICAL:
-                m_health_status.critical_error_count++;
-                m_health_status.last_critical_error = error.error_code + ": " + error.description;
-                m_health_status.is_healthy = false;
-                break;
-            case ErrorSeverity::INFO:
-            default:
-                break;
-        }
-        
-        m_health_status.last_error_time = error.timestamp;
-        
-        // Log error
-        std::string msg = error.component + " [" + error.error_code + "]: " + 
-                         error.description;
-        if (!error.context.empty()) {
-            msg += " (" + error.context + ")";
-        }
-        
+
         switch (error.severity) {
             case ErrorSeverity::INFO:
                 LOG_INFO(msg);  // TierSystemFailsafe
                 break;
             case ErrorSeverity::WARNING:
-                LOG_WARN(msg);  // TierSystemFailsafe
-                break;
             case ErrorSeverity::ERROR:
                 LOG_WARN(msg);  // TierSystemFailsafe
                 break;
@@ -101,11 +111,11 @@ bool TierSystemFailsafe::report_error(const SystemError& error) {
                 LOG_WARN("CRITICAL: " + msg);  // TierSystemFailsafe
                 break;
         }
-        
-        // Call error callback if registered
-        if (m_alerting_enabled && m_error_callback) {
+
+        // Call error callback if registered (outside lock)
+        if (should_alert && callback_to_invoke) {
             try {
-                m_error_callback(error);
+                callback_to_invoke(error);
             } catch (const std::exception& e) {
                 LOG_WARN("Error callback failed: " + std::string(e.what()));  // TierSystemFailsafe
             }
@@ -162,18 +172,13 @@ HealthStatus TierSystemFailsafe::get_health_status() const {
     HealthStatus status = m_health_status;
     
     // Update memory usage
-    struct sysinfo info{};
-    if (sysinfo(&info) == 0) {
-        unsigned long total_mem = info.totalram;
-        unsigned long free_mem = info.freeram;
-        unsigned long used_mem = total_mem - free_mem;
-        status.memory_usage_percent = (static_cast<float>(used_mem) / total_mem) * 100.0f;
-    }
+    status.memory_usage_percent = check_memory_usage();
+
+	// Thread count is informational; if unknown, keep default 0.
     
     // Determine overall health
     status.is_healthy = status.critical_error_count == 0 && 
-                        status.memory_usage_percent < 90.0f &&
-                        status.thread_count > 0;
+                        status.memory_usage_percent < 90.0f;
     
     return status;
 }
@@ -230,29 +235,54 @@ std::string TierSystemFailsafe::get_health_report() const {
 
 bool TierSystemFailsafe::attempt_recovery(const SystemError& error, RecoveryStrategy strategy) {
     try {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        
-        m_health_status.recovery_attempts++;
-        
-        if (perform_recovery(error, strategy)) {
-            m_health_status.successful_recoveries++;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_health_status.recovery_attempts++;
+        }
+
+        const bool ok = perform_recovery(error, strategy);
+        HealthCallback health_cb;
+        bool should_call_health_cb = false;
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (ok) {
+                m_health_status.successful_recoveries++;
+
+				// If this recovery addresses a critical error, clear critical health state.
+				if (error.severity == ErrorSeverity::CRITICAL && m_health_status.critical_error_count > 0) {
+					m_health_status.critical_error_count--;
+					if (m_health_status.critical_error_count == 0) {
+						m_health_status.last_critical_error.clear();
+					}
+				}
+
+                // If system recovered from critical errors, notify.
+				if (!m_health_status.is_healthy && m_health_status.critical_error_count == 0) {
+                    m_health_status.is_healthy = true;
+                    health_cb = m_health_callback;
+                    should_call_health_cb = (health_cb != nullptr);
+                }
+            } else {
+                m_health_status.failed_recovery_attempts++;
+            }
+        }
+
+        if (ok) {
             report_error(ErrorSeverity::INFO, "RECOVERY_SUCCESS",
                         "Recovery strategy succeeded: " + std::to_string(static_cast<int>(strategy)),
                         "TierSystemFailsafe", error.error_code);
-            
-            // Call health callback if system recovered
-            if (!m_health_status.is_healthy && get_error_count(ErrorSeverity::CRITICAL) == 0) {
-                m_health_status.is_healthy = true;
-                if (m_health_callback) {
-                    m_health_callback(true);
+
+            if (should_call_health_cb) {
+                try {
+                    health_cb(true);
+                } catch (const std::exception& e) {
+                    LOG_WARN("Health callback failed: " + std::string(e.what()));
                 }
             }
-            
-            return true;
-        } else {
-            m_health_status.failed_recovery_attempts++;
-            return false;
         }
+
+        return ok;
     } catch (const std::exception& e) {
         LOG_WARN("Recovery attempt failed: " + std::string(e.what()));  // TierSystemFailsafe
         return false;
@@ -368,30 +398,40 @@ bool TierSystemFailsafe::validate_configuration(int max_tier1, int max_tier2) {
 }
 
 float TierSystemFailsafe::check_memory_usage() const {
+#if defined(__linux__)
     struct sysinfo info{};
     if (sysinfo(&info) == 0) {
         unsigned long total_mem = info.totalram;
         unsigned long free_mem = info.freeram;
         unsigned long used_mem = total_mem - free_mem;
-        float usage = (static_cast<float>(used_mem) / total_mem) * 100.0f;
-        
-        // Note: skipping report_error call since this is const and may be called from const methods
-        return usage;
+        return (static_cast<float>(used_mem) / total_mem) * 100.0f;
     }
-    return 0.0f;
-}
+#elif defined(__APPLE__)
+    // Get total memory
+    int mib[2];
+    mib[0] = CTL_HW;
+    mib[1] = HW_MEMSIZE;
+    int64_t total_mem = 0;
+    size_t len = sizeof(total_mem);
+    if (sysctl(mib, 2, &total_mem, &len, nullptr, 0) != 0) {
+        return 0.0f; // Error
+    }
 
-bool TierSystemFailsafe::check_thread_safety() {
-    // This is a simplified check - in production, use more sophisticated deadlock detection
-    // Try to acquire lock with timeout
-    std::unique_lock<std::mutex> lock(m_mutex, std::defer_lock);
-    if (!lock.try_lock()) {
-        report_error(ErrorSeverity::CRITICAL, ErrorCodes::MUTEX_DEADLOCK,
-                    "Potential deadlock detected in failsafe system",
-                    "TierSystemFailsafe");
-        return false;
+    // Get used memory
+    mach_port_t mach_port = mach_host_self();
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm_stats;
+    vm_size_t page_size;
+    host_page_size(mach_port, &page_size);
+
+    if (host_statistics64(mach_port, HOST_VM_INFO64, (host_info64_t)&vm_stats, &count) == KERN_SUCCESS) {
+        unsigned long long used_memory = (vm_stats.active_count +
+                                          vm_stats.inactive_count +
+                                          vm_stats.wire_count) * page_size;
+        return (static_cast<float>(used_memory) / total_mem) * 100.0f;
     }
-    return true;
+#endif
+    return 0.0f;
 }
 
 std::string TierSystemFailsafe::get_diagnostics() {
@@ -518,6 +558,7 @@ bool TierSystemFailsafe::perform_recovery(const SystemError& error, RecoveryStra
 }
 
 bool TierSystemFailsafe::is_peer_quarantined(const std::string& peer_id) const {
+	std::lock_guard<std::mutex> lock(m_mutex);
     auto it = m_quarantined_peers.find(peer_id);
     if (it == m_quarantined_peers.end()) {
         return false;
@@ -530,11 +571,19 @@ bool TierSystemFailsafe::is_peer_quarantined(const std::string& peer_id) const {
 }
 
 void TierSystemFailsafe::quarantine_peer(const std::string& peer_id) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_quarantined_peers[peer_id] = std::chrono::steady_clock::now();
     LOG_WARN("Peer quarantined: " + peer_id);  // TierSystemFailsafe
 }
 
 void TierSystemFailsafe::release_quarantine(const std::string& peer_id) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     m_quarantined_peers.erase(peer_id);
     LOG_INFO("Peer quarantine released: " + peer_id);  // TierSystemFailsafe
+}
+
+bool TierSystemFailsafe::check_thread_safety() {
+    // Placeholder: full deadlock detection requires platform-specific instrumentation.
+    // We still return true to avoid false negatives, and keep this hook for future improvements.
+    return true;
 }

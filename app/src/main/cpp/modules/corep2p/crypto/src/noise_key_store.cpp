@@ -1,8 +1,44 @@
 #include "noise_key_store.h"
 #include "logger.h"
+#include "config_manager.h"
+#include <sodium.h>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <fstream>
+#include <filesystem>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
+
+namespace {
+
+std::string resolve_keystore_file_path(const std::string& configured_path) {
+    // The config value historically was a directory-ish string like "keystore".
+    // Support both:
+    //  - directory path (append a default file name)
+    //  - explicit file path (ends with .json)
+    const std::string base = configured_path.empty() ? std::string("keystore") : configured_path;
+    std::filesystem::path p(base);
+
+    const bool looks_like_file = p.has_extension() && p.extension() == ".json";
+    if (looks_like_file) {
+        return p.string();
+    }
+
+    return (p / "noise_keystore.json").string();
+}
+
+bool ensure_parent_dir(const std::string& file_path) {
+    std::error_code ec;
+    std::filesystem::path p(file_path);
+    const auto parent = p.parent_path();
+    if (parent.empty()) return true;
+    if (std::filesystem::exists(parent, ec)) return true;
+    return std::filesystem::create_directories(parent, ec);
+}
+
+} // namespace
 
 // Helper functions
 std::string NoiseKeyStore::bytes_to_hex(const std::vector<uint8_t>& data) {
@@ -28,33 +64,150 @@ NoiseKeyStore::NoiseKeyStore() : m_initialized(false), m_dirty(false) {
 }
 
 bool NoiseKeyStore::initialize() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    
-    // In production, this would:
-    // 1. Call JNI to read from Android SharedPreferences (encrypted)
-    // 2. Load local static key from Android Keystore
-    // 3. Load peer keys from SharedPreferences
-    
-    // For now, assume empty state and keys will be set programmatically
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    // Resolve persistence file path once.
+    if (m_storage_file_path.empty()) {
+        const std::string configured = ConfigManager::getInstance().getKeyStorePath();
+        m_storage_file_path = resolve_keystore_file_path(configured);
+    }
+
+    // Best-effort load.
+    bool loaded_anything = false;
+    try {
+        std::ifstream in(m_storage_file_path);
+        if (in.good()) {
+            json j;
+            in >> j;
+
+            if (j.is_object()) {
+                if (auto it = j.find("local_private_key_hex"); it != j.end() && it->is_string()) {
+                    m_local_private_key = hex_to_bytes(it->get<std::string>());
+                }
+                if (auto it = j.find("local_public_key_hex"); it != j.end() && it->is_string()) {
+                    m_local_public_key = hex_to_bytes(it->get<std::string>());
+                }
+
+                // Validate local keys (must both be 32 bytes).
+                if (m_local_private_key.size() != 32 || m_local_public_key.size() != 32) {
+                    m_local_private_key.clear();
+                    m_local_public_key.clear();
+                } else {
+                    loaded_anything = true;
+                }
+
+                if (auto it = j.find("peer_keys"); it != j.end() && it->is_object()) {
+                    for (auto& kv : it->items()) {
+                        if (!kv.value().is_string()) continue;
+                        auto key = hex_to_bytes(kv.value().get<std::string>());
+                        if (key.size() != 32) continue;
+                        m_peer_keys[kv.key()] = std::move(key);
+                    }
+                    if (!m_peer_keys.empty()) {
+                        loaded_anything = true;
+                    }
+                }
+            }
+
+            nativeLog(
+                "KeyStore: Initialized from storage (path=" + m_storage_file_path + ", peers=" +
+                std::to_string(m_peer_keys.size()) + ")"
+            );
+        } else {
+            nativeLog("KeyStore: No existing keystore file; will generate a local static key");
+        }
+    } catch (const std::exception& e) {
+        nativeLog(std::string("ERROR: KeyStore: Failed to load keystore: ") + e.what());
+        m_local_private_key.clear();
+        m_local_public_key.clear();
+        m_peer_keys.clear();
+    }
+
     m_initialized = true;
-    nativeLog("KeyStore: Initialized from storage");
+    m_dirty = false;
+
+    // Ensure local identity exists.
+    if (m_local_public_key.empty()) {
+        lock.unlock();
+        return generate_and_store_local_key();
+    }
+
+    // If we loaded something, ensure the file path directory exists and re-save once
+    // to normalize format (best-effort).
+    lock.unlock();
+    if (loaded_anything) {
+        save();
+    }
     return true;
 }
 
 bool NoiseKeyStore::save() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    
-    if (!m_dirty) {
-        return true;  // Nothing to save
+    std::unique_lock<std::mutex> lock(m_mutex);
+
+    if (!m_initialized) {
+        nativeLog("WARN: KeyStore: save() called before initialize(); ignoring");
+        return false;
     }
-    
-    // In production, this would:
-    // 1. Call JNI to save to Android SharedPreferences (encrypted)
-    // 2. Save local static key to Android Keystore
-    // 3. Save peer keys to SharedPreferences
-    
+
+    if (!m_dirty) {
+        return true; // Nothing to save
+    }
+
+    if (m_storage_file_path.empty()) {
+        const std::string configured = ConfigManager::getInstance().getKeyStorePath();
+        m_storage_file_path = resolve_keystore_file_path(configured);
+    }
+
+    const std::string path = m_storage_file_path;
+    const std::string tmp_path = path + ".tmp";
+
+    json j;
+    j["version"] = 1;
+    j["local_private_key_hex"] = bytes_to_hex(m_local_private_key);
+    j["local_public_key_hex"] = bytes_to_hex(m_local_public_key);
+    json peers = json::object();
+    for (const auto& kv : m_peer_keys) {
+        peers[kv.first] = bytes_to_hex(kv.second);
+    }
+    j["peer_keys"] = std::move(peers);
+
+    // Drop the lock while doing I/O.
+    lock.unlock();
+
+    if (!ensure_parent_dir(path)) {
+        nativeLog("ERROR: KeyStore: Failed to create keystore directory for " + path);
+        return false;
+    }
+
+    try {
+        {
+            std::ofstream out(tmp_path, std::ios::trunc);
+            if (!out.is_open()) {
+                nativeLog("ERROR: KeyStore: Failed to open keystore file for writing: " + tmp_path);
+                return false;
+            }
+            out << j.dump(2);
+            if (!out.good()) {
+                nativeLog("ERROR: KeyStore: Failed writing keystore file: " + tmp_path);
+                return false;
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(tmp_path, path, ec);
+        if (ec) {
+            // Windows-friendly fallback. (Also covers some Android/filesystem quirks.)
+            std::filesystem::copy_file(tmp_path, path, std::filesystem::copy_options::overwrite_existing, ec);
+            std::filesystem::remove(tmp_path, ec);
+        }
+    } catch (const std::exception& e) {
+        nativeLog(std::string("ERROR: KeyStore: Exception while saving keystore: ") + e.what());
+        return false;
+    }
+
+    lock.lock();
     m_dirty = false;
-    nativeLog("KeyStore: Saved to persistent storage");
+    nativeLog("KeyStore: Saved to persistent storage (path=" + path + ")");
     return true;
 }
 
@@ -63,13 +216,18 @@ void NoiseKeyStore::set_local_static_key(const std::vector<uint8_t>& private_key
         nativeLog("ERROR: KeyStore: Local keys must be 32 bytes");
         return;
     }
-    
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_local_private_key = private_key;
-    m_local_public_key = public_key;
-    m_dirty = true;
-    
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_local_private_key = private_key;
+        m_local_public_key = public_key;
+        m_dirty = true;
+    }
+
     nativeLog("KeyStore: Local static key set (pk=" + bytes_to_hex(public_key).substr(0, 8) + "...)");
+
+    // Best-effort persistence.
+    save();
 }
 
 std::vector<uint8_t> NoiseKeyStore::get_local_static_private_key() const {
@@ -78,7 +236,9 @@ std::vector<uint8_t> NoiseKeyStore::get_local_static_private_key() const {
 }
 
 std::vector<uint8_t> NoiseKeyStore::get_local_static_public_key() const {
+    // nativeLog("KeyStore: Acquiring lock for get_local_static_public_key");
     std::lock_guard<std::mutex> lock(m_mutex);
+    // nativeLog("KeyStore: Lock acquired for get_local_static_public_key");
     return m_local_public_key;
 }
 
@@ -88,10 +248,28 @@ bool NoiseKeyStore::has_local_static_key() const {
 }
 
 bool NoiseKeyStore::generate_and_store_local_key() {
-    // This would call JNI to generate key in Android Keystore
-    // For now, this is a placeholder - actual generation happens in Java
-    nativeLog("KeyStore: generate_and_store_local_key() - implement in Java via JNI");
-    return false;
+    if (sodium_init() < 0) {
+        nativeLog("ERROR: KeyStore: libsodium initialization failed while generating local key");
+        return false;
+    }
+
+    std::vector<uint8_t> public_key(crypto_box_PUBLICKEYBYTES, 0x00);
+    std::vector<uint8_t> private_key(crypto_box_SECRETKEYBYTES, 0x00);
+
+    if (crypto_box_keypair(public_key.data(), private_key.data()) != 0) {
+        nativeLog("ERROR: KeyStore: crypto_box_keypair failed while generating local key");
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_local_public_key = std::move(public_key);
+        m_local_private_key = std::move(private_key);
+        m_dirty = true;
+    }
+
+    nativeLog("KeyStore: Generated new local static keypair");
+    return save();
 }
 
 void NoiseKeyStore::register_peer_key(const std::string& peer_id, const std::vector<uint8_t>& public_key) {
@@ -100,11 +278,28 @@ void NoiseKeyStore::register_peer_key(const std::string& peer_id, const std::vec
         return;
     }
     
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_peer_keys[peer_id] = public_key;
-    m_dirty = true;
-    
-    nativeLog("KeyStore: Peer key registered for " + peer_id + " (pk=" + bytes_to_hex(public_key).substr(0, 8) + "...)");
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        auto it = m_peer_keys.find(peer_id);
+        if (it != m_peer_keys.end() && it->second != public_key) {
+            changed = true;
+        }
+        m_peer_keys[peer_id] = public_key;
+        m_dirty = true;
+    }
+
+    if (changed) {
+        nativeLog(
+            "WARN: KeyStore: Peer key changed for " + peer_id + " (pk=" +
+            bytes_to_hex(public_key).substr(0, 8) + "...)"
+        );
+    } else {
+        nativeLog("KeyStore: Peer key registered for " + peer_id + " (pk=" + bytes_to_hex(public_key).substr(0, 8) + "...)");
+    }
+
+    // Best-effort persistence.
+    save();
 }
 
 std::vector<uint8_t> NoiseKeyStore::get_peer_key(const std::string& peer_id) const {
@@ -122,10 +317,17 @@ bool NoiseKeyStore::has_peer_key(const std::string& peer_id) const {
 }
 
 void NoiseKeyStore::remove_peer_key(const std::string& peer_id) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_peer_keys.erase(peer_id) > 0) {
-        m_dirty = true;
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        removed = (m_peer_keys.erase(peer_id) > 0);
+        if (removed) {
+            m_dirty = true;
+        }
+    }
+    if (removed) {
         nativeLog("KeyStore: Peer key removed for " + peer_id);
+        save();
     }
 }
 
@@ -144,11 +346,18 @@ size_t NoiseKeyStore::get_peer_count() const {
 }
 
 void NoiseKeyStore::clear_peer_keys() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_peer_keys.empty()) {
-        m_peer_keys.clear();
-        m_dirty = true;
+    bool had_any = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        had_any = !m_peer_keys.empty();
+        if (had_any) {
+            m_peer_keys.clear();
+            m_dirty = true;
+        }
+    }
+    if (had_any) {
         nativeLog("KeyStore: All peer keys cleared");
+        save();
     }
 }
 

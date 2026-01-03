@@ -37,4 +37,10 @@ void sendPeersToUI(const std::vector<Peer>& peers);
  */
 void sendToLogUI(const std::string& message);
 
+/**
+ * @brief Sets the log level.
+ * @param level The log level to set.
+ */
+void setLogLevel(int level);
+
 #endif // JNI_BRIDGE_H

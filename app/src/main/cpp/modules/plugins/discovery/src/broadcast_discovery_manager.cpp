@@ -70,18 +70,32 @@ void BroadcastDiscoveryManager::shutdown() {
             std::lock_guard<std::mutex> lock(m_mutex);
             
             if (!m_running) {
+                LOG_INFO("BroadcastDiscoveryManager: Already shutdown, returning");
                 return;
             }
             
+            LOG_INFO("BroadcastDiscoveryManager: Setting m_running=false");
             m_running = false;
         }
+
+        // Wake background loops immediately so joins don't wait on sleep intervals.
+        m_wait_cv.notify_all();
         
         // Wait for threads to finish
+        LOG_INFO("BroadcastDiscoveryManager: Joining cleanup thread...");
         if (m_cleanup_thread.joinable()) {
             m_cleanup_thread.join();
+            LOG_INFO("BroadcastDiscoveryManager: Cleanup thread joined");
+        } else {
+            LOG_INFO("BroadcastDiscoveryManager: Cleanup thread not joinable");
         }
+        
+        LOG_INFO("BroadcastDiscoveryManager: Joining response timeout thread...");
         if (m_response_timeout_thread.joinable()) { // Updated m_timeout_thread
             m_response_timeout_thread.join(); // Updated m_timeout_thread
+            LOG_INFO("BroadcastDiscoveryManager: Response timeout thread joined");
+        } else {
+            LOG_INFO("BroadcastDiscoveryManager: Response timeout thread not joinable");
         }
         
         {
@@ -558,8 +572,18 @@ std::string BroadcastDiscoveryManager::dump_pending_discoveries() const {
 void BroadcastDiscoveryManager::cleanup_loop() {
     while (m_running) {
         try {
-            std::this_thread::sleep_for(std::chrono::seconds(m_config.dedup_timeout_sec));  // Use config timeout
-            
+            // Wait for the next cleanup interval, but allow shutdown to interrupt immediately.
+            {
+                std::unique_lock<std::mutex> wl(m_wait_mutex);
+                m_wait_cv.wait_for(
+                    wl,
+                    std::chrono::seconds(m_config.dedup_timeout_sec),
+                    [this] { return !m_running.load(); }
+                );
+            }
+
+            if (!m_running) break;
+
             std::lock_guard<std::mutex> lock(m_mutex);
             
             auto now = std::chrono::steady_clock::now();
@@ -586,8 +610,20 @@ void BroadcastDiscoveryManager::cleanup_loop() {
 void BroadcastDiscoveryManager::response_timeout_loop() {
     while (m_running) {
         try {
-            std::this_thread::sleep_for(std::chrono::seconds(m_config.discovery_timeout_sec / 5));  // Check more frequently
-            
+            const int poll_sec = std::max(1, m_config.discovery_timeout_sec / 5);
+
+            // Wait for the next check interval, but allow shutdown to interrupt immediately.
+            {
+                std::unique_lock<std::mutex> wl(m_wait_mutex);
+                m_wait_cv.wait_for(
+                    wl,
+                    std::chrono::seconds(poll_sec),
+                    [this] { return !m_running.load(); }
+                );
+            }
+
+            if (!m_running) break;
+
             std::lock_guard<std::mutex> lock(m_mutex);
             
             auto now = std::chrono::steady_clock::now();
@@ -693,4 +729,8 @@ int BroadcastDiscoveryManager::calculate_avg_latency() const {
     }
     if (count == 0) return 0; // Avoid division by zero
     return static_cast<int>(total_latency / count);
+}
+
+bool BroadcastDiscoveryManager::is_running() const {
+    return m_running.load();
 }

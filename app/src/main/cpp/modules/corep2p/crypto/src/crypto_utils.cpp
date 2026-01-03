@@ -16,6 +16,16 @@ static const uint8_t g_aes_key[KEYLEN] = {
     0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08
 };
 
+static std::string to_hex_debug(const uint8_t* data, size_t len) {
+    std::string hex;
+    char buf[3];
+    for(size_t i=0; i<len; ++i) {
+        snprintf(buf, sizeof(buf), "%02x", data[i]);
+        hex += buf;
+    }
+    return hex;
+}
+
 // Generate random IV for each encryption operation
 void generate_random_iv(uint8_t* iv, size_t length) {
     if (!iv || length != AES_BLOCKLEN) {
@@ -64,6 +74,8 @@ std::string encrypt_message(const std::string& plain_text) {
     
     AES_init_ctx_iv(&ctx, g_aes_key, random_iv);
     
+    nativeLog("AES_ENCRYPT: Key=" + to_hex_debug(g_aes_key, 4) + "..., IV=" + to_hex_debug(random_iv, AES_BLOCKLEN));
+
     std::string encrypted_text = plain_text;
     pkcs7_pad(encrypted_text);
     
@@ -78,7 +90,7 @@ std::string encrypt_message(const std::string& plain_text) {
 
 std::string decrypt_message(const std::string& encrypted_text) {
     if (encrypted_text.length() < AES_BLOCKLEN) {
-        nativeLog("AES Error: Ciphertext too short to contain IV.");
+        nativeLog("AES Error: Ciphertext too short to contain IV. len=" + std::to_string(encrypted_text.length()) + ", need>=" + std::to_string(AES_BLOCKLEN));
         return "";
     }
 
@@ -90,12 +102,14 @@ std::string decrypt_message(const std::string& encrypted_text) {
     std::string ciphertext = encrypted_text.substr(AES_BLOCKLEN);
     
     if (ciphertext.length() % AES_BLOCKLEN != 0) {
-        nativeLog("AES Error: Ciphertext is not a multiple of block size.");
+        nativeLog("AES Error: Ciphertext is not a multiple of block size. ciphertext_len=" + std::to_string(ciphertext.length()) + ", block=" + std::to_string(AES_BLOCKLEN));
         return "";
     }
 
     struct AES_ctx ctx;
     AES_init_ctx_iv(&ctx, g_aes_key, iv);
+
+    // nativeLog("AES_DECRYPT: Key=" + to_hex_debug(g_aes_key, 4) + "..., IV=" + to_hex_debug(iv, AES_BLOCKLEN));
 
     std::string decrypted_text = ciphertext;
     AES_CBC_decrypt_buffer(&ctx, (uint8_t*)decrypted_text.data(), decrypted_text.length());

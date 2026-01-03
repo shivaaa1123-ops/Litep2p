@@ -1,0 +1,82 @@
+name: WAN connectivity (self-hosted SG/US)
+
+on:
+  workflow_dispatch:
+    inputs:
+      deadline_sec:
+        description: "Max seconds to reach connected"
+        required: false
+        default: "60"
+      comms_mode:
+        description: "UDP|TCP|QUIC"
+        required: false
+        default: "UDP"
+  schedule:
+    # Nightly
+    - cron: "0 2 * * *"
+
+jobs:
+  wan_connect:
+    name: "${{ matrix.name }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: sg->us
+            runner_label: litep2p-sg
+            peer_id: peer-sg
+            target_peer_id: peer-us
+            port: 30001
+          - name: us->sg
+            runner_label: litep2p-us
+            peer_id: peer-us
+            target_peer_id: peer-sg
+            port: 30001
+    runs-on: [self-hosted, "${{ matrix.runner_label }}"]
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build wan_integration_runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd desktop
+          mkdir -p build_ci
+          cd build_ci
+          cmake -G Ninja ..
+          cmake --build . -j2 --target wan_integration_runner
+
+      - name: Run wan integration
+        shell: bash
+        env:
+          # Do NOT rely on a repo-tracked config.json (it may contain secrets).
+          # Put a real config on each runner at /etc/litep2p/config.json.
+          CONFIG_PATH: /etc/litep2p/config.json
+          PEER_ID: ${{ matrix.peer_id }}
+          TARGET_PEER_ID: ${{ matrix.target_peer_id }}
+          PORT: ${{ matrix.port }}
+          COMMS_MODE: ${{ inputs.comms_mode || 'UDP' }}
+          DEADLINE_SEC: ${{ inputs.deadline_sec || '60' }}
+          OUT_STATUS_JSON: ${{ github.workspace }}/wan_status_${{ matrix.name }}.json
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${CONFIG_PATH}" ]]; then
+            echo "Missing CONFIG_PATH=${CONFIG_PATH} on this runner."
+            echo "Create it from config.example.json and fill in signaling+TURN endpoints/creds."
+            exit 3
+          fi
+          cd desktop/build_ci
+          ./bin/wan_integration_runner |& tee "${GITHUB_WORKSPACE}/wan_run_${{ matrix.name }}.log"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wan-${{ matrix.name }}
+          path: |
+            wan_run_${{ matrix.name }}.log
+            wan_status_${{ matrix.name }}.json
+
+

@@ -17,11 +17,17 @@ if(JNI_FOUND)
     message(STATUS "✓ JNI found - building JNI module")
     
     add_library(litep2p_jni OBJECT
-        src/jni_bridge.cpp
         src/jni_helpers.cpp
         src/p2p_api.cpp
         src/p2p_entry.cpp
     )
+
+    # NOTE:
+    # The real Android JNI bridge implementation is built from:
+    #   app/src/main/cpp/src/jni_bridge.cpp
+    # and linked into the shared library target `litep2p`.
+    # Keep this module free of duplicate JNI entrypoints to avoid symbol clashes
+    # and maintenance divergence.
 
     # Expose include directories with proper scope propagation
     target_include_directories(litep2p_jni PUBLIC

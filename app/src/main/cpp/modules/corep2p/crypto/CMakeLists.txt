@@ -6,7 +6,7 @@ add_library(litep2p_crypto OBJECT
     src/aes.cpp
     src/crypto_utils.cpp
     src/noise_protocol.cpp
-    # src/noise_nk.cpp  # Temporarily disabled due to libsodium API issues
+    src/noise_nk.cpp
     src/noise_key_store.cpp
 )
 

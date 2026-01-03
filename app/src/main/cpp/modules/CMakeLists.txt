@@ -4,6 +4,18 @@
 cmake_minimum_required(VERSION 3.22.1)
 project("litep2p")
 
+# ==========================================================================
+# OPTIONAL MODULES
+# ==========================================================================
+
+option(ENABLE_PROXY_MODULE "Enable Proxy (relay) module" ON)
+
+if(ENABLE_PROXY_MODULE)
+    add_compile_definitions(ENABLE_PROXY_MODULE=1)
+else()
+    add_compile_definitions(ENABLE_PROXY_MODULE=0)
+endif()
+
 # Position independent code for shared libraries
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -55,6 +67,12 @@ add_subdirectory(plugins/routing)
 add_subdirectory(plugins/optimization)
 add_subdirectory(plugins/file_transfer)
 
+if(ENABLE_PROXY_MODULE)
+    add_subdirectory(plugins/proxy)
+    # Session owns message dispatch, so it pulls in proxy objects when enabled.
+    target_link_libraries(litep2p_session PUBLIC litep2p_proxy)
+endif()
+
 # Layer 5: Interface Plugin (Android/Kotlin interop)
 add_subdirectory(plugins/jni)
 
@@ -69,6 +87,7 @@ add_library(litep2p SHARED
 # Link all module dependencies
 target_link_libraries(litep2p
     ${log-lib}
+    litep2p_session
 )
 
 if(HAVE_SODIUM)
@@ -112,6 +131,12 @@ message(STATUS "    ✓ litep2p_routing (NAT traversal)")
 message(STATUS "    ✓ litep2p_optimization (Battery/CPU optimization)")
 message(STATUS "    ✓ litep2p_file_transfer (File transfer)")
 message(STATUS "    ✓ litep2p_jni (Android/Kotlin interop)")
+
+if(ENABLE_PROXY_MODULE)
+    message(STATUS "    ✓ litep2p_proxy (Proxy / Relay)")
+else()
+    message(STATUS "    - litep2p_proxy (Proxy / Relay) [DISABLED]")
+endif()
 message(STATUS "")
 message(STATUS "  Final Library: litep2p (shared)")
 message(STATUS "════════════════════════════════════════════════════════════")

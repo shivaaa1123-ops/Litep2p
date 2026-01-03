@@ -32,9 +32,14 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
         return Holder(v)
     }
 
+    // Safely truncate peer ID for display (handles IDs shorter than 8 chars)
+    private fun truncateId(id: String): String {
+        return if (id.length > 8) "${id.take(8)}..." else id
+    }
+
     override fun onBindViewHolder(holder: Holder, position: Int) {
         val p = items[position]
-        holder.id.text = "ID: ${p.id.substring(0, 8)}..."
+        holder.id.text = "ID: ${truncateId(p.id)}"
         holder.ip.text = "IP: ${p.ip}"
         holder.port.text = "Port: ${p.port}"
         holder.status.text = "Status: ${if (p.connected) "Connected" else "Disconnected"}"
@@ -48,7 +53,7 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
                 val context = holder.itemView.context
 
                 if (!currentPeer.connected) {
-                    Toast.makeText(context, "Connecting to ${currentPeer.id.substring(0, 8)}...", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Connecting to ${truncateId(currentPeer.id)}...", Toast.LENGTH_SHORT).show()
                     // Log connection type and peer info
                     val connectionType = P2P.getConnectionType() // Assume this returns "TCP" or "UDP"
                     Log.i("LiteP2P_UI", "User requested $connectionType connection to peer ${currentPeer.id} (IP: ${currentPeer.ip}, Port: ${currentPeer.port})")
@@ -58,7 +63,7 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
                     val editText = dialogView.findViewById<EditText>(R.id.messageEditText)
 
                     AlertDialog.Builder(context)
-                        .setTitle("Send Message to ${currentPeer.id.substring(0, 8)}")
+                        .setTitle("Send Message to ${truncateId(currentPeer.id)}")
                         .setView(dialogView)
                         .setPositiveButton("Send") { dialog, _ ->
                             val message = editText.text.toString()

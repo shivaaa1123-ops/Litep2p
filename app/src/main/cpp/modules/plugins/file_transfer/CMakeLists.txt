@@ -3,6 +3,10 @@
 
 add_library(litep2p_file_transfer OBJECT
     src/file_transfer_manager.cpp
+    src/file_transfer_chunks.cpp
+    src/file_transfer_checkpoint.cpp
+    src/file_transfer_congestion.cpp
+    src/file_transfer_paths.cpp
 )
 
 # Expose include directories with proper scope propagation

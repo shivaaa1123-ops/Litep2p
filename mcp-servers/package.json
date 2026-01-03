@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@contextstream/mcp-server": "^0.3.19"
+  }
+}

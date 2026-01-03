@@ -7,6 +7,10 @@ add_library(litep2p_transport OBJECT
     src/udp_connection_manager.cpp
     src/multi_socket_manager.cpp
     src/batch_connection_manager.cpp
+    src/tcp_message.cpp
+    src/udp_message.cpp
+    src/quic_message.cpp
+    src/quic_connection_manager.cpp
 )
 
 # Expose include directories with proper scope propagation

@@ -3,6 +3,7 @@
 #include <cstring>
 #include <memory>
 #include <cstdlib>
+#include <stdexcept>
 #include <sodium.h>
 
 // Noise Protocol NN state machine implementation
@@ -194,13 +195,20 @@ public:
     // Mix DH output into chaining key and encryption key
     void mix_key(const std::string& dh_result) {
         // ck, k = HKDF(ck, dh_result)
-        uint8_t out[HASH_LEN + 32];
-        crypto_auth_hmacsha256_state state;
-        crypto_auth_hmacsha256_init(&state, m_noise_state.ck, HASH_LEN);
-        crypto_auth_hmacsha256_update(&state, (const unsigned char*)dh_result.data(), dh_result.size());
-        crypto_auth_hmacsha256_final(&state, out);
-        memcpy(m_noise_state.ck, out, HASH_LEN);
-        memcpy(m_noise_state.k, out + HASH_LEN, 32);
+        // Simplified HKDF for Noise:
+        // temp_k = HMAC-SHA256(ck, dh_result)
+        // ck = HMAC-SHA256(temp_k, 0x01)
+        // k = HMAC-SHA256(temp_k, 0x02)
+        
+        uint8_t temp_k[HASH_LEN];
+        crypto_auth_hmacsha256(temp_k, (const unsigned char*)dh_result.data(), dh_result.size(), m_noise_state.ck);
+        
+        uint8_t one = 0x01;
+        crypto_auth_hmacsha256(m_noise_state.ck, &one, 1, temp_k);
+        
+        uint8_t two = 0x02;
+        crypto_auth_hmacsha256(m_noise_state.k, &two, 1, temp_k);
+        
         m_noise_state.key_set = true;
         m_noise_state.n = 0;
     }

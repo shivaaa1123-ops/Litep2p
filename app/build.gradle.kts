@@ -12,9 +12,13 @@ android {
         minSdk = 24
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1"
+        versionName = "0.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
 
         externalNativeBuild {
             cmake {
@@ -39,6 +43,32 @@ android {
                     arguments += "-DBUILD_TESTING=OFF"
                 }
             }
+        }
+    }
+
+    // Build flavors for thread mode selection
+    flavorDimensions += "threadMode"
+    productFlavors {
+        create("multiThread") {
+            dimension = "threadMode"
+            // Normal multi-threaded mode (default)
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DSINGLE_THREAD_MODE=OFF"
+                }
+            }
+        }
+        create("singleThread") {
+            dimension = "threadMode"
+            // Single-thread mode for reduced resource usage
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DSINGLE_THREAD_MODE=ON"
+                }
+            }
+            // Optional: different app suffix for testing both versions
+            applicationIdSuffix = ".st"
+            versionNameSuffix = "-singlethread"
         }
     }
 

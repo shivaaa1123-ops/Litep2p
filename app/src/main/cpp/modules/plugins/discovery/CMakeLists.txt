@@ -5,6 +5,7 @@ add_library(litep2p_discovery OBJECT
     src/discovery.cpp
     src/broadcast_discovery_manager.cpp
     src/peer_cache_lru.cpp
+    src/signaling_client.cpp
 )
 
 # Expose include directories with proper scope propagation

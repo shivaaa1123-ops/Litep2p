@@ -5,9 +5,63 @@ cmake_minimum_required(VERSION 3.22.1)
 # Project name and version
 project(litep2p VERSION 0.2.0)
 
+# Module Configuration Options - Enable/Disable features
+option(LITEP2P_ENABLE_NETWORK_TRAVERSAL "Enable NAT traversal and network traversal features" ON)
+option(LITEP2P_ENABLE_NOISE_PROTOCOL "Enable Noise protocol for encrypted communication" ON)
+option(LITEP2P_ENABLE_DISCOVERY "Enable peer discovery service" ON)
+option(LITEP2P_ENABLE_FILE_TRANSFER "Enable file transfer capabilities" ON)
+option(LITEP2P_ENABLE_OPTIMIZATION "Enable battery and network optimization" ON)
+option(LITEP2P_ENABLE_ROUTING "Enable routing capabilities" ON)
+
+# Optional compile-time module: Proxy / Relay
+option(ENABLE_PROXY_MODULE "Enable Proxy (relay) module" ON)
+
+# Single-thread mode: reduces thread count for efficiency
+option(SINGLE_THREAD_MODE "Enable single-thread mode for reduced resource usage" OFF)
+
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Add compile definitions based on configuration
+if(LITEP2P_ENABLE_NETWORK_TRAVERSAL)
+    add_compile_definitions(HAVE_NETWORK_TRAVERSAL)
+endif()
+
+if(LITEP2P_ENABLE_NOISE_PROTOCOL)
+    add_compile_definitions(HAVE_NOISE_PROTOCOL)
+endif()
+
+if(LITEP2P_ENABLE_DISCOVERY)
+    add_compile_definitions(HAVE_DISCOVERY)
+endif()
+
+if(LITEP2P_ENABLE_FILE_TRANSFER)
+    add_compile_definitions(HAVE_FILE_TRANSFER)
+endif()
+
+if(LITEP2P_ENABLE_OPTIMIZATION)
+    add_compile_definitions(HAVE_OPTIMIZATION)
+endif()
+
+if(LITEP2P_ENABLE_ROUTING)
+    add_compile_definitions(HAVE_ROUTING)
+endif()
+
+# Propagate proxy module toggle as a numeric macro for conditional compilation.
+if(ENABLE_PROXY_MODULE)
+    add_compile_definitions(ENABLE_PROXY_MODULE=1)
+else()
+    add_compile_definitions(ENABLE_PROXY_MODULE=0)
+endif()
+
+# Single-thread mode compile definition
+if(SINGLE_THREAD_MODE)
+    add_compile_definitions(LITEP2P_SINGLE_THREAD_MODE_COMPILE=1)
+    message(STATUS "Single-thread mode: ENABLED")
+else()
+    message(STATUS "Single-thread mode: DISABLED")
+endif()
 
 # Add compile definitions for JNI
 add_compile_definitions(HAVE_JNI)
@@ -19,11 +73,30 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/corep2p/reactor/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/corep2p/transport/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/corep2p/security/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/discovery/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/routing/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/session/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/optimization/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/file_transfer/include
+)
+
+if(ENABLE_PROXY_MODULE)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/proxy/include)
+endif()
+
+if(LITEP2P_ENABLE_DISCOVERY)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/discovery/include)
+endif()
+
+if(LITEP2P_ENABLE_ROUTING)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/routing/include)
+endif()
+
+if(LITEP2P_ENABLE_OPTIMIZATION)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/optimization/include)
+endif()
+
+if(LITEP2P_ENABLE_FILE_TRANSFER)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/file_transfer/include)
+endif()
+
+include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/jni/include
@@ -62,25 +135,69 @@ add_library(litep2p_transport STATIC ${TRANSPORT_SOURCES})
 target_link_libraries(litep2p_transport PUBLIC)
 
 # Plugin libraries
-file(GLOB_RECURSE DISCOVERY_SOURCES "modules/plugins/discovery/src/*.cpp")
-add_library(litep2p_discovery STATIC ${DISCOVERY_SOURCES})
-target_link_libraries(litep2p_discovery litep2p_corep2p)
+if(LITEP2P_ENABLE_DISCOVERY)
+    file(GLOB_RECURSE DISCOVERY_SOURCES "modules/plugins/discovery/src/*.cpp")
+    add_library(litep2p_discovery STATIC ${DISCOVERY_SOURCES})
+    target_link_libraries(litep2p_discovery litep2p_corep2p)
+endif()
 
-file(GLOB_RECURSE ROUTING_SOURCES "modules/plugins/routing/src/*.cpp")
-add_library(litep2p_routing STATIC ${ROUTING_SOURCES})
-target_link_libraries(litep2p_routing litep2p_corep2p)
+if(LITEP2P_ENABLE_ROUTING)
+    file(GLOB_RECURSE ROUTING_SOURCES "modules/plugins/routing/src/*.cpp")
+    add_library(litep2p_routing STATIC ${ROUTING_SOURCES})
+    target_link_libraries(litep2p_routing litep2p_corep2p)
+endif()
 
-file(GLOB_RECURSE SESSION_SOURCES "modules/plugins/session/src/*.cpp")
+# Session library is always required (core functionality)
+set(SESSION_SOURCES
+    "modules/plugins/session/src/session_manager.cpp"
+    "modules/plugins/session/src/engine_handler.cpp"
+    "modules/plugins/session/src/session_cache.cpp"
+    "modules/plugins/session/src/peer_manager.cpp"
+    "modules/plugins/session/src/event_manager.cpp"
+    "modules/plugins/session/src/unified_event_loop.cpp"
+    "modules/plugins/session/src/peer_state_machine.cpp"
+    "modules/plugins/session/src/nat_traversal_manager.cpp"
+    "modules/plugins/session/src/tier_manager.cpp"
+    "modules/plugins/session/src/message_handler.cpp"
+    "modules/plugins/session/src/wire_codec.cpp"
+    "modules/plugins/session/src/peer_lifecycle_manager.cpp"
+    "modules/plugins/session/src/maintenance_manager.cpp"
+    "modules/plugins/session/src/local_peer_db.cpp"
+    "modules/plugins/session/src/sqlite3_dyn.cpp"
+)
 add_library(litep2p_session STATIC ${SESSION_SOURCES})
 target_link_libraries(litep2p_session litep2p_corep2p)
 
-file(GLOB_RECURSE OPTIMIZATION_SOURCES "modules/plugins/optimization/src/*.cpp")
-add_library(litep2p_optimization STATIC ${OPTIMIZATION_SOURCES})
-target_link_libraries(litep2p_optimization litep2p_corep2p)
+if(ENABLE_PROXY_MODULE)
+    file(GLOB_RECURSE PROXY_SOURCES "modules/plugins/proxy/src/*.cpp")
+    add_library(litep2p_proxy STATIC ${PROXY_SOURCES})
+    target_link_libraries(litep2p_proxy litep2p_corep2p)
+    target_include_directories(litep2p_proxy PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/proxy/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/session/include
+    )
+    target_link_libraries(litep2p_session litep2p_proxy)
+endif()
 
-file(GLOB_RECURSE FILE_TRANSFER_SOURCES "modules/plugins/file_transfer/src/*.cpp")
-add_library(litep2p_file_transfer STATIC ${FILE_TRANSFER_SOURCES})
-target_link_libraries(litep2p_file_transfer litep2p_corep2p)
+if(LITEP2P_ENABLE_DISCOVERY)
+    target_link_libraries(litep2p_session litep2p_discovery)
+endif()
+
+if(LITEP2P_ENABLE_ROUTING)
+    target_link_libraries(litep2p_session litep2p_routing)
+endif()
+
+if(LITEP2P_ENABLE_OPTIMIZATION)
+    file(GLOB_RECURSE OPTIMIZATION_SOURCES "modules/plugins/optimization/src/*.cpp")
+    add_library(litep2p_optimization STATIC ${OPTIMIZATION_SOURCES})
+    target_link_libraries(litep2p_optimization litep2p_corep2p)
+endif()
+
+if(LITEP2P_ENABLE_FILE_TRANSFER)
+    file(GLOB_RECURSE FILE_TRANSFER_SOURCES "modules/plugins/file_transfer/src/*.cpp")
+    add_library(litep2p_file_transfer STATIC ${FILE_TRANSFER_SOURCES})
+    target_link_libraries(litep2p_file_transfer litep2p_corep2p)
+endif()
 
 # Add prebuilt libsodium for current ABI
 add_library(sodium STATIC IMPORTED)
@@ -120,14 +237,31 @@ target_link_libraries(litep2p
     litep2p_security
     litep2p_reactor
     litep2p_transport
-    litep2p_discovery
-    litep2p_routing
     litep2p_session
-    litep2p_optimization
-    litep2p_file_transfer
     sodium
     log
+    dl
 )
+
+if(ENABLE_PROXY_MODULE)
+    target_link_libraries(litep2p litep2p_proxy)
+endif()
+
+if(LITEP2P_ENABLE_DISCOVERY)
+    target_link_libraries(litep2p litep2p_discovery)
+endif()
+
+if(LITEP2P_ENABLE_ROUTING)
+    target_link_libraries(litep2p litep2p_routing)
+endif()
+
+if(LITEP2P_ENABLE_OPTIMIZATION)
+    target_link_libraries(litep2p litep2p_optimization)
+endif()
+
+if(LITEP2P_ENABLE_FILE_TRANSFER)
+    target_link_libraries(litep2p litep2p_file_transfer)
+endif()
 
 # Compiler options
 target_compile_options(litep2p PRIVATE

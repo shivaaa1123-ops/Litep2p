@@ -11,9 +11,12 @@
 #include <cstdint>
 #include <chrono>
 #include <deque>
-#include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <filesystem>
+#include <string_view>
 
 /**
  * FILE TRANSFER MODULE
@@ -61,6 +64,7 @@ struct TransferSession {
     uint64_t bytes_transferred;     // Bytes successfully transferred
     uint32_t total_chunks;          // Total number of chunks
     uint32_t chunks_transferred;    // Chunks successfully transferred
+    uint32_t next_chunk_id = 0;     // Next chunk to send (Sender only)
     
     TransferDirection direction;    // SEND or RECEIVE
     TransferState state;            // Current transfer state
@@ -87,6 +91,10 @@ struct TransferSession {
     // Error tracking
     int error_count = 0;
     std::string last_error;
+
+    // Receive side disk state
+    std::string temp_file_path;    // Used for atomic finalize (e.g., "<file>.part")
+    mutable std::mutex file_io_mutex;
 };
 
 /**
@@ -127,6 +135,7 @@ using TransferProgressCallback = std::function<void(const std::string& transfer_
 using TransferCompleteCallback = std::function<void(const std::string& transfer_id, bool success, const std::string& error)>;
 using PathSelectedCallback = std::function<void(const std::string& transfer_id, const std::string& path_id, int latency_ms)>;
 using CongestionChangedCallback = std::function<void(CongestionLevel level, const CongestionMetrics& metrics)>;
+using TransferOutboundMessageCallback = std::function<void(const std::string& peer_id, const std::string& payload)>;
 
 // ============================================================================
 // FILE TRANSFER MANAGER
@@ -139,8 +148,56 @@ public:
      * @param max_concurrent_transfers Maximum concurrent transfers
      * @param chunk_size_kb Size of each chunk in KB (default 32)
      */
-    explicit FileTransferManager(uint32_t max_concurrent_transfers = MAX_CONCURRENT_TRANSFERS,
-                                 uint32_t chunk_size_kb = CHUNK_SIZE / 1024);
+    /**
+     * Configuration struct allowing runtime tuning without recompilation.
+     * Defaults are chosen for low‑power devices.
+     */
+    struct TransferConfig {
+        uint32_t max_concurrent_transfers;
+        uint32_t chunk_size_kb;
+        uint32_t path_eval_interval_sec;
+        uint32_t congestion_check_interval_ms;
+        uint32_t initial_rate_limit_kbps;
+        
+        TransferConfig() : 
+            max_concurrent_transfers(MAX_CONCURRENT_TRANSFERS),
+            chunk_size_kb(CHUNK_SIZE / 1024),
+            path_eval_interval_sec(30),
+            congestion_check_interval_ms(2000),
+            initial_rate_limit_kbps(INITIAL_RATE_LIMIT_KBPS) {}
+            
+        TransferConfig(uint32_t max_transfers, uint32_t chunk_kb) :
+            max_concurrent_transfers(max_transfers),
+            chunk_size_kb(chunk_kb),
+            path_eval_interval_sec(30),
+            congestion_check_interval_ms(2000),
+            initial_rate_limit_kbps(INITIAL_RATE_LIMIT_KBPS) {}
+    };
+
+    explicit FileTransferManager(const TransferConfig& cfg = TransferConfig());
+
+    /**
+     * Provide a callback used by the file transfer engine to emit FILE_TRANSFER
+     * payloads back to the session/network layer.
+     *
+     * The callback receives the destination peer_id and the raw FILE_TRANSFER
+     * payload (not including the session wire header).
+     */
+    void set_outbound_message_callback(TransferOutboundMessageCallback cb);
+
+    /**
+     * Entry-point for the session layer to deliver raw FILE_TRANSFER payloads.
+     *
+     * The payload is the MessageType::FILE_TRANSFER wire payload (not including
+     * the session wire header).
+     */
+    void handle_incoming_message(const std::string& peer_id, std::string_view payload);
+
+    /**
+     * Gracefully stop background threads. Call before destruction if you need
+     * deterministic shutdown on low‑power devices.
+     */
+    void stop();
     
     ~FileTransferManager();
     
@@ -455,6 +512,8 @@ private:
     
     // Pending chunks (per transfer)
     std::unordered_map<std::string, std::deque<std::shared_ptr<TransferChunk>>> m_pending_chunks;
+    // Inflight chunks (sent but not acked)
+    std::unordered_map<std::string, std::vector<std::shared_ptr<TransferChunk>>> m_inflight_chunks;
     std::mutex m_chunks_mutex;
     
     // Congestion history
@@ -478,11 +537,23 @@ private:
     TransferCompleteCallback m_complete_callback;
     PathSelectedCallback m_path_selected_callback;
     CongestionChangedCallback m_congestion_callback;
+    TransferOutboundMessageCallback m_outbound_callback;
     
     // Background threads
     std::thread m_path_monitor_thread;
     std::thread m_congestion_monitor_thread;
+    std::thread m_send_worker_thread;
     std::atomic<bool> m_running{true};
+    // Synchronisation for graceful shutdown
+    std::condition_variable m_shutdown_cv;
+    std::mutex m_shutdown_mutex;
+
+    // Sender worker wake-ups
+    std::condition_variable m_send_cv;
+    std::mutex m_send_mutex;
+    // Configurable evaluation intervals (seconds / milliseconds)
+    uint32_t m_path_eval_interval_sec{30};
+    uint32_t m_congestion_check_interval_ms{2000};
     
     // ==================== INTERNAL METHODS ====================
     
@@ -495,6 +566,12 @@ private:
      * Congestion monitoring thread
      */
     void congestion_monitor_loop();
+
+    /**
+     * Sender worker loop: drains pending chunks, schedules retransmits, and
+     * applies pacing/window limits.
+     */
+    void send_worker_loop();
     
     /**
      * Load file into chunks

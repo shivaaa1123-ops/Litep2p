@@ -5,16 +5,29 @@ add_library(litep2p_session OBJECT
     src/session_manager.cpp
     src/session_cache.cpp
     src/peer_manager.cpp
+    src/engine_handler.cpp
+    src/event_manager.cpp
+    src/unified_event_loop.cpp
+    src/peer_state_machine.cpp
+    src/nat_traversal_manager.cpp
+    src/tier_manager.cpp
 )
 
 # Expose include directories with proper scope propagation
 target_include_directories(litep2p_session PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../optimization/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../routing/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../file_transfer/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../corep2p/core/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../discovery/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../routing/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../optimization/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../file_transfer/include
 )
+
+if(ENABLE_PROXY_MODULE)
+    target_include_directories(litep2p_session PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/../proxy/include
+    )
+endif()
 
 # Link core module dependencies and other plugins
 # Include paths from all linked libraries automatically propagate

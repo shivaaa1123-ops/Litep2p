@@ -1,5 +1,6 @@
 #include "noise_nk.h"
 #include "logger.h"
+#include <iostream>
 #include <random>
 #include <sstream>
 #include <iomanip>
@@ -36,14 +37,15 @@ static std::vector<uint8_t> hex_decode(const std::string& hex) {
 NoiseNKSession::NoiseNKSession(
     const std::string& peer_id,
     Role role,
-    const std::vector<uint8_t>& initiator_static_pk,
-    const std::vector<uint8_t>& responder_static_pk
+    const std::vector<uint8_t>& peer_ephemeral_or_static_pk,
+    const std::vector<uint8_t>& local_static_pk,
+    const std::vector<uint8_t>& local_static_sk
 )
     : m_peer_id(peer_id),
       m_role(role),
       m_state(State::NEW),
-      m_initiator_static_pk(initiator_static_pk),
-      m_responder_static_pk(responder_static_pk),
+      m_responder_static_pk(role == Role::INITIATOR ? peer_ephemeral_or_static_pk : local_static_pk),
+      m_responder_static_sk(role == Role::RESPONDER ? local_static_sk : std::vector<uint8_t>{}),
       m_send_counter(0),
       m_recv_counter(0),
       m_handshake_step(0)
@@ -58,15 +60,27 @@ NoiseNKSession::NoiseNKSession(
     }
     m_session_id = ss.str();
 
-    nativeLog("NK: Session created for " + peer_id + " (role=" + (role == Role::INITIATOR ? "INITIATOR" : "RESPONDER") + ", sid=" + m_session_id + ")");
+    std::cout << "NK: Session created for " + peer_id + " (role=" + (role == Role::INITIATOR ? "INITIATOR" : "RESPONDER") + ", sid=" + m_session_id + ")" << std::endl;
 }
 
 std::vector<uint8_t> NoiseNKSession::generate_ephemeral_keypair() {
-    std::vector<uint8_t> sk(32), pk(32);
-    crypto_box_keypair(pk.data(), sk.data());
-    m_local_ephemeral_sk = sk;
-    m_local_ephemeral_pk = pk;
-    return pk;
+    int init_res = sodium_init();
+    if (init_res < 0) {
+        return {};
+    }
+
+    unsigned char sk_buf[crypto_box_SECRETKEYBYTES];
+    unsigned char pk_buf[crypto_box_PUBLICKEYBYTES];
+
+    int res = crypto_box_keypair(pk_buf, sk_buf);
+    
+    if (res != 0) {
+        return {};
+    }
+    
+    m_local_ephemeral_sk.assign(sk_buf, sk_buf + crypto_box_SECRETKEYBYTES);
+    m_local_ephemeral_pk.assign(pk_buf, pk_buf + crypto_box_PUBLICKEYBYTES);
+    return m_local_ephemeral_pk;
 }
 
 void NoiseNKSession::perform_dh(
@@ -76,12 +90,13 @@ void NoiseNKSession::perform_dh(
 ) {
     result.resize(32);
     if (crypto_scalarmult(result.data(), secret_key.data(), public_key.data()) != 0) {
-        nativeLog("NK Error: crypto_scalarmult failed");
+        std::cout << "NK Error: crypto_scalarmult failed" << std::endl;
         result.assign(32, 0);
     }
 }
 
 void NoiseNKSession::derive_keys() {
+    std::cout << "NK_DEBUG: derive_keys() START" << std::endl;
     unsigned char ck[32];
     unsigned char h[32];
     std::string protocol_name = "Noise_NK_25519_ChaChaPoly_SHA256";
@@ -92,28 +107,46 @@ void NoiseNKSession::derive_keys() {
     proto_concat.insert(proto_concat.end(), prologue.begin(), prologue.end());
     crypto_hash_sha256(h, proto_concat.data(), proto_concat.size());
     memcpy(ck, h, 32);
+    std::cout << "NK_DEBUG: derive_keys() - protocol hash done" << std::endl;
 
     // Mix responder static key into handshake hash
+    std::cout << "NK_DEBUG: derive_keys() - m_responder_static_pk size=" + std::to_string(m_responder_static_pk.size()) << std::endl;
+    if (m_responder_static_pk.empty()) {
+        std::cout << "NK_DEBUG ERROR: m_responder_static_pk is EMPTY!" << std::endl;
+        return;
+    }
     crypto_hash_sha256(h, m_responder_static_pk.data(), m_responder_static_pk.size());
     memcpy(ck, h, 32);
+    std::cout << "NK_DEBUG: derive_keys() - responder static pk mixed" << std::endl;
 
     // DH results: ee, es
     std::vector<uint8_t> dh_results;
 
     // DH(ephemeral, ephemeral)
+    std::cout << "NK_DEBUG: derive_keys() - m_local_ephemeral_sk size=" + std::to_string(m_local_ephemeral_sk.size()) + ", m_peer_ephemeral_pk size=" + std::to_string(m_peer_ephemeral_pk.size()) << std::endl;
     std::vector<uint8_t> dh_ee(32);
     perform_dh(m_local_ephemeral_sk, m_peer_ephemeral_pk, dh_ee);
+    std::cout << "NK_DEBUG: derive_keys() - DH_ee done" << std::endl;
     dh_results.insert(dh_results.end(), dh_ee.begin(), dh_ee.end());
 
-    // DH(ephemeral, static) - varies by role
+    // DH(ephemeral_initiator, static_responder) - same calculation for both roles
+    // In NK pattern: es = DH(e_i, s_r) where e_i is initiator's ephemeral, s_r is responder's static
     std::vector<uint8_t> dh_es(32);
     if (m_role == Role::INITIATOR) {
-        // Initiator DH(ephemeral_i, static_r)
+        // Initiator: DH(e_i.sk, s_r.pk) - we have our ephemeral secret, peer's static public
+        std::cout << "NK_DEBUG: derive_keys() - INITIATOR DH_es" << std::endl;
         perform_dh(m_local_ephemeral_sk, m_responder_static_pk, dh_es);
     } else {
-        // Responder DH(ephemeral_r, static_i)
-        perform_dh(m_local_ephemeral_sk, m_initiator_static_pk, dh_es);
+        // Responder: DH(s_r.sk, e_i.pk) - we have our static secret, peer's ephemeral public
+        // This produces the same shared secret due to DH commutativity
+        std::cout << "NK_DEBUG: derive_keys() - RESPONDER DH_es, m_responder_static_sk size=" + std::to_string(m_responder_static_sk.size()) << std::endl;
+        if (m_responder_static_sk.empty()) {
+            std::cout << "NK_DEBUG ERROR: m_responder_static_sk is EMPTY!" << std::endl;
+            return;
+        }
+        perform_dh(m_responder_static_sk, m_peer_ephemeral_pk, dh_es);
     }
+    std::cout << "NK_DEBUG: derive_keys() - DH_es done" << std::endl;
     dh_results.insert(dh_results.end(), dh_es.begin(), dh_es.end());
 
     // HKDF-SHA256 to derive keys
@@ -140,7 +173,7 @@ void NoiseNKSession::derive_keys() {
     m_send_nonce.assign(12, 0x00);
     m_recv_nonce.assign(12, 0x00);
 
-    nativeLog("NK: Keys derived (send_key=" + hex_encode(m_send_key).substr(0, 8) + "..., recv_key=" + hex_encode(m_recv_key).substr(0, 8) + "...)");
+    std::cout << "NK: Keys derived (send_key=" + hex_encode(m_send_key).substr(0, 8) + "..., recv_key=" + hex_encode(m_recv_key).substr(0, 8) + "...)" << std::endl;
 }
 
 void NoiseNKSession::increment_nonce(std::vector<uint8_t>& nonce) {
@@ -157,7 +190,7 @@ std::vector<uint8_t> NoiseNKSession::chacha20poly1305_encrypt(
     const std::vector<uint8_t>& plaintext
 ) {
     if (key.size() != 32 || nonce.size() != 12) {
-        nativeLog("ERROR: NK: Invalid key or nonce size for encryption");
+        std::cout << "ERROR: NK: Invalid key or nonce size for encryption" << std::endl;
         return {};
     }
 
@@ -178,12 +211,12 @@ std::vector<uint8_t> NoiseNKSession::chacha20poly1305_decrypt(
     const std::vector<uint8_t>& ciphertext
 ) {
     if (key.size() != 32 || nonce.size() != 12) {
-        nativeLog("ERROR: NK: Invalid key or nonce size for decryption");
+        std::cout << "ERROR: NK: Invalid key or nonce size for decryption" << std::endl;
         return {};
     }
 
     if (ciphertext.size() < 16) {
-        nativeLog("ERROR: NK: Ciphertext too short (no auth tag)");
+        std::cout << "ERROR: NK: Ciphertext too short (no auth tag)" << std::endl;
         return {};
     }
 
@@ -195,7 +228,7 @@ std::vector<uint8_t> NoiseNKSession::chacha20poly1305_decrypt(
         ciphertext.data(), ciphertext.size(),
         nullptr, 0, nonce.data(), key.data()
     ) != 0) {
-        nativeLog("ERROR: NK: Decryption failed (auth tag mismatch)");
+        std::cout << "ERROR: NK: Decryption failed (auth tag mismatch)" << std::endl;
         return {};
     }
     plaintext.resize(plen);
@@ -204,17 +237,21 @@ std::vector<uint8_t> NoiseNKSession::chacha20poly1305_decrypt(
 
 std::vector<uint8_t> NoiseNKSession::start_handshake() {
     if (m_role != Role::INITIATOR) {
-        nativeLog("ERROR: NK: Only initiator can start handshake");
+        fprintf(stderr, "ERROR: NK: Only initiator can start handshake\n");
+        fflush(stderr);
         return {};
     }
 
     if (m_state != State::NEW) {
-        nativeLog("ERROR: NK: Cannot start handshake - session already started");
+        fprintf(stderr, "ERROR: NK: Cannot start handshake - session already started\n");
+        fflush(stderr);
         return {};
     }
 
     // Generate ephemeral keypair
     auto eph_pk = generate_ephemeral_keypair();
+    fprintf(stderr, "NK_DEBUG: start_handshake - generate_ephemeral_keypair returned\n");
+    fflush(stderr);
     if (eph_pk.empty()) {
         m_state = State::FAILED;
         return {};
@@ -222,26 +259,33 @@ std::vector<uint8_t> NoiseNKSession::start_handshake() {
 
     // Message 1: e
     // Contains: ephemeral public key (32 bytes)
+    fprintf(stderr, "NK_DEBUG: start_handshake - copying m_local_ephemeral_pk\n");
+    fflush(stderr);
     std::vector<uint8_t> msg1 = m_local_ephemeral_pk;
+    fprintf(stderr, "NK_DEBUG: start_handshake - m_local_ephemeral_pk copied\n");
+    fflush(stderr);
 
     m_state = State::HANDSHAKE_1;
     m_handshake_step = 1;
 
-    nativeLog("NK: Handshake message 1 sent (e, " + std::to_string(msg1.size()) + " bytes)");
+    fprintf(stderr, "NK: Handshake message 1 sent (e, %zu bytes)\n", msg1.size());
+    fflush(stderr);
     return msg1;
 }
 
 std::vector<uint8_t> NoiseNKSession::process_handshake(const std::vector<uint8_t>& msg) {
+    std::cout << "NK_DEBUG: process_handshake called. State=" + std::to_string((int)m_state) + ", msg size=" + std::to_string(msg.size()) << std::endl;
     if (m_state == State::FAILED || m_state == State::READY) {
-        nativeLog("ERROR: NK: Cannot process handshake in state " + std::to_string((int)m_state));
+        std::cout << "ERROR: NK: Cannot process handshake in state " + std::to_string((int)m_state) << std::endl;
         return {};
     }
 
     try {
         if (m_state == State::NEW) {
+            std::cout << "NK_DEBUG: Processing message 1 (Responder)" << std::endl;
             // Responder: Process message 1 (e)
             if (msg.size() != 32) {
-                nativeLog("ERROR: NK: Message 1 invalid size (expected 32, got " + std::to_string(msg.size()) + ")");
+                std::cout << "ERROR: NK: Message 1 invalid size (expected 32, got " + std::to_string(msg.size()) + ")" << std::endl;
                 m_state = State::FAILED;
                 return {};
             }
@@ -250,19 +294,26 @@ std::vector<uint8_t> NoiseNKSession::process_handshake(const std::vector<uint8_t
             m_state = State::HANDSHAKE_1;
             m_handshake_step = 1;
 
+            std::cout << "NK_DEBUG: Generating ephemeral keypair" << std::endl;
             // Generate our ephemeral keypair
             auto eph_pk = generate_ephemeral_keypair();
             if (eph_pk.empty()) {
+                std::cout << "NK_DEBUG: Failed to generate ephemeral keypair" << std::endl;
                 m_state = State::FAILED;
                 return {};
             }
+            std::cout << "NK_DEBUG: Ephemeral keypair generated" << std::endl;
 
-            // Prepare response: e, ee, es
-            // Note: We don't send static key yet, just prove we have it via encryption
+            // Prepare response: e
             std::vector<uint8_t> msg2 = m_local_ephemeral_pk;
 
-            nativeLog("NK: Handshake message 1 received, message 2 prepared (e, 32 bytes)");
-            m_state = State::HANDSHAKE_2;
+            // NK is a 2-message pattern: after responder sends Message 2, 
+            // both sides have all the DH values needed to derive keys.
+            // Derive keys NOW so responder is READY when Message 2 is sent.
+            derive_keys();
+
+            std::cout << "NK: Handshake message 1 received, message 2 prepared (e, 32 bytes), keys derived - READY" << std::endl;
+            m_state = State::READY;
             m_handshake_step = 2;
 
             return msg2;
@@ -270,7 +321,7 @@ std::vector<uint8_t> NoiseNKSession::process_handshake(const std::vector<uint8_t
         } else if (m_state == State::HANDSHAKE_1) {
             // Initiator: Process message 2 (e)
             if (msg.size() != 32) {
-                nativeLog("ERROR: NK: Message 2 invalid size (expected 32, got " + std::to_string(msg.size()) + ")");
+                std::cout << "ERROR: NK: Message 2 invalid size (expected 32, got " + std::to_string(msg.size()) + ")" << std::endl;
                 m_state = State::FAILED;
                 return {};
             }
@@ -280,35 +331,21 @@ std::vector<uint8_t> NoiseNKSession::process_handshake(const std::vector<uint8_t
             // Derive keys from ee and es DH operations
             derive_keys();
 
-            // Message 3: empty (just authentication from earlier DH)
-            std::vector<uint8_t> msg3;
-
             m_state = State::READY;
-            m_handshake_step = 3;
+            m_handshake_step = 2;
 
-            nativeLog("NK: Handshake message 2 received, keys derived, ready for communication");
-            return msg3;
-
-        } else if (m_state == State::HANDSHAKE_2) {
-            // Responder: Receive empty message 3 (authentication confirmation)
-            // In NK pattern, responder is already authenticated by initiator's DH with responder's static key
-
-            // Derive keys
-            derive_keys();
-
-            m_state = State::READY;
-            m_handshake_step = 3;
-
-            nativeLog("NK: Handshake complete (responder), keys ready");
+            std::cout << "NK: Handshake message 2 received, keys derived, ready for communication" << std::endl;
+            // NK is a 2-message pattern - no Message 3 needed
             return {};
         }
+        // Note: HANDSHAKE_2 state is no longer used - responder becomes READY immediately after sending msg2
 
-        nativeLog("ERROR: NK: Invalid handshake state");
+        std::cout << "ERROR: NK: Invalid handshake state" << std::endl;
         m_state = State::FAILED;
         return {};
 
     } catch (const std::exception& e) {
-        nativeLog("ERROR: NK: Exception in process_handshake: " + std::string(e.what()));
+        std::cout << "ERROR: NK: Exception in process_handshake: " + std::string(e.what()) << std::endl;
         m_state = State::FAILED;
         return {};
     }
@@ -316,7 +353,7 @@ std::vector<uint8_t> NoiseNKSession::process_handshake(const std::vector<uint8_t
 
 std::vector<uint8_t> NoiseNKSession::encrypt(const std::vector<uint8_t>& plaintext) {
     if (!is_ready()) {
-        nativeLog("ERROR: NK: Cannot encrypt - handshake not complete");
+        std::cout << "ERROR: NK: Cannot encrypt - handshake not complete" << std::endl;
         return {};
     }
 
@@ -330,7 +367,7 @@ std::vector<uint8_t> NoiseNKSession::encrypt(const std::vector<uint8_t>& plainte
 
 std::vector<uint8_t> NoiseNKSession::decrypt(const std::vector<uint8_t>& ciphertext) {
     if (!is_ready()) {
-        nativeLog("ERROR: NK: Cannot decrypt - handshake not complete");
+        std::cout << "ERROR: NK: Cannot decrypt - handshake not complete" << std::endl;
         return {};
     }
 
@@ -347,12 +384,12 @@ std::vector<uint8_t> NoiseNKSession::decrypt(const std::vector<uint8_t>& ciphert
 // ============================================================================
 
 NoiseNKManager::NoiseNKManager() {
-    nativeLog("NK: Manager initialized");
+    std::cout << "NK: Manager initialized" << std::endl;
 }
 
 void NoiseNKManager::register_peer_key(const std::string& peer_id, const std::vector<uint8_t>& static_pk) {
     if (static_pk.size() != 32) {
-        nativeLog("ERROR: NK: Peer key must be 32 bytes, got " + std::to_string(static_pk.size()));
+        std::cout << "ERROR: NK: Peer key must be 32 bytes, got " + std::to_string(static_pk.size()) << std::endl;
         return;
     }
     
@@ -360,7 +397,7 @@ void NoiseNKManager::register_peer_key(const std::string& peer_id, const std::ve
         std::lock_guard<std::mutex> lock(m_keys_mutex);
         m_peer_keys[peer_id] = static_pk;
     }
-    nativeLog("NK: Peer key registered for " + peer_id + " (key=" + hex_encode(static_pk).substr(0, 8) + "...)");
+    std::cout << "NK: Peer key registered for " + peer_id + " (key=" + hex_encode(static_pk).substr(0, 8) + "...)" << std::endl;
 }
 
 std::vector<uint8_t> NoiseNKManager::get_peer_key(const std::string& peer_id) const {
@@ -374,14 +411,14 @@ std::vector<uint8_t> NoiseNKManager::get_peer_key(const std::string& peer_id) co
 
 void NoiseNKManager::set_local_static_key(const std::vector<uint8_t>& static_sk, const std::vector<uint8_t>& static_pk) {
     if (static_sk.size() != 32 || static_pk.size() != 32) {
-        nativeLog("ERROR: NK: Static key must be 32 bytes");
+        std::cout << "ERROR: NK: Static key must be 32 bytes" << std::endl;
         return;
     }
     
     std::lock_guard<std::mutex> lock(m_keys_mutex);
     m_local_static_sk = static_sk;
     m_local_static_pk = static_pk;
-    nativeLog("NK: Local static key set (pk=" + hex_encode(static_pk).substr(0, 8) + "...)");
+    std::cout << "NK: Local static key set (pk=" + hex_encode(static_pk).substr(0, 8) + "...)" << std::endl;
 }
 
 std::vector<uint8_t> NoiseNKManager::get_local_static_pk() const {
@@ -390,9 +427,10 @@ std::vector<uint8_t> NoiseNKManager::get_local_static_pk() const {
 }
 
 std::shared_ptr<NoiseNKSession> NoiseNKManager::create_initiator_session(const std::string& peer_id) {
-    auto peer_key = get_peer_key(peer_id);
-    if (peer_key.empty()) {
-        nativeLog("ERROR: NK: Peer key not found for " + peer_id + ". Register peer key first.");
+    auto peer_static_pk = get_peer_key(peer_id);
+    if (peer_static_pk.empty()) {
+        fprintf(stderr, "ERROR: NK: Peer static key not found for %s. Register peer key first.\n", peer_id.c_str());
+        fflush(stderr);
         return nullptr;
     }
 
@@ -403,39 +441,49 @@ std::shared_ptr<NoiseNKSession> NoiseNKManager::create_initiator_session(const s
     }
 
     if (local_pk.empty()) {
-        nativeLog("ERROR: NK: Local static key not set. Call set_local_static_key first.");
+        fprintf(stderr, "ERROR: NK: Local static key not set. Call set_local_static_key first.\n");
+        fflush(stderr);
         return nullptr;
     }
 
-    auto session = std::make_shared<NoiseNKSession>(peer_id, NoiseNKSession::Role::INITIATOR, local_pk, peer_key);
+    // Initiator: peer_static_pk is responder's static public key, local_pk is our static public key (not used in NK)
+    // The initiator doesn't need a static secret key in NK pattern
+    auto session = std::make_shared<NoiseNKSession>(peer_id, NoiseNKSession::Role::INITIATOR, peer_static_pk, local_pk);
 
     {
         std::lock_guard<std::mutex> lock(m_sessions_mutex);
         m_sessions[peer_id] = session;
     }
+    
+    fprintf(stderr, "NK_DEBUG: create_initiator_session returning session %p\n", session.get());
+    fflush(stderr);
 
     return session;
 }
 
 std::shared_ptr<NoiseNKSession> NoiseNKManager::create_responder_session(const std::string& peer_id) {
-    // For responder, we don't know peer's static key yet - that comes from out-of-band
-    // For now, create placeholder and update when we receive peer's key
-    
-    std::vector<uint8_t> local_pk;
+    std::vector<uint8_t> local_pk, local_sk;
     {
         std::lock_guard<std::mutex> lock(m_keys_mutex);
         local_pk = m_local_static_pk;
+        local_sk = m_local_static_sk;
     }
 
-    if (local_pk.empty()) {
-        nativeLog("ERROR: NK: Local static key not set");
+    if (local_pk.empty() || local_sk.empty()) {
+        std::cout << "ERROR: NK: Local static keypair not set" << std::endl;
         return nullptr;
     }
 
-    // Use placeholder for peer key initially
-    std::vector<uint8_t> placeholder_peer_key(32, 0x00);
+    // Get peer's public key from registered keys (this is the initiator's static public key)
+    // Note: In standard NK pattern, initiator doesn't have a static key, but we use it for peer identification
+    auto peer_key = get_peer_key(peer_id);
+    if (peer_key.empty()) {
+        std::cout << "WARN: NK: Peer key not found for " + peer_id + " - peer identification may fail" << std::endl;
+    }
     
-    auto session = std::make_shared<NoiseNKSession>(peer_id, NoiseNKSession::Role::RESPONDER, placeholder_peer_key, local_pk);
+    // Responder: local_pk is our static public key, local_sk is our static secret key
+    // peer_key is not used in NK pattern DH, but may be used for identification
+    auto session = std::make_shared<NoiseNKSession>(peer_id, NoiseNKSession::Role::RESPONDER, peer_key, local_pk, local_sk);
 
     {
         std::lock_guard<std::mutex> lock(m_sessions_mutex);
@@ -461,7 +509,10 @@ std::shared_ptr<NoiseNKSession> NoiseNKManager::get_or_create_session(const std:
     }
 
     if (role == NoiseNKSession::Role::INITIATOR) {
-        return create_initiator_session(peer_id);
+        auto s = create_initiator_session(peer_id);
+        fprintf(stderr, "NK_DEBUG: get_or_create_session (INITIATOR) returning %p\n", s.get());
+        fflush(stderr);
+        return s;
     } else {
         return create_responder_session(peer_id);
     }
@@ -470,22 +521,30 @@ std::shared_ptr<NoiseNKSession> NoiseNKManager::get_or_create_session(const std:
 void NoiseNKManager::remove_session(const std::string& peer_id) {
     std::lock_guard<std::mutex> lock(m_sessions_mutex);
     m_sessions.erase(peer_id);
-    nativeLog("NK: Session removed for " + peer_id);
+    std::cout << "NK: Session removed for " + peer_id << std::endl;
 }
 
 void NoiseNKManager::clear_sessions() {
     std::lock_guard<std::mutex> lock(m_sessions_mutex);
     m_sessions.clear();
-    nativeLog("NK: All sessions cleared");
+    std::cout << "NK: All sessions cleared" << std::endl;
 }
 
 std::pair<std::vector<uint8_t>, std::vector<uint8_t>> NoiseNKManager::generate_static_keypair() {
-    // Crypto functionality disabled - using dummy keypair
-    nativeLog("NK Warning: Crypto disabled - using dummy static keypair");
-    std::vector<uint8_t> public_key(32, 0x55);
-    std::vector<uint8_t> secret_key(32, 0x66);
+    if (sodium_init() < 0) {
+        std::cout << "ERROR: NK: libsodium initialization failed while generating static keypair" << std::endl;
+        return {std::vector<uint8_t>(), std::vector<uint8_t>()};
+    }
 
-    nativeLog("NK: Static keypair generated (pk=" + hex_encode(public_key).substr(0, 8) + "...)");
+    std::vector<uint8_t> public_key(crypto_box_PUBLICKEYBYTES, 0x00);
+    std::vector<uint8_t> secret_key(crypto_box_SECRETKEYBYTES, 0x00);
+
+    if (crypto_box_keypair(public_key.data(), secret_key.data()) != 0) {
+        std::cout << "ERROR: NK: crypto_box_keypair failed while generating static keypair" << std::endl;
+        return {std::vector<uint8_t>(), std::vector<uint8_t>()};
+    }
+
+    std::cout << "NK: Static keypair generated (pk=" + hex_encode(public_key).substr(0, 8) + "...)" << std::endl;
     return {secret_key, public_key};
 }
 

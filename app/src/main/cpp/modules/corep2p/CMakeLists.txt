@@ -4,7 +4,10 @@
 
 add_library(litep2p_corep2p OBJECT
     src/corep2p.cpp
+    $<TARGET_OBJECTS:litep2p_dynamic_config>
 )
+
+add_subdirectory(dynamic_config)
 
 # Include paths for all 5 core modules AND parent-level includes
 target_include_directories(litep2p_corep2p PUBLIC

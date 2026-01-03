@@ -166,6 +166,21 @@ Relay reference implementation (Rust or C++) is coming soon.
 
 ---
 
+## 🛰️ Optional Proxy Module (compile-time)
+
+LiteP2P also includes an **application-level Proxy/Relay module** (see `proxy.md`).
+This is **compile-time optional** and is enabled by default.
+
+- Desktop:
+    - To disable: configure with `-DENABLE_PROXY_MODULE=OFF`
+- Android (NDK/CMake):
+    - To disable: pass `-DENABLE_PROXY_MODULE=OFF` to the CMake configure arguments
+
+When enabled, the session wire protocol reserves message types `PROXY_CONTROL` and `PROXY_STREAM_DATA`.
+Runtime behavior defaults to disabled; you can enable roles via `SessionManager::configure_proxy(...)`.
+
+---
+
 ## 📊 Roadmap
 
 ### v0.1  

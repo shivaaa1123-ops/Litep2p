@@ -7,6 +7,8 @@ add_library(litep2p_routing OBJECT
     src/peer_reconnect_policy.cpp
     src/peer_tier_manager.cpp
     src/tier_system_failsafe.cpp
+    src/upnp_controller.cpp
+    src/turn_client.cpp
 )
 
 # Expose include directories with proper scope propagation

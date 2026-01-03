@@ -1,6 +1,7 @@
 
 
 #include "jni_helpers.h"
+#include "jni_bridge.h"
 #include <android/log.h>
 #include <thread>
 
@@ -28,12 +29,17 @@ void detachJNIEnv() {
     }
 }
 
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
+void jni_helpers_on_load(JavaVM* vm) {
     g_vm = vm;
-    return JNI_VERSION_1_6;
 }
 
-extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void*) {
-    // Cleanup if needed
+void jni_helpers_on_unload(JavaVM* vm) {
+    // Cleanup JNI global refs owned by the JNI bridge while the VM is still available.
+    if (vm) {
+        JNIEnv* env = nullptr;
+        if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK && env) {
+            jniBridgeCleanup(env);
+        }
+    }
     g_vm = nullptr;
 }

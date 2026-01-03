@@ -25,6 +25,20 @@
         android:layout_height="wrap_content"
         android:layout_marginTop="8dp"/>
 
+    <CheckBox
+        android:id="@+id/proxyGatewayCheck"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:checked="true"
+        android:text="Enable Proxy Gateway" />
+
+    <CheckBox
+        android:id="@+id/proxyClientCheck"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Enable Proxy Client" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

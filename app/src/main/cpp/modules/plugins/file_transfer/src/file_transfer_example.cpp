@@ -3,6 +3,11 @@
 #include <iostream>
 #include <thread>
 #include <fstream>
+#include <mutex>
+#include <vector>
+#include <chrono>
+#include <algorithm>
+#include <cstdint>
 
 /**
  * FILE TRANSFER MANAGER - COMPREHENSIVE EXAMPLE
@@ -36,7 +41,7 @@ private:
         std::cout << "\n[Example 1] Simple File Transfer" << std::endl;
         std::cout << "─────────────────────────────────" << std::endl;
         
-        FileTransferManager ft_mgr(100, 32);
+        FileTransferManager ft_mgr; // Use default configuration
         
         // Create a test file
         create_test_file("/tmp/test_file.bin", 1024 * 1024);  // 1MB
@@ -83,7 +88,7 @@ private:
         std::cout << "\n[Example 2] Resumable Transfer" << std::endl;
         std::cout << "──────────────────────────────" << std::endl;
         
-        FileTransferManager ft_mgr(100, 32);
+        FileTransferManager ft_mgr; // Use default configuration
         
         // Create test file
         create_test_file("/tmp/resume_file.bin", 5 * 1024 * 1024);  // 5MB
@@ -124,7 +129,7 @@ private:
         std::cout << "\n[Example 3] Multi-Path Routing" << std::endl;
         std::cout << "──────────────────────────────" << std::endl;
         
-        FileTransferManager ft_mgr(100, 32);
+        FileTransferManager ft_mgr; // Use default configuration
         
         // Register multiple paths to same peer
         std::string path_1 = ft_mgr.register_network_path(
@@ -177,7 +182,7 @@ private:
         std::cout << "\n[Example 4] Multiplexed Transfer" << std::endl;
         std::cout << "────────────────────────────────" << std::endl;
         
-        FileTransferManager ft_mgr(100, 32);
+        FileTransferManager ft_mgr; // Use default configuration
         
         // Register multiple paths
         std::string path_1 = ft_mgr.register_network_path(
@@ -236,7 +241,7 @@ private:
         std::cout << "\n[Example 5] Congestion Handling" << std::endl;
         std::cout << "──────────────────────────────" << std::endl;
         
-        FileTransferManager ft_mgr(100, 32);
+        FileTransferManager ft_mgr; // Use default configuration
         
         std::string path_id = ft_mgr.register_network_path(
             "peer_congestion",
@@ -317,6 +322,9 @@ private:
         file.close();
         std::cout << "Created test file: " << path << " (" << size << " bytes)" << std::endl;
     }
+    
+    // Implement thread safety
+    std::mutex mtx;
 };
 
 // ============================================================================
@@ -333,6 +341,7 @@ int main() {
         
         return 0;
     } catch (const std::exception& e) {
+        // Handle the exception
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }

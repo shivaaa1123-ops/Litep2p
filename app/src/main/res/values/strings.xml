@@ -8,7 +8,7 @@
     <string name="menu_slideshow">Slideshow</string>
     <string name="action_settings">Settings</string>
     <string-array name="comms_modes_array">
-        <item>TCP</item>
         <item>UDP</item>
+        <item>TCP</item>
     </string-array>
 </resources>

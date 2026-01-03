@@ -8,6 +8,7 @@
 #include <memory>
 #include <unordered_map>
 #include <mutex>
+#include <random>
 
 /**
  * Peer Reconnect Policy for Weak/High-Latency Networks
@@ -39,6 +40,19 @@ enum class BatteryLevel {
     HIGH            // 80-100%
 };
 
+// High-level reconnect behavior selection.
+//
+// AUTO: Derive behavior from network type + battery + charging state.
+// AGGRESSIVE: Prioritize fast recovery and reliability (still respects NETWORK_DOWN).
+// BALANCED: Reasonable retry pacing for most environments.
+// POWER_SAVER: Minimize radio/battery usage (mobile-first).
+enum class ReconnectMode {
+    AUTO,
+    AGGRESSIVE,
+    BALANCED,
+    POWER_SAVER
+};
+
 struct PeerConnectionStats {
     std::string peer_id;
     
@@ -50,8 +64,8 @@ struct PeerConnectionStats {
     int successful_connections;
     
     // Timing statistics
-    uint32_t last_connection_attempt_ms;      // Time since last attempt
-    uint32_t last_successful_connection_ms;   // Time since last success
+    uint64_t last_connection_attempt_ms;      // Monotonic ms (steady clock) of last attempt; 0 = never
+    uint64_t last_successful_connection_ms;   // Monotonic ms (steady clock) of last success; 0 = never
     uint32_t average_rtt_ms;
     uint32_t max_rtt_ms;
     uint32_t min_rtt_ms;
@@ -63,7 +77,7 @@ struct PeerConnectionStats {
     // Retry state
     int retry_count_current_cycle;
     int backoff_level;                         // 1, 2, 4, 8, 16...
-    uint32_t next_retry_time_ms;               // Absolute time
+    uint64_t next_retry_time_ms;               // Monotonic ms (steady clock) when next retry is allowed; 0 = now
     
     // Connection method
     std::string last_used_method;              // "TCP", "UDP", "Relay"
@@ -83,6 +97,15 @@ public:
      * @param network_wifi: True if on WiFi, false if on mobile
      */
     void initialize(int battery_level_percent, bool network_wifi);
+
+    // Explicit mode override (optional). If not set, AUTO mode can be driven by config.json.
+    void set_reconnect_mode(ReconnectMode mode);
+    void set_reconnect_mode_string(const std::string& mode);
+    ReconnectMode get_reconnect_mode() const;
+
+    // Suggested reconnect pacing for global schedulers (e.g., DB-first reconnect tick).
+    // This is intentionally coarse: per-peer backoff is still applied via get_retry_strategy().
+    uint32_t get_reconnect_attempt_interval_ms() const;
     
     /**
      * Start tracking a peer for automatic reconnection
@@ -198,7 +221,10 @@ public:
     void shutdown();
 
 private:
-    PeerReconnectPolicy() = default;
+    PeerReconnectPolicy();
+
+    static ReconnectMode parse_reconnect_mode_string_(std::string mode);
+    void recompute_effective_mode_flags_locked_();
     
     // Configuration based on battery level
     struct RetryConfig {
@@ -215,7 +241,7 @@ private:
     uint32_t calculate_backoff_with_jitter(int backoff_level);
     
     // Priority scoring for reconnection
-    float calculate_peer_priority(const PeerConnectionStats& stats);
+    float calculate_peer_priority(const PeerConnectionStats& stats, uint64_t now_ms);
     
     // State
     std::unordered_map<std::string, PeerConnectionStats> peer_stats_;
@@ -233,6 +259,12 @@ private:
     // Configuration
     bool use_aggressive_reconnect_;            // WiFi + AC power = aggressive
     bool use_battery_aware_mode_;              // Mobile data + battery = conservative
+
+    // Mode selection
+    ReconnectMode reconnect_mode_ = ReconnectMode::AUTO;
+    bool reconnect_mode_overridden_ = false;
+
+    std::mt19937 random_engine_;
 };
 
 #endif // PEER_RECONNECT_POLICY_H
