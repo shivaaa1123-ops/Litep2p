@@ -1,11 +1,12 @@
 #ifndef NAT_STUN_H
 #define NAT_STUN_H
 
-#include <string>
-#include <vector>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
-#include <chrono>
+#include <string>
+#include <vector>
 
 /**
  * @file nat_stun.h
