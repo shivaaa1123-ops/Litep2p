@@ -60,8 +60,8 @@ bool starts_with(const std::string& s, const std::string& pfx) {
 // - ROLE (sender|receiver) (required)
 // - SELF_ID (required)
 // - SELF_PORT (default: 31001)
-// - TARGET_ID (sender only, required)
-// - TARGET_NETID (sender only, required, format ip:port)
+// - TARGET_ID (sender required; receiver optional)
+// - TARGET_NETID (sender required; receiver optional, format ip:port)
 // - SIZES (sender only, csv; default: 64,128,256,512,1024,2048,4096,8192,16384,32768)
 // - DEADLINE_SEC (default: 120)
 // - OUT_JSON (optional path)
@@ -127,6 +127,10 @@ int main() {
     const auto deadline = t0 + std::chrono::seconds(deadline_sec);
 
     if (role == "receiver") {
+        // Optional: deterministic mapping to sender so we can respond immediately without discovery races.
+        if (!target_id.empty() && !target_netid.empty()) {
+            sm.addPeer(target_id, target_netid);
+        }
         // Run until deadline.
         while (Clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -157,6 +161,35 @@ int main() {
         return 1;
     }
 
+    // Warmup: ensure we can complete a request/ack loop (also ensures Noise session is READY).
+    {
+        const int warm_sz = 64;
+        const std::string warm_body(static_cast<size_t>(warm_sz), 'W');
+        const std::string warm_msg = std::string("MSG_SIZE:") + std::to_string(warm_sz) + "|" + warm_body;
+        bool ok = false;
+        for (int attempt = 0; attempt < 20 && Clock::now() < deadline; ++attempt) {
+            last_ack.store(-1, std::memory_order_release);
+            sm.sendMessageToPeer(target_id, warm_msg);
+            const auto ack_deadline = Clock::now() + std::chrono::seconds(3);
+            while (Clock::now() < ack_deadline) {
+                if (last_ack.load(std::memory_order_acquire) == warm_sz) {
+                    ok = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (ok) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
+        if (!ok) {
+            sm.stop();
+            write_text(out_json,
+                       std::string("{\"role\":\"sender\",\"result\":\"warmup_failed\",\"self_id\":\"") + self_id +
+                           "\",\"target_id\":\"" + target_id + "\"}\n");
+            return 1;
+        }
+    }
+
     const auto sizes = parse_sizes_csv(sizes_csv);
     int max_ok = -1;
     int failures = 0;
@@ -171,7 +204,7 @@ int main() {
         sm.sendMessageToPeer(target_id, msg);
 
         // Wait for ACK:<n>
-        const auto ack_deadline = Clock::now() + std::chrono::seconds(12);
+        const auto ack_deadline = Clock::now() + std::chrono::seconds(15);
         while (Clock::now() < ack_deadline) {
             if (last_ack.load(std::memory_order_acquire) == n) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));

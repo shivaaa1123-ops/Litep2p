@@ -123,7 +123,8 @@ cd "${ROOT_DIR}/desktop/build_linux_ci"
 
 (
   cd "${WORK_B}"
-  CONFIG_PATH="${WORK_B}/config.json" ROLE=receiver SELF_ID="${IDB}" SELF_PORT="${PORT_B}" DEADLINE_SEC=120 \
+  CONFIG_PATH="${WORK_B}/config.json" ROLE=receiver SELF_ID="${IDB}" SELF_PORT="${PORT_B}" \
+    TARGET_ID="${IDA}" TARGET_NETID="127.0.0.1:${PORT_A}" DEADLINE_SEC=120 \
     OUT_JSON="${OUT_DIR}/message_size_receiver.json" \
     "${ROOT_DIR}/desktop/build_linux_ci/bin/message_size_runner" > "${OUT_DIR}/message_size_receiver.log" 2>&1
 ) &
