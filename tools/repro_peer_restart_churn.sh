@@ -399,7 +399,7 @@ for ((i=1; i<=CYCLES; i++)); do
 
   # Randomly choose a churn pattern.
   # If ENABLE_DUPLICATE_ID=0, avoid the duplicate-id scenario (it intentionally violates invariants).
-  local mod=7
+  mod=7
   if [[ "${ENABLE_DUPLICATE_ID}" != "1" ]]; then
     mod=6
   fi
