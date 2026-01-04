@@ -47,6 +47,7 @@ VERBOSE="${VERBOSE:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-25}"
 DISCOVERY_RETRIES="${DISCOVERY_RETRIES:-2}"
 SEND_RETRIES="${SEND_RETRIES:-5}"
+CONNECT_RETRIES="${CONNECT_RETRIES:-4}"
 
 A_FIFO="$RUN_DIR/peer_a.in"
 B_FIFO="$RUN_DIR/peer_b.in"
@@ -212,8 +213,37 @@ assert_connected_and_messaging() {
   fi
 
   # Best-effort connect (id->addr mapping is discovery-driven).
-  send_a "connect $PEER_B_ID"
-  send_b "connect $PEER_A_ID"
+  local a_conn0 b_conn0
+  a_conn0="$(line_count "$A_LOG")"
+  b_conn0="$(line_count "$B_LOG")"
+
+  # Under loss/jitter, connect/handshake may take longer; retry connect commands a few times.
+  local ctry
+  for ((ctry=1; ctry<=CONNECT_RETRIES; ctry++)); do
+    send_a "connect $PEER_B_ID"
+    send_b "connect $PEER_A_ID"
+
+    # Look for either side reporting a successful connect.
+    if wait_for_pattern_since_line "$A_LOG" "$a_conn0" "Connected:" "$CONNECT_TIMEOUT_SEC" \
+      && wait_for_pattern_since_line "$B_LOG" "$b_conn0" "Connected:" "$CONNECT_TIMEOUT_SEC"; then
+      break
+    fi
+
+    log_summary "WARN cycle=$cycle reason=connect_not_confirmed attempt=$ctry/$CONNECT_RETRIES"
+    if ! is_pid_alive "$A_PID" || ! is_pid_alive "$B_PID"; then
+      log_summary "FAIL cycle=$cycle reason=peer_died_during_connect_wait"
+      return 1
+    fi
+    # Refresh peer list + try again.
+    send_a "peers"
+    send_b "peers"
+  done
+
+  if ! wait_for_pattern_since_line "$A_LOG" "$a_conn0" "Connected:" 0 \
+    || ! wait_for_pattern_since_line "$B_LOG" "$b_conn0" "Connected:" 0; then
+    log_summary "FAIL cycle=$cycle reason=connect_not_confirmed"
+    return 1
+  fi
 
   # Send messages both ways and assert receipt.
   local msg_a msg_b
