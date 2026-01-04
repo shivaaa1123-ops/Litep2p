@@ -1412,6 +1412,24 @@ void SessionManager::Impl::initializeNoiseHandshake(const std::string& peer_id) 
             pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_FAILED});
             return;
         }
+
+        // If a previous attempt left a half-initialized initiator session (handshake_initiated=true but not READY),
+        // we must reset it; otherwise start_handshake() returns empty and we can get stuck retrying forever under loss.
+        if (!session->is_ready() && session->handshake_initiated()) {
+            LOG_WARN("SM: Resetting half-initialized Noise session for " + peer_id + " before initiating handshake");
+            m_secure_session_manager->remove_session(peer_id);
+            session = m_secure_session_manager->get_or_create_session(peer_id, NoiseNKSession::Role::INITIATOR);
+            if (!session) {
+                LOG_WARN("SM: Failed to recreate secure session for initiator " + peer_id);
+                pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_FAILED});
+                return;
+            }
+        }
+
+        if (session->is_ready()) {
+            // Already ready; no need to re-initiate.
+            return;
+        }
         handshake_payload = session->start_handshake();
     }
 
