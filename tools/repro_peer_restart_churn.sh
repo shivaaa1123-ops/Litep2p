@@ -301,6 +301,18 @@ assert_connected_and_messaging() {
     sleep 0.3
   done
 
+  # Also ensure Noise handshake is READY on both sides before sending app messages.
+  # CONNECT_SUCCESS can happen before the Noise session is fully ready, and sending ENCRYPTED_DATA too early
+  # can lead to decrypt failures and confusing flaps.
+  a0="$(line_count "$A_LOG")"
+  b0="$(line_count "$B_LOG")"
+  if ! wait_for_pattern_since_line "$A_LOG" "$a0" "Handshake complete for ${PEER_B_ID}" 6; then
+    log_summary "WARN cycle=$cycle reason=a_handshake_not_ready"
+  fi
+  if ! wait_for_pattern_since_line "$B_LOG" "$b0" "Handshake complete for ${PEER_A_ID}" 6; then
+    log_summary "WARN cycle=$cycle reason=b_handshake_not_ready"
+  fi
+
   # Send messages both ways and assert receipt.
   local msg_a msg_b
   msg_a="cycle=${cycle} from=A t=$(now_ms)"
