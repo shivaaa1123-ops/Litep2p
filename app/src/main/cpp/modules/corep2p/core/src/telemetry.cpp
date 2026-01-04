@@ -102,6 +102,11 @@ void Telemetry::flush(const std::string& reason) {
     append_to_file_(line);
 }
 
+std::string Telemetry::snapshot_json(const std::string& reason) {
+    if (!is_enabled()) return "{}";
+    return build_flush_json_(reason);
+}
+
 Telemetry::Counter* Telemetry::get_or_create_counter_(const std::string& name) {
     std::lock_guard<std::mutex> lk(m_mu);
     return &m_counters[name];

@@ -19,6 +19,7 @@ void print_usage(const char* program_name) {
               << "  --config FILE   Path to configuration file (default: config.json)\n"
               << "  --log-level LVL Log level: debug|info|warning|error|none (default: none)\n"
               << "  --proxy ROLE    Set local proxy role: off|gateway|exit|client|both (default: off)\n"
+              << "  --tui-telemetry-ms MS  Telemetry pane refresh interval in ms (default: 1000)\n"
               << "  --no-tui        Force plain log output (no interactive UI)\n"
               << "  --daemon        Run as daemon (no stdin, suitable for background/testing)\n"
               << "  --help          Show this help message\n"
@@ -67,6 +68,7 @@ int main(int argc, char* argv[]) {
     bool force_plain_cli = false;
     bool daemon_mode = false;
     std::string proxy_role;
+    int tui_telemetry_ms = 1000;
     
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -118,6 +120,21 @@ int main(int argc, char* argv[]) {
                 proxy_role = argv[++i];
             } else {
                 std::cerr << "Error: --proxy requires an argument" << std::endl;
+                return 1;
+            }
+        } else if (arg == "--tui-telemetry-ms") {
+            if (i + 1 < argc) {
+                try {
+                    int v = std::stoi(argv[++i]);
+                    if (v < 100) v = 100;
+                    if (v > 60000) v = 60000;
+                    tui_telemetry_ms = v;
+                } catch (...) {
+                    std::cerr << "Error: invalid --tui-telemetry-ms value" << std::endl;
+                    return 1;
+                }
+            } else {
+                std::cerr << "Error: --tui-telemetry-ms requires an argument" << std::endl;
                 return 1;
             }
         } else if (arg == "--no-tui" || arg == "--plain") {
@@ -186,6 +203,7 @@ int main(int argc, char* argv[]) {
     // This ensures startup logs are captured and displayed
     nativeLog("MAIN: Creating TerminalCLI...");
     TerminalCLI cli(node, force_plain_cli, daemon_mode);
+    cli.setTelemetryRefreshIntervalMs(tui_telemetry_ms);
     nativeLog("MAIN: TerminalCLI created");
     
     // Set user-requested log level (CLI constructor sets INFO by default)

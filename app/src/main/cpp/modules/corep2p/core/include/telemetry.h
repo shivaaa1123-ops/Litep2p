@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 // Lightweight, local-only telemetry (no network export).
 // - Counters: monotonically increasing
@@ -40,6 +41,9 @@ public:
 
     // Manual flush (e.g., on shutdown).
     void flush(const std::string& reason);
+
+    // Snapshot current telemetry as a single-line JSON (no side effects; does not log or write to file).
+    std::string snapshot_json(const std::string& reason = "snapshot");
 
     // Metrics API (thread-safe).
     void inc_counter(const std::string& name, int64_t delta = 1);

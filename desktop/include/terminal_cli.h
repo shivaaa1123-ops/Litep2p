@@ -28,6 +28,7 @@
 #include <atomic>
 #include <set>
 #include <unordered_map>
+#include <chrono>
 
 class P2PNode;
 
@@ -55,6 +56,10 @@ public:
     
     void run();
     void stop();
+
+    // TUI-only: controls how often the telemetry pane is refreshed/redrawn.
+    // Clamped to [100, 60000] ms. No-op in plain/daemon mode.
+    void setTelemetryRefreshIntervalMs(int ms);
     
     // Callbacks from engine
     void on_log_message(const std::string& message);
@@ -90,6 +95,7 @@ private:
     std::deque<std::string> log_buffer;         // Engine logs
     std::deque<std::string> cmd_output_buffer;  // Command results
     std::deque<std::string> message_buffer;     // Chat messages
+    std::deque<std::string> telemetry_buffer;   // Telemetry (rendered lines)
     std::vector<PeerInfo> peer_list;            // Discovered peers
     std::set<std::string> connected_peers;      // Set of connected peer IDs
 
@@ -137,6 +143,11 @@ private:
     void draw_cmd_output_panel();
     void draw_logs_panel();
     void draw_prompt();
+    void refresh_telemetry_buffer_locked();
+
+    // Telemetry rendering cadence (TUI mode only)
+    std::chrono::steady_clock::time_point last_telemetry_draw_{};
+    int telemetry_draw_interval_ms_{1000};
     
     // Buffer management
     void add_log(const std::string& msg);

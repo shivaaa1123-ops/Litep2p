@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <cstring>
 #include <nlohmann/json.hpp>
+#include "telemetry.h"
 
 struct ParsedPeerEntry {
     std::string peer_id;
@@ -236,6 +237,8 @@ TerminalCLI::TerminalCLI(P2PNode& p2p_node, bool force_plain, bool daemon_mode)
     node.setMessageEventCallback(
         [this](const std::string& peer_id, const std::string& message) { this->on_message_received(peer_id, message); }
     );
+
+    last_telemetry_draw_ = std::chrono::steady_clock::now();
 }
 
 TerminalCLI::~TerminalCLI() {
@@ -243,6 +246,12 @@ TerminalCLI::~TerminalCLI() {
     node.clearEventCallbacks();
     restore_terminal();
     g_cli = nullptr;
+}
+
+void TerminalCLI::setTelemetryRefreshIntervalMs(int ms) {
+    if (ms < 100) ms = 100;
+    if (ms > 60000) ms = 60000;
+    telemetry_draw_interval_ms_ = ms;
 }
 
 void TerminalCLI::setup_terminal() {
@@ -425,6 +434,16 @@ void TerminalCLI::run() {
         if (n == 1) {
             handle_keypress(c);
         }
+
+        // Periodic telemetry refresh (keep it smooth but not noisy).
+        const auto now = std::chrono::steady_clock::now();
+        if (tui_ready_ && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_telemetry_draw_).count() >= telemetry_draw_interval_ms_) {
+            std::lock_guard<std::mutex> lock(display_mutex);
+            refresh_telemetry_buffer_locked();
+            draw_messages_panel();
+            draw_prompt();
+            last_telemetry_draw_ = now;
+        }
     }
     
     // Clear log callback before restoring terminal
@@ -587,12 +606,87 @@ void TerminalCLI::full_redraw() {
     
     draw_header();
     draw_peers_panel();
+    refresh_telemetry_buffer_locked();
     draw_messages_panel();
     draw_cmd_output_panel();
     draw_logs_panel();
     draw_prompt();
     
     write_tty(ESC_SHOW_CURSOR);
+}
+
+void TerminalCLI::refresh_telemetry_buffer_locked() {
+    // Must be called with display_mutex held.
+    telemetry_buffer.clear();
+
+    // Snapshot telemetry JSON and render a compact, stable set of fields.
+    try {
+        const std::string js = Telemetry::getInstance().snapshot_json("cli");
+        if (js.empty() || js == "{}") {
+            telemetry_buffer.push_back(std::string(C_DIM) + "telemetry: disabled" + C_RESET);
+            return;
+        }
+        auto j = nlohmann::json::parse(js, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) {
+            telemetry_buffer.push_back(std::string(C_BRED) + "telemetry: parse error" + C_RESET);
+            return;
+        }
+
+        auto get_i64 = [&](const nlohmann::json& obj, const std::string& k, int64_t def = 0) -> int64_t {
+            if (!obj.is_object()) return def;
+            auto it = obj.find(k);
+            if (it == obj.end()) return def;
+            if (it->is_number_integer()) return it->get<int64_t>();
+            if (it->is_number_unsigned()) return static_cast<int64_t>(it->get<uint64_t>());
+            if (it->is_number_float()) return static_cast<int64_t>(it->get<double>());
+            return def;
+        };
+
+        const int64_t uptime_ms = get_i64(j, "uptime_ms", 0);
+        const int64_t up_s = uptime_ms / 1000;
+        const int64_t up_m = up_s / 60;
+        const int64_t up_h = up_m / 60;
+
+        telemetry_buffer.push_back(std::string(C_BCYAN) + "uptime " + C_RESET +
+                                   std::to_string(up_h) + "h" + std::to_string(up_m % 60) + "m" + std::to_string(up_s % 60) + "s");
+
+        const auto& counters = j.value("counters", nlohmann::json::object());
+        const auto& gauges = j.value("gauges", nlohmann::json::object());
+
+        auto g = [&](const std::string& k) -> int64_t { return get_i64(gauges, k, 0); };
+        auto c = [&](const std::string& k) -> int64_t { return get_i64(counters, k, 0); };
+
+        telemetry_buffer.push_back(std::string(C_MAGENTA) + "peers" + C_RESET +
+                                   " total=" + std::to_string(g("peers_total")) +
+                                   " conn=" + std::to_string(g("peers_connected")));
+        telemetry_buffer.push_back("state C=" + std::to_string(g("peers_state_connecting")) +
+                                   " H=" + std::to_string(g("peers_state_handshaking")) +
+                                   " R=" + std::to_string(g("peers_state_ready")));
+        telemetry_buffer.push_back("pending msgs=" + std::to_string(g("pending_messages_total")));
+
+        telemetry_buffer.push_back(std::string(C_GREEN) + "connect" + C_RESET +
+                                   " ok=" + std::to_string(c("connect_success_total")) +
+                                   " fail=" + std::to_string(c("connect_failed_total")) +
+                                   " sup=" + std::to_string(c("connect_suppressed_total")));
+        telemetry_buffer.push_back(std::string(C_GREEN) + "handshake" + C_RESET +
+                                   " ok=" + std::to_string(c("handshake_success_total")) +
+                                   " fail=" + std::to_string(c("handshake_failed_total")));
+
+        telemetry_buffer.push_back(std::string(C_YELLOW) + "noise" + C_RESET +
+                                   " decrypt_fail=" + std::to_string(c("noise_decrypt_fail_total")) +
+                                   " reset=" + std::to_string(c("noise_session_reset_total")));
+
+        telemetry_buffer.push_back(std::string(C_CYAN) + "tx" + C_RESET +
+                                   " msgs=" + std::to_string(c("tx_messages_total")) +
+                                   " bytes=" + std::to_string(c("tx_bytes_total")));
+        telemetry_buffer.push_back(std::string(C_CYAN) + "rx" + C_RESET +
+                                   " ev=" + std::to_string(c("rx_events_total")) +
+                                   " bytes=" + std::to_string(c("rx_bytes_total")));
+
+        telemetry_buffer.push_back("netchg total=" + std::to_string(c("network_change_total")));
+    } catch (...) {
+        telemetry_buffer.push_back(std::string(C_BRED) + "telemetry: exception" + C_RESET);
+    }
 }
 
 void TerminalCLI::draw_header() {
@@ -671,18 +765,38 @@ void TerminalCLI::draw_messages_panel() {
     
     std::ostringstream oss;
     
-    std::string title = " MESSAGES ";
-    oss << "\033[" << start << ";" << (start_col + 2) << "H" << C_MAGENTA << C_BOLD << title << C_RESET;
+    // Split messages panel into: [messages | telemetry]
+    int telemetry_w = std::min(42, std::max(26, w / 3));
+    int msg_w = std::max(10, w - telemetry_w - 1); // 1 col separator
+    int sep_col = start_col + msg_w;
+
+    std::string title_left = " MESSAGES ";
+    std::string title_right = " TELEMETRY ";
+    oss << "\033[" << start << ";" << (start_col + 2) << "H" << C_MAGENTA << C_BOLD << title_left << C_RESET;
+    oss << "\033[" << start << ";" << (sep_col + 2) << "H" << C_CYAN << C_BOLD << title_right << C_RESET;
     oss << "\033[" << start << ";" << term_width << "H" << C_CYAN << BOX_RT << C_RESET;
     
     for (int i = 0; i < h; i++) {
         int row = start + 1 + i;
+        // Clear full row area
         oss << "\033[" << row << ";" << start_col << "H";
         for (int j = 0; j < w; j++) oss << " ";
-        
+
+        // Vertical separator
+        if (sep_col > start_col && sep_col < term_width) {
+            oss << "\033[" << row << ";" << sep_col << "H" << C_DIM << "│" << C_RESET;
+        }
+
+        // Messages (left)
         oss << "\033[" << row << ";" << start_col << "H";
         if (i < (int)message_buffer.size()) {
-            oss << truncate_str(message_buffer[i], w - 2);
+            oss << truncate_str(message_buffer[i], std::max(0, msg_w - 2));
+        }
+
+        // Telemetry (right)
+        oss << "\033[" << row << ";" << (sep_col + 1) << "H";
+        if (i < (int)telemetry_buffer.size()) {
+            oss << truncate_str(telemetry_buffer[i], std::max(0, telemetry_w - 2));
         }
         
         oss << "\033[" << row << ";" << term_width << "H" << C_CYAN << BOX_V << C_RESET;
