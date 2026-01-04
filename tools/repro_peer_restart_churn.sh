@@ -48,6 +48,7 @@ PROGRESS_EVERY="${PROGRESS_EVERY:-25}"
 DISCOVERY_RETRIES="${DISCOVERY_RETRIES:-2}"
 SEND_RETRIES="${SEND_RETRIES:-5}"
 CONNECT_RETRIES="${CONNECT_RETRIES:-4}"
+ENABLE_DUPLICATE_ID="${ENABLE_DUPLICATE_ID:-0}"
 
 A_FIFO="$RUN_DIR/peer_a.in"
 B_FIFO="$RUN_DIR/peer_b.in"
@@ -397,13 +398,25 @@ for ((i=1; i<=CYCLES; i++)); do
   fi
 
   # Randomly choose a churn pattern.
-  case $((RANDOM % 7)) in
+  # If ENABLE_DUPLICATE_ID=0, avoid the duplicate-id scenario (it intentionally violates invariants).
+  local mod=7
+  if [[ "${ENABLE_DUPLICATE_ID}" != "1" ]]; then
+    mod=6
+  fi
+
+  case $((RANDOM % mod)) in
     0) restart_b_graceful ;;
     1) restart_b_term ;;
     2) restart_b_kill ;;
     3) restart_a_graceful ;;
     4) restart_a_kill ;;
-    5) duplicate_b_then_kill_one ;;
+    5)
+      if [[ "${ENABLE_DUPLICATE_ID}" == "1" ]]; then
+        duplicate_b_then_kill_one
+      else
+        log_summary "ACTION noop (no restart)"
+      fi
+      ;;
     6) log_summary "ACTION noop (no restart)" ;;
   esac
 
