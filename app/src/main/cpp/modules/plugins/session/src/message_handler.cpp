@@ -141,6 +141,8 @@ namespace detail {
                 }
                 LOG_INFO("MH: Identified unknown peer as " + peer_id + " from CONNECT message");
                 
+                // Flag to track if we created a new peer (for notifyPeerUpdate outside lock)
+                bool created_new_peer = false;
                 {
                     std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
                     Peer* peer = m_sm->find_peer_by_id(peer_id);
@@ -221,8 +223,12 @@ namespace detail {
                         m_sm->add_peer_to_network_index(peer_id, event.network_id);
                         m_sm->m_peer_contexts[peer_id] = PeerContext{peer_id, event.network_id};
                         m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::DISCOVERED});
-                        m_sm->notifyPeerUpdate();
+                        created_new_peer = true;  // Defer notifyPeerUpdate to avoid deadlock
                     }
+                }
+                // CRITICAL: notifyPeerUpdate() acquires m_peers_mutex, so call OUTSIDE the lock scope
+                if (created_new_peer) {
+                    m_sm->notifyPeerUpdate();
                 }
             } else {
                 LOG_WARN("SM: Received non-CONNECT message from unknown peer. Dropping.");
