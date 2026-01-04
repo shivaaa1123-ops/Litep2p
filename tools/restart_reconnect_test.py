@@ -323,6 +323,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="LiteP2P restart/reconnect behavior test")
     ap.add_argument("--binary", type=str, default="", help="Path to desktop peer binary")
     ap.add_argument("--config", type=str, default="", help="Path to config.json (optional)")
+    ap.add_argument("--config-a", type=str, default="", help="Config for peer A (overrides --config if set)")
+    ap.add_argument("--config-b", type=str, default="", help="Config for peer B (overrides --config if set)")
     ap.add_argument(
         "--use-repo-config",
         action="store_true",
@@ -339,15 +341,27 @@ def main() -> int:
     args = ap.parse_args()
 
     binary = Path(args.binary).expanduser() if args.binary else find_default_binary()
+
+    # Support per-peer configs to ensure isolated Noise keystores.
     explicit_config = Path(args.config).expanduser() if args.config else None
     if args.use_repo_config and explicit_config is None:
         explicit_config = Path(__file__).resolve().parents[1] / "config.json"
 
-    config, temp_to_delete = build_lan_safe_config_path(explicit_config)
+    config_a_path = Path(args.config_a).expanduser() if args.config_a else explicit_config
+    config_b_path = Path(args.config_b).expanduser() if args.config_b else explicit_config
+
+    temp_to_delete: Optional[Path] = None
+    if config_a_path is None:
+        # No explicit config; generate one (shared is okay for generated temp configs).
+        config, temp_to_delete = build_lan_safe_config_path(None)
+        config_a_path = config
+        config_b_path = config
 
     print(f"[test] binary: {binary}")
-    if config:
-        print(f"[test] config: {config}")
+    if config_a_path:
+        print(f"[test] config_a: {config_a_path}")
+    if config_b_path and config_b_path != config_a_path:
+        print(f"[test] config_b: {config_b_path}")
     print(f"[test] starting B: id={args.id_b} port={args.port_b}")
     a = None
     a2 = None
@@ -360,7 +374,7 @@ def main() -> int:
             port=args.port_b,
             peer_id=args.id_b,
             log_level=args.log_level,
-            config=config,
+            config=config_b_path,
             verbose=args.verbose,
         )
 
@@ -375,7 +389,7 @@ def main() -> int:
             port=args.port_a,
             peer_id=args.id_a,
             log_level=args.log_level,
-            config=config,
+            config=config_a_path,
             verbose=args.verbose,
         )
 
@@ -419,7 +433,7 @@ def main() -> int:
             port=args.port_a,
             peer_id=args.id_a,
             log_level=args.log_level,
-            config=config,
+            config=config_a_path,
             verbose=args.verbose,
         )
 

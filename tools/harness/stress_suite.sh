@@ -52,7 +52,13 @@ nohup env SIGNALING_HOST=127.0.0.1 SIGNALING_PORT="${SIGNALING_PORT}" LOG_LEVEL=
   python3 tools/signaling_server/server.py > "${OUT_DIR}/local_signaling.log" 2>&1 &
 sleep 1
 
-cat > "${OUT_DIR}/config_local_signaling.json" <<JSON
+# Create per-peer config files with ISOLATED keystores to prevent Noise key corruption.
+# Both A and B run from the same cwd, so "keystore" would be shared otherwise.
+KEYSTORE_A="${OUT_DIR}/keystore_a"
+KEYSTORE_B="${OUT_DIR}/keystore_b"
+mkdir -p "${KEYSTORE_A}" "${KEYSTORE_B}"
+
+cat > "${OUT_DIR}/config_a.json" <<JSON
 {
   "network": {"default_server_port": 30001, "discovery_port": 30000},
   "global_discovery": {"enabled": false},
@@ -60,7 +66,20 @@ cat > "${OUT_DIR}/config_local_signaling.json" <<JSON
   "signaling": {"enabled": true, "url": "ws://127.0.0.1:${SIGNALING_PORT}", "reconnect_interval_ms": 200},
   "storage": {"peer_db": {"enabled": false}},
   "peer_management": {"peer_expiration_timeout_ms": 15000, "heartbeat_interval_sec": 1, "timer_tick_interval_sec": 1},
-  "security": {"noise_nk_protocol": {"enabled": true, "mandatory": true, "key_store_path": "keystore"}},
+  "security": {"noise_nk_protocol": {"enabled": true, "mandatory": true, "key_store_path": "${KEYSTORE_A}"}},
+  "logging": {"level": "debug", "console_output": true}
+}
+JSON
+
+cat > "${OUT_DIR}/config_b.json" <<JSON
+{
+  "network": {"default_server_port": 30001, "discovery_port": 30000},
+  "global_discovery": {"enabled": false},
+  "nat_traversal": {"enabled": false, "stun_enabled": false, "hole_punching_enabled": false, "turn_enabled": false},
+  "signaling": {"enabled": true, "url": "ws://127.0.0.1:${SIGNALING_PORT}", "reconnect_interval_ms": 200},
+  "storage": {"peer_db": {"enabled": false}},
+  "peer_management": {"peer_expiration_timeout_ms": 15000, "heartbeat_interval_sec": 1, "timer_tick_interval_sec": 1},
+  "security": {"noise_nk_protocol": {"enabled": true, "mandatory": true, "key_store_path": "${KEYSTORE_B}"}},
   "logging": {"level": "debug", "console_output": true}
 }
 JSON
@@ -71,7 +90,8 @@ IDA="suiteA_${TS}"
 IDB="suiteB_${TS}"
 python3 tools/reconnect_mechanism_test.py \
   --binary "${PEER_BIN}" \
-  --config "${OUT_DIR}/config_local_signaling.json" \
+  --config-a "${OUT_DIR}/config_a.json" \
+  --config-b "${OUT_DIR}/config_b.json" \
   --id-a "${IDA}" --id-b "${IDB}" \
   --cycles "${RECONNECT_CYCLES}" \
   --restart both \
@@ -83,7 +103,8 @@ python3 tools/reconnect_mechanism_test.py \
 echo "[suite] Running restart_reconnect_test ..."
 python3 tools/restart_reconnect_test.py \
   --binary "${PEER_BIN}" \
-  --config "${OUT_DIR}/config_local_signaling.json" \
+  --config-a "${OUT_DIR}/config_a.json" \
+  --config-b "${OUT_DIR}/config_b.json" \
   --id-a "restartA_${TS}" --id-b "restartB_${TS}" \
   --port-a 31101 --port-b 31102 \
   --log-level "${LOG_LEVEL}" \

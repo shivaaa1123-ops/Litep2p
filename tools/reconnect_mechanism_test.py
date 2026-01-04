@@ -377,6 +377,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="LiteP2P reconnect/session-freshness mechanism test")
     ap.add_argument("--binary", type=str, default="", help="Path to desktop peer binary")
     ap.add_argument("--config", type=str, default="", help="Path to config.json (optional; if omitted, a test config is generated)")
+    ap.add_argument("--config-a", type=str, default="", help="Config for peer A (overrides --config if set)")
+    ap.add_argument("--config-b", type=str, default="", help="Config for peer B (overrides --config if set)")
     ap.add_argument("--port-a", type=int, default=31001)
     ap.add_argument("--port-b", type=int, default=31002)
     ap.add_argument("--id-a", type=str, default="peerA")
@@ -398,17 +400,28 @@ def main() -> int:
     args = ap.parse_args()
 
     binary = Path(args.binary).expanduser() if args.binary else find_default_binary()
-    explicit_config = Path(args.config).expanduser() if args.config else None
 
-    config, temp_to_delete = build_test_config_path(
-        explicit_config=explicit_config,
-        peer_expiration_timeout_ms=args.peer_expiration_timeout_ms,
-        heartbeat_interval_sec=args.heartbeat_interval_sec,
-    )
+    # Support per-peer configs to ensure isolated Noise keystores.
+    explicit_config = Path(args.config).expanduser() if args.config else None
+    config_a_path = Path(args.config_a).expanduser() if args.config_a else explicit_config
+    config_b_path = Path(args.config_b).expanduser() if args.config_b else explicit_config
+
+    temp_to_delete: Optional[Path] = None
+    if config_a_path is None:
+        # No explicit config; generate one (shared is okay for generated temp configs).
+        config, temp_to_delete = build_test_config_path(
+            explicit_config=None,
+            peer_expiration_timeout_ms=args.peer_expiration_timeout_ms,
+            heartbeat_interval_sec=args.heartbeat_interval_sec,
+        )
+        config_a_path = config
+        config_b_path = config
 
     print(f"[test] binary: {binary}")
-    if config:
-        print(f"[test] config: {config}")
+    if config_a_path:
+        print(f"[test] config_a: {config_a_path}")
+    if config_b_path and config_b_path != config_a_path:
+        print(f"[test] config_b: {config_b_path}")
     print(f"[test] cycles: {args.cycles}  restart: {args.restart}")
 
     a: Optional[PeerProc] = None
@@ -429,7 +442,7 @@ def main() -> int:
             port=args.port_b,
             peer_id=args.id_b,
             log_level=args.log_level,
-            config=config,
+            config=config_b_path,
             verbose=args.verbose,
         )
         require(b, re.compile(r"LiteP2P \(plain mode\)"), timeout_s=10.0, msg="B did not start in time")
@@ -442,7 +455,7 @@ def main() -> int:
             port=args.port_a,
             peer_id=args.id_a,
             log_level=args.log_level,
-            config=config,
+            config=config_a_path,
             verbose=args.verbose,
         )
         require(a, re.compile(r"LiteP2P \(plain mode\)"), timeout_s=10.0, msg="A did not start in time")
@@ -490,7 +503,7 @@ def main() -> int:
                     port=args.port_a,
                     peer_id=args.id_a,
                     log_level=args.log_level,
-                    config=config,
+                    config=config_a_path,
                     kill_mode=args.kill,
                     verbose=args.verbose,
                     pause_s=args.restart_pause,
@@ -554,7 +567,7 @@ def main() -> int:
                     port=args.port_b,
                     peer_id=args.id_b,
                     log_level=args.log_level,
-                    config=config,
+                    config=config_b_path,
                     kill_mode=args.kill,
                     verbose=args.verbose,
                     pause_s=args.restart_pause,
