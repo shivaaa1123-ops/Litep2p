@@ -81,6 +81,7 @@ CYCLES="${CYCLES:-200}"
 MSG_TIMEOUT_SEC="${MSG_TIMEOUT_SEC:-3}"
 CONNECT_TIMEOUT_SEC="${CONNECT_TIMEOUT_SEC:-3}"
 DISCOVERY_TIMEOUT_SEC="${DISCOVERY_TIMEOUT_SEC:-6}"
+HANDSHAKE_TIMEOUT_SEC="${HANDSHAKE_TIMEOUT_SEC:-25}"
 SLEEP_BETWEEN_SEC="${SLEEP_BETWEEN_SEC:-0.2}"
 VERBOSE="${VERBOSE:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-25}"
@@ -285,32 +286,15 @@ assert_connected_and_messaging() {
     return 1
   fi
 
-  # Ensure both sides' peer list reports CONNECTED (not just a transient "Connected:" line).
-  # This avoids sending messages while the connection is flapping (common right after restarts).
-  local stab_try
-  for ((stab_try=1; stab_try<=3; stab_try++)); do
-    a0="$(line_count "$A_LOG")"
-    b0="$(line_count "$B_LOG")"
-    send_a "peers"
-    send_b "peers"
-    if wait_for_pattern_since_line "$A_LOG" "$a0" "\\b${PEER_B_ID}\\b\\s+\\[CONNECTED\\]" 3 \
-      && wait_for_pattern_since_line "$B_LOG" "$b0" "\\b${PEER_A_ID}\\b\\s+\\[CONNECTED\\]" 3; then
-      break
-    fi
-    log_summary "WARN cycle=$cycle reason=peerlist_not_connected attempt=$stab_try/3"
-    sleep 0.3
-  done
-
-  # Also ensure Noise handshake is READY on both sides before sending app messages.
-  # CONNECT_SUCCESS can happen before the Noise session is fully ready, and sending ENCRYPTED_DATA too early
-  # can lead to decrypt failures and confusing flaps.
-  a0="$(line_count "$A_LOG")"
-  b0="$(line_count "$B_LOG")"
-  if ! wait_for_pattern_since_line "$A_LOG" "$a0" "Handshake complete for ${PEER_B_ID}" 6; then
-    log_summary "WARN cycle=$cycle reason=a_handshake_not_ready"
+  # STRICT: ensure Noise handshake is READY on both sides before sending app messages.
+  # Sending ENCRYPTED_DATA before both sides are READY causes expected decrypt failures/flaps.
+  if ! wait_for_pattern_since_line "$A_LOG" "$a_conn0" "SecureSession: Handshake complete for ${PEER_B_ID}" "$HANDSHAKE_TIMEOUT_SEC"; then
+    log_summary "FAIL cycle=$cycle reason=a_handshake_timeout"
+    return 1
   fi
-  if ! wait_for_pattern_since_line "$B_LOG" "$b0" "Handshake complete for ${PEER_A_ID}" 6; then
-    log_summary "WARN cycle=$cycle reason=b_handshake_not_ready"
+  if ! wait_for_pattern_since_line "$B_LOG" "$b_conn0" "SecureSession: Handshake complete for ${PEER_A_ID}" "$HANDSHAKE_TIMEOUT_SEC"; then
+    log_summary "FAIL cycle=$cycle reason=b_handshake_timeout"
+    return 1
   fi
 
   # Send messages both ways and assert receipt.
