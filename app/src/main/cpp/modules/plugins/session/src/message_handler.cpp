@@ -386,8 +386,18 @@ namespace detail {
                 m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_SUCCESS});
 #if HAVE_NOISE_PROTOCOL
                 if (m_sm->m_use_noise_protocol && m_sm->shouldInitiateNoiseHandshake(peer_id)) {
-                    LOG_INFO("MH: Scheduling Noise handshake (initiator) for peer " + peer_id);
-                    m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_REQUIRED});
+                    bool ready = false;
+                    if (m_sm->m_secure_session_manager) {
+                        std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
+                        auto existing = m_sm->m_secure_session_manager->get_session(peer_id);
+                        ready = (existing && existing->is_ready());
+                    }
+                    if (!ready) {
+                        LOG_INFO("MH: Scheduling Noise handshake (initiator) for peer " + peer_id);
+                        m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_REQUIRED});
+                    } else {
+                        LOG_DEBUG("MH: Noise session already READY for " + peer_id + " - skipping handshake scheduling");
+                    }
                 }
 #endif
                 break;
@@ -428,8 +438,18 @@ namespace detail {
 #if HAVE_NOISE_PROTOCOL
                 LOG_INFO("MH: Checking noise handshake initiation. use_noise=" + std::string(m_sm->m_use_noise_protocol ? "true" : "false"));
                 if (m_sm->m_use_noise_protocol && m_sm->shouldInitiateNoiseHandshake(peer_id)) {
-                    LOG_INFO("MH: Scheduling Noise handshake (initiator) for peer " + peer_id);
-                    m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_REQUIRED});
+                    bool ready = false;
+                    if (m_sm->m_secure_session_manager) {
+                        std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
+                        auto existing = m_sm->m_secure_session_manager->get_session(peer_id);
+                        ready = (existing && existing->is_ready());
+                    }
+                    if (!ready) {
+                        LOG_INFO("MH: Scheduling Noise handshake (initiator) for peer " + peer_id);
+                        m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_REQUIRED});
+                    } else {
+                        LOG_DEBUG("MH: Noise session already READY for " + peer_id + " - skipping handshake scheduling");
+                    }
                 }
 #endif
                 break;
