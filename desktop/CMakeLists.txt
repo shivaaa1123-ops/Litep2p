@@ -285,6 +285,10 @@ add_executable(wan_integration_runner tests/wan_integration_runner.cpp)
 target_include_directories(wan_integration_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(wan_integration_runner PRIVATE litep2p_engine)
 
+add_executable(message_size_runner tests/message_size_runner.cpp)
+target_include_directories(message_size_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(message_size_runner PRIVATE litep2p_engine)
+
 if(ENABLE_PROXY_MODULE)
     add_executable(proxy_test tests/proxy_test.cpp)
     target_include_directories(proxy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -91,6 +91,59 @@ python3 tools/restart_reconnect_test.py \
   --timeout 50 \
   > "${OUT_DIR}/restart_reconnect.log" 2>&1
 
+echo "[suite] Running file_transfer_test (chunking/resume) ..."
+cd "${ROOT_DIR}/desktop/build_linux_ci"
+./bin/file_transfer_test > "${OUT_DIR}/file_transfer_test.log" 2>&1 || true
+
+echo "[suite] Running message_size_runner (two-process loopback) ..."
+WORK_A="${OUT_DIR}/msgsize_a"
+WORK_B="${OUT_DIR}/msgsize_b"
+mkdir -p "${WORK_A}" "${WORK_B}"
+
+cat > "${WORK_A}/config.json" <<JSON
+{
+  "global_discovery": {"enabled": false},
+  "nat_traversal": {"enabled": false, "stun_enabled": false, "hole_punching_enabled": false, "turn_enabled": false},
+  "signaling": {"enabled": false, "url": "ws://127.0.0.1:1", "reconnect_interval_ms": 60000},
+  "storage": {"peer_db": {"enabled": false}},
+  "peer_management": {"peer_expiration_timeout_ms": 15000, "heartbeat_interval_sec": 1, "timer_tick_interval_sec": 1},
+  "security": {"noise_nk_protocol": {"enabled": true, "mandatory": true, "key_store_path": "keystore"}},
+  "logging": {"level": "error", "console_output": true}
+}
+JSON
+
+cp "${WORK_A}/config.json" "${WORK_B}/config.json"
+
+PORT_A=31201
+PORT_B=31202
+IDA="msgA_$(date +%s)"
+IDB="msgB_$(date +%s)"
+
+cd "${ROOT_DIR}/desktop/build_linux_ci"
+
+(
+  cd "${WORK_B}"
+  CONFIG_PATH="${WORK_B}/config.json" ROLE=receiver SELF_ID="${IDB}" SELF_PORT="${PORT_B}" DEADLINE_SEC=120 \
+    OUT_JSON="${OUT_DIR}/message_size_receiver.json" \
+    "${ROOT_DIR}/desktop/build_linux_ci/bin/message_size_runner" > "${OUT_DIR}/message_size_receiver.log" 2>&1
+) &
+RX_PID=$!
+
+sleep 1
+
+(
+  cd "${WORK_A}"
+  CONFIG_PATH="${WORK_A}/config.json" ROLE=sender SELF_ID="${IDA}" SELF_PORT="${PORT_A}" \
+    TARGET_ID="${IDB}" TARGET_NETID="127.0.0.1:${PORT_B}" \
+    SIZES="64,128,256,512,1024,2048,4096,8192,16384,32768" DEADLINE_SEC=120 \
+    OUT_JSON="${OUT_DIR}/message_size_sender.json" \
+    "${ROOT_DIR}/desktop/build_linux_ci/bin/message_size_runner" > "${OUT_DIR}/message_size_sender.log" 2>&1
+)
+SENDER_CODE=$?
+
+wait "${RX_PID}" || true
+echo "[suite] message_size_runner sender exit=${SENDER_CODE}"
+
 echo "[suite] Applying UDP packet loss via iptables (p=${LOSS_PROB}, duration=${LOSS_DURATION_SEC}s) ..."
 iptables -A INPUT  -p udp --dport 31001 -m statistic --mode random --probability "${LOSS_PROB}" -j DROP
 iptables -A INPUT  -p udp --dport 31002 -m statistic --mode random --probability "${LOSS_PROB}" -j DROP
