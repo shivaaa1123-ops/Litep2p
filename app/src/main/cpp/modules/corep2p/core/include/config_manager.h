@@ -85,6 +85,13 @@ public:
     bool isMonitoringEnabled() const;
     int getMetricsPort() const;
     int getHealthCheckInterval() const;
+
+    // Telemetry (local metrics, periodic JSON flush)
+    bool isTelemetryEnabled() const;
+    bool isTelemetryLogEnabled() const;
+    int getTelemetryFlushIntervalMs() const;
+    std::string getTelemetryFilePath() const;
+    bool telemetryIncludePeerIds() const;
     
     // NAT Traversal
     bool isNATTraversalEnabled() const;

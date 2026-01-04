@@ -186,6 +186,7 @@ set(FILE_TRANSFER_SOURCES
 # Core P2P
 set(CORE_P2P_SOURCES
     ../app/src/main/cpp/modules/corep2p/core/src/config_manager.cpp
+    ../app/src/main/cpp/modules/corep2p/core/src/telemetry.cpp
 )
 
 # Discovery

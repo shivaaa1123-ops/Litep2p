@@ -2,6 +2,7 @@
 #include "../../../corep2p/transport/include/quic_connection_manager.h"
 #include "../../../corep2p/transport/include/udp_connection_manager.h"
 #include "../../../corep2p/core/include/config_manager.h"
+#include "../../../corep2p/core/include/telemetry.h"
 #include "../../routing/include/upnp_controller.h"
 #include "../../discovery/include/signaling_client.h"
 #include "unified_event_loop.h"
@@ -473,6 +474,19 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
     m_comms_mode = comms_mode;
     m_localPeerId = peer_id;
     m_network_available.store(true, std::memory_order_release);
+
+    // Telemetry (local-only, no network). Safe to call multiple times.
+    {
+        auto& cfg = ConfigManager::getInstance();
+        Telemetry::Config tc;
+        tc.enabled = cfg.isTelemetryEnabled();
+        tc.log_json = cfg.isTelemetryLogEnabled();
+        tc.flush_interval_ms = cfg.getTelemetryFlushIntervalMs();
+        tc.file_path = cfg.getTelemetryFilePath();
+        tc.include_peer_ids = cfg.telemetryIncludePeerIds();
+        Telemetry::getInstance().initialize(peer_id, tc);
+        Telemetry::getInstance().inc_counter("engine_start_total");
+    }
 
     // Variable to hold signaling FD for single-thread mode registration
     int single_thread_signaling_fd = -1;
@@ -1178,6 +1192,10 @@ void SessionManager::Impl::stop() {
     std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
     LOG_INFO("SM: Stopping session manager...");
 
+    // Best-effort final telemetry flush before teardown starts.
+    Telemetry::getInstance().inc_counter("engine_stop_total");
+    Telemetry::getInstance().flush("shutdown");
+
     const auto stop_started_at = std::chrono::steady_clock::now();
     auto log_phase_ms = [&](const char* label, const std::chrono::steady_clock::time_point& started) {
         const auto now = std::chrono::steady_clock::now();
@@ -1703,9 +1721,33 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
     }
 
     const PeerState prev_state = ctx->state;
+    const auto prev_enter = ctx->last_state_change;
     NATIVELOGW(("SM_NATIVE: handleFSMEvent - calling fsm.handle_event. Current State: " + std::to_string(static_cast<int>(ctx->state)) + ", Event: " + std::to_string(static_cast<int>(event.fsmEvent))).c_str());
     FSMResult result = m_peer_fsm.handle_event(*ctx, event.fsmEvent);
     const PeerState new_state = ctx->state;
+
+    // ---------------- Telemetry: FSM events + state durations ----------------
+    {
+        Telemetry& t = Telemetry::getInstance();
+        t.inc_counter("fsm_event_total");
+        switch (event.fsmEvent) {
+            case PeerEvent::CONNECT_REQUESTED: t.inc_counter("connect_requested_total"); break;
+            case PeerEvent::CONNECT_SUCCESS: t.inc_counter("connect_success_total"); break;
+            case PeerEvent::CONNECT_FAILED: t.inc_counter("connect_failed_total"); break;
+            case PeerEvent::HANDSHAKE_REQUIRED: t.inc_counter("handshake_required_total"); break;
+            case PeerEvent::HANDSHAKE_SUCCESS: t.inc_counter("handshake_success_total"); break;
+            case PeerEvent::HANDSHAKE_FAILED: t.inc_counter("handshake_failed_total"); break;
+            case PeerEvent::DISCONNECT_DETECTED: t.inc_counter("disconnect_detected_total"); break;
+            default: break;
+        }
+
+        if (prev_state != new_state) {
+            t.inc_counter("state_transition_total");
+            const auto now = std::chrono::steady_clock::now();
+            const int64_t dur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - prev_enter).count();
+            t.observe_hist_ms(std::string("state_duration_ms.") + std::to_string(static_cast<int>(prev_state)), dur_ms);
+        }
+    }
 
     // Update UI-facing connected status based on FSM state transitions.
     // IMPORTANT:
@@ -1929,6 +1971,9 @@ void SessionManager::Impl::timerLoop() {
 void SessionManager::Impl::handleSendMessageWithRetry(const std::string& peer_id, const std::string& network_id, 
                                    const std::string& message, const std::string& message_id) {
     LOG_INFO("SM: handleSendMessageWithRetry called - peer_id=" + peer_id + ", network_id=" + network_id + ", msg_len=" + std::to_string(message.length()));
+
+    Telemetry::getInstance().inc_counter("tx_messages_total");
+    Telemetry::getInstance().inc_counter("tx_bytes_total", static_cast<int64_t>(message.size()));
     
     // Shutdown guard - early return if shutting down
     if (m_shutting_down.load(std::memory_order_acquire)) {
@@ -1973,6 +2018,9 @@ void SessionManager::Impl::set_network_info(bool is_wifi, bool is_available) {
     const bool network_restored = (!was_available && is_available);
     const bool network_type_changed = (was_available && is_available && was_wifi != is_wifi);
     if (network_restored || network_type_changed) {
+        Telemetry::getInstance().inc_counter("network_change_total");
+        if (network_restored) Telemetry::getInstance().inc_counter("network_change_restored_total");
+        if (network_type_changed) Telemetry::getInstance().inc_counter("network_change_type_total");
         LOG_INFO(std::string("SM: Network change detected (") +
                  (network_restored ? "restored" : "type_changed") +
                  ", wifi=" + (is_wifi ? "true" : "false") + "). Refreshing NAT/signaling.");

@@ -1,6 +1,7 @@
 #include "peer_lifecycle_manager.h"
 #include "session_manager_p.h"
 #include "config_manager.h"
+#include "telemetry.h"
 #include "../../routing/include/peer_reconnect_policy.h"
 
 #include <chrono>
@@ -474,6 +475,7 @@ namespace detail {
                 LOG_INFO("SM: ConnectToPeer suppressed by reconnect policy for " + event.peerId +
                          " (backoff_ms=" + std::to_string(strat.backoff_ms) +
                          ", should_retry=" + std::string(strat.should_retry ? "true" : "false") + ")");
+                Telemetry::getInstance().inc_counter("connect_suppressed_total");
                 return;
             }
         }

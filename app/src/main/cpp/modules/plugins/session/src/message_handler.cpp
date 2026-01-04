@@ -2,6 +2,7 @@
 #include "session_manager_p.h"
 #include "message_types.h"
 #include "config_manager.h"
+#include "telemetry.h"
 #include <iostream>
 #include <nlohmann/json.hpp>
 
@@ -67,6 +68,9 @@ namespace detail {
         if (m_sm->m_shutting_down.load(std::memory_order_acquire)) {
             return;
         }
+
+        Telemetry::getInstance().inc_counter("rx_events_total");
+        Telemetry::getInstance().inc_counter("rx_bytes_total", static_cast<int64_t>(event.data.size()));
         
         LOG_INFO("MH: === START handleDataReceived ===");
         LOG_INFO("MH: Received data from network_id=" + event.network_id + ", length=" + std::to_string(event.data.length()));
@@ -502,6 +506,7 @@ namespace detail {
                             handleDataReceived(decrypted_event); // Recursive call with decrypted data
                         } else {
                             LOG_WARN("SM: Failed to decrypt message from " + peer_id + " (stale key/session?)");
+                            Telemetry::getInstance().inc_counter("noise_decrypt_fail_total");
 
                             // Recovery path: likely stale keys (peer restart) or session desync.
                             // Clear READY session and trigger a fresh handshake/reconnect.
@@ -509,6 +514,7 @@ namespace detail {
                                 std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
                                 m_sm->m_secure_session_manager->remove_session(peer_id);
                             }
+                            Telemetry::getInstance().inc_counter("noise_session_reset_total");
                             m_sm->clearQueuedMessages(peer_id);
                             if (m_sm->m_message_batcher) {
                                 (void)m_sm->m_message_batcher->flush_peer(peer_id);
@@ -546,6 +552,8 @@ namespace detail {
 #endif
                 break;
             case MessageType::APPLICATION_DATA:
+                Telemetry::getInstance().inc_counter("rx_app_messages_total");
+                Telemetry::getInstance().inc_counter("rx_app_bytes_total", static_cast<int64_t>(payload.size()));
                 // Remote control plane: LP_ADMIN is carried over APPLICATION_DATA as JSON.
                 // If recognized, handle it here and prevent it from reaching the normal app callback.
                 if (!payload.empty() && payload.front() == '{') {

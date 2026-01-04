@@ -1,6 +1,7 @@
 #include "maintenance_manager.h"
 #include "session_manager_p.h"
 #include "config_manager.h"
+#include "telemetry.h"
 #include "wire_codec.h"
 #include "../../discovery/include/discovery.h"
 
@@ -15,6 +16,41 @@ namespace detail {
         // Shutdown guard
         if (m_sm->m_shutting_down.load(std::memory_order_acquire)) {
             return;
+        }
+
+        // Telemetry tick + basic gauges (cheap, best-effort).
+        {
+            Telemetry& t = Telemetry::getInstance();
+            t.tick();
+
+            int64_t peers_total = 0;
+            int64_t peers_connected = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                peers_total = static_cast<int64_t>(m_sm->m_peers.size());
+                for (const auto& kv : m_sm->m_peers) {
+                    if (kv.second.connected) peers_connected++;
+                }
+            }
+            t.set_gauge("peers_total", peers_total);
+            t.set_gauge("peers_connected", peers_connected);
+
+            int64_t st_connecting = 0, st_handshaking = 0, st_ready = 0;
+            int64_t pending_msgs = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                for (const auto& kv : m_sm->m_peer_contexts) {
+                    const PeerContext& ctx = kv.second;
+                    if (ctx.state == PeerState::CONNECTING) st_connecting++;
+                    else if (ctx.state == PeerState::HANDSHAKING) st_handshaking++;
+                    else if (ctx.state == PeerState::READY) st_ready++;
+                    pending_msgs += static_cast<int64_t>(ctx.pending_messages.size());
+                }
+            }
+            t.set_gauge("peers_state_connecting", st_connecting);
+            t.set_gauge("peers_state_handshaking", st_handshaking);
+            t.set_gauge("peers_state_ready", st_ready);
+            t.set_gauge("pending_messages_total", pending_msgs);
         }
         
         // In single-thread mode, we need to periodically send discovery broadcasts

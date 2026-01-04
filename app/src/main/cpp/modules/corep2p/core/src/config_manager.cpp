@@ -413,6 +413,36 @@ int ConfigManager::getHealthCheckInterval() const {
     return jsonGetOr<int>(m_config, {"monitoring", "health_check_interval_ms"}, 30000);
 }
 
+bool ConfigManager::isTelemetryEnabled() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return true;
+    return jsonGetOr<bool>(m_config, {"monitoring", "telemetry", "enabled"}, true);
+}
+
+bool ConfigManager::isTelemetryLogEnabled() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return true;
+    return jsonGetOr<bool>(m_config, {"monitoring", "telemetry", "log_json"}, true);
+}
+
+int ConfigManager::getTelemetryFlushIntervalMs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 30000;
+    return jsonGetOr<int>(m_config, {"monitoring", "telemetry", "flush_interval_ms"}, 30000);
+}
+
+std::string ConfigManager::getTelemetryFilePath() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return "";
+    return jsonGetOr<std::string>(m_config, {"monitoring", "telemetry", "file_path"}, "");
+}
+
+bool ConfigManager::telemetryIncludePeerIds() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return true;
+    return jsonGetOr<bool>(m_config, {"monitoring", "telemetry", "include_peer_ids"}, true);
+}
+
 bool ConfigManager::isNATTraversalEnabled() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return true;

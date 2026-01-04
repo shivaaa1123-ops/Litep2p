@@ -4,6 +4,7 @@
 add_library(litep2p_core OBJECT
     src/config_manager.cpp
     src/logger.cpp
+    src/telemetry.cpp
 )
 
 # Expose include directory with proper scope propagation
