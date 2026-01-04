@@ -30,6 +30,45 @@ RUNS_DIR="$ROOT_DIR/desktop_sim_runs"
 RUN_DIR="$RUNS_DIR/churn_repro_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RUN_DIR"
 
+# Create per-peer configs so each process has its own Noise keystore (and optional peer_db),
+# matching real-world behavior (each device/app has isolated storage). Without this, multiple peers
+# will overwrite the same keystore file and encrypted messaging will fail/flap nondeterministically.
+CONFIG_A="$RUN_DIR/config_peer_a.json"
+CONFIG_B="$RUN_DIR/config_peer_b.json"
+KEYSTORE_A="$RUN_DIR/keystore_a"
+KEYSTORE_B="$RUN_DIR/keystore_b"
+mkdir -p "$KEYSTORE_A" "$KEYSTORE_B"
+
+python3 - "$CONFIG" "$CONFIG_A" "$KEYSTORE_A" <<'PY'
+import json, sys
+src, dst, ks = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(src, "r", encoding="utf-8"))
+sec = data.setdefault("security", {})
+nk = sec.setdefault("noise_nk_protocol", {})
+nk["enabled"] = bool(nk.get("enabled", True))
+nk["mandatory"] = bool(nk.get("mandatory", True))
+nk["key_store_path"] = ks
+storage = data.setdefault("storage", {})
+peer_db = storage.setdefault("peer_db", {})
+peer_db["enabled"] = False
+json.dump(data, open(dst, "w", encoding="utf-8"), indent=2)
+PY
+
+python3 - "$CONFIG" "$CONFIG_B" "$KEYSTORE_B" <<'PY'
+import json, sys
+src, dst, ks = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(src, "r", encoding="utf-8"))
+sec = data.setdefault("security", {})
+nk = sec.setdefault("noise_nk_protocol", {})
+nk["enabled"] = bool(nk.get("enabled", True))
+nk["mandatory"] = bool(nk.get("mandatory", True))
+nk["key_store_path"] = ks
+storage = data.setdefault("storage", {})
+peer_db = storage.setdefault("peer_db", {})
+peer_db["enabled"] = False
+json.dump(data, open(dst, "w", encoding="utf-8"), indent=2)
+PY
+
 # Fixed IDs so we can restart with the exact same identity.
 PEER_A_ID="${PEER_A_ID:-11111111-1111-1111-1111-111111111111}"
 PEER_B_ID="${PEER_B_ID:-22222222-2222-2222-2222-222222222222}"
@@ -101,13 +140,13 @@ log_progress() {
 }
 
 start_peer_a() {
-  "$BIN" --no-tui --log-level none --config "$CONFIG" --id "$PEER_A_ID" --port "$PEER_A_PORT" <"$A_FIFO" >>"$A_LOG" 2>&1 &
+  "$BIN" --no-tui --log-level none --config "$CONFIG_A" --id "$PEER_A_ID" --port "$PEER_A_PORT" <"$A_FIFO" >>"$A_LOG" 2>&1 &
   A_PID=$!
   log_summary "START A pid=$A_PID id=$PEER_A_ID port=$PEER_A_PORT"
 }
 
 start_peer_b() {
-  "$BIN" --no-tui --log-level none --config "$CONFIG" --id "$PEER_B_ID" --port "$PEER_B_PORT" <"$B_FIFO" >>"$B_LOG" 2>&1 &
+  "$BIN" --no-tui --log-level none --config "$CONFIG_B" --id "$PEER_B_ID" --port "$PEER_B_PORT" <"$B_FIFO" >>"$B_LOG" 2>&1 &
   B_PID=$!
   log_summary "START B pid=$B_PID id=$PEER_B_ID port=$PEER_B_PORT"
 }
