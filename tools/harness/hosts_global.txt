@@ -1,0 +1,9 @@
+# LiteP2P global infra hosts (Jan 4, 2026)
+# Format: user@host (one per line). Comments allowed.
+
+root@134.199.173.96   # AU peer
+root@134.209.157.160  # IN peer
+root@46.101.75.101    # EU peer
+root@157.245.194.189  # SG peer
+root@157.245.161.54   # US peer
+root@64.227.140.251   # SIG (signaling + TURN)
