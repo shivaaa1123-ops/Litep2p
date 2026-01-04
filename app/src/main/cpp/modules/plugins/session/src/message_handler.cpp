@@ -309,10 +309,14 @@ namespace detail {
                 // IMPORTANT (UDP restart safety): a peer can go offline abruptly (no FIN/RST), so we may never
                 // get a disconnect callback. If we keep a READY Noise session around, a restarted peer will
                 // negotiate new keys and encrypted messages will fail. Therefore, clear any READY Noise session
-                // whenever we receive a fresh CONTROL_CONNECT (but do NOT clear in-progress sessions).
+                // whenever we receive a fresh CONTROL_CONNECT *from a peer we still considered CONNECTED*.
+                //
+                // Do NOT clear READY sessions when peer_was_connected=false because CONTROL_CONNECT can be
+                // re-sent during reconnect storms / endpoint flaps. Clearing in that case causes unnecessary
+                // re-keys and decrypt failures under churn.
 #if HAVE_NOISE_PROTOCOL
                 bool cleared_ready_noise = false;
-                if (m_sm->m_secure_session_manager) {
+                if (peer_was_connected && m_sm->m_secure_session_manager) {
                     std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
                     auto existing = m_sm->m_secure_session_manager->get_session(peer_id);
                     if (existing && existing->is_ready()) {
