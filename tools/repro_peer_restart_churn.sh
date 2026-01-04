@@ -285,6 +285,22 @@ assert_connected_and_messaging() {
     return 1
   fi
 
+  # Ensure both sides' peer list reports CONNECTED (not just a transient "Connected:" line).
+  # This avoids sending messages while the connection is flapping (common right after restarts).
+  local stab_try
+  for ((stab_try=1; stab_try<=3; stab_try++)); do
+    a0="$(line_count "$A_LOG")"
+    b0="$(line_count "$B_LOG")"
+    send_a "peers"
+    send_b "peers"
+    if wait_for_pattern_since_line "$A_LOG" "$a0" "\\b${PEER_B_ID}\\b\\s+\\[CONNECTED\\]" 3 \
+      && wait_for_pattern_since_line "$B_LOG" "$b0" "\\b${PEER_A_ID}\\b\\s+\\[CONNECTED\\]" 3; then
+      break
+    fi
+    log_summary "WARN cycle=$cycle reason=peerlist_not_connected attempt=$stab_try/3"
+    sleep 0.3
+  done
+
   # Send messages both ways and assert receipt.
   local msg_a msg_b
   msg_a="cycle=${cycle} from=A t=$(now_ms)"
@@ -304,6 +320,9 @@ assert_connected_and_messaging() {
       break
     fi
     log_summary "WARN cycle=$cycle reason=B_missing_msg_a attempt=$attempt/$SEND_RETRIES"
+    # Re-drive connect in case the session got reset due to decrypt failure.
+    send_a "connect $PEER_B_ID"
+    send_b "connect $PEER_A_ID"
   done
 
   for ((attempt=1; attempt<=SEND_RETRIES; attempt++)); do
@@ -313,6 +332,8 @@ assert_connected_and_messaging() {
       break
     fi
     log_summary "WARN cycle=$cycle reason=A_missing_msg_b attempt=$attempt/$SEND_RETRIES"
+    send_a "connect $PEER_B_ID"
+    send_b "connect $PEER_A_ID"
   done
 
   if [[ "$ok_a" != "1" ]]; then
