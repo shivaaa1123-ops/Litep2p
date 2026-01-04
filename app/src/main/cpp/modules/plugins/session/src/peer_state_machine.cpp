@@ -206,9 +206,13 @@ FSMResult PeerStateMachine::compute_transition(
                 { PeerAction::INITIATE_HANDSHAKE }
             );
 
+        // When already READY, receiving a handshake message is likely a duplicate or late-arriving
+        // message from the remote peer. We still process it (to send back a response if needed for
+        // their state machine), but do NOT transition back to HANDSHAKING. The actual processing
+        // in SessionManager will check is_ready() and handle appropriately.
         if (event == PeerEvent::HANDSHAKE_MESSAGE_RECEIVED)
             return FSMResult(
-                PeerState::HANDSHAKING,
+                PeerState::READY,
                 { PeerAction::PROCESS_HANDSHAKE_MESSAGE }
             );
 
