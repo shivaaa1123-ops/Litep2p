@@ -294,29 +294,56 @@ namespace detail {
                 break;
             }
             case MessageType::CONTROL_CONNECT: {
+                // Extract the remote public key from CONTROL_CONNECT payload FIRST
+                // Format: "peer_id|public_key_hex"
+                std::string remote_pk_hex;
+                size_t delimiter = payload.find('|');
+                if (delimiter != std::string::npos) {
+                    remote_pk_hex = payload.substr(delimiter + 1);
+                }
+                
+                // Parse the public key bytes
+                std::vector<uint8_t> incoming_pk;
+                for (size_t i = 0; i + 1 < remote_pk_hex.length(); i += 2) {
+                    std::string byteString = remote_pk_hex.substr(i, 2);
+                    uint8_t byte = (uint8_t)strtol(byteString.c_str(), nullptr, 16);
+                    incoming_pk.push_back(byte);
+                }
+                
                 // Check if we're getting a CONNECT from a peer that was already connected
-                // This indicates the peer restarted or is re-establishing connection
                 bool peer_was_connected = false;
                 {
                     std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
                     Peer* peer = m_sm->find_peer_by_id(peer_id);
                     if (peer && peer->connected) {
-                        LOG_INFO("MH: Peer " + peer_id + " was already CONNECTED, now sending fresh CONNECT - likely restart");
                         peer_was_connected = true;
                     }
                 }
                 
-                // IMPORTANT (UDP restart safety): a peer can go offline abruptly (no FIN/RST), so we may never
-                // get a disconnect callback. If we keep a READY Noise session around, a restarted peer will
-                // negotiate new keys and encrypted messages will fail. Therefore, clear any READY Noise session
-                // whenever we receive a fresh CONTROL_CONNECT *from a peer we still considered CONNECTED*.
-                //
-                // Do NOT clear READY sessions when peer_was_connected=false because CONTROL_CONNECT can be
-                // re-sent during reconnect storms / endpoint flaps. Clearing in that case causes unnecessary
-                // re-keys and decrypt failures under churn.
+                // IMPORTANT: Only clear a READY Noise session if the remote peer's public key
+                // is DIFFERENT from what we have stored. This indicates a true restart/re-key.
+                // If the key is the SAME, the remote is just retrying CONTROL_CONNECT (common
+                // during reconnect storms or endpoint flaps) and we should NOT disrupt the session.
+                bool remote_key_changed = false;
 #if HAVE_NOISE_PROTOCOL
+                if (m_sm->m_use_noise_protocol && incoming_pk.size() == 32 && m_sm->m_noise_key_store) {
+                    auto stored_pk = m_sm->m_noise_key_store->get_peer_key(peer_id);
+                    if (stored_pk.empty()) {
+                        // No stored key - first contact, not a key change
+                        remote_key_changed = false;
+                    } else if (stored_pk != incoming_pk) {
+                        // Key is different - remote peer restarted with new keys
+                        LOG_INFO("MH: Peer " + peer_id + " public key CHANGED - likely true restart");
+                        remote_key_changed = true;
+                    }
+                    // Register/update the key
+                    m_sm->m_noise_key_store->register_peer_key(peer_id, incoming_pk);
+                    LOG_DEBUG("MH: Registered public key for peer " + peer_id);
+                }
+                
                 bool cleared_ready_noise = false;
-                if (peer_was_connected && m_sm->m_secure_session_manager) {
+                // Only clear READY session if: peer was connected AND key changed (true restart)
+                if (peer_was_connected && remote_key_changed && m_sm->m_secure_session_manager) {
                     std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
                     auto existing = m_sm->m_secure_session_manager->get_session(peer_id);
                     if (existing && existing->is_ready()) {
@@ -325,50 +352,16 @@ namespace detail {
                     }
                 }
                 if (cleared_ready_noise) {
-                    LOG_INFO("MH: Cleared READY Noise session for peer " + peer_id + " upon CONTROL_CONNECT" +
-                             std::string(peer_was_connected ? " (peer_was_connected=true)" : ""));
-                    m_sm->clearQueuedMessages(peer_id);
-                    if (m_sm->m_message_batcher) {
-                        (void)m_sm->m_message_batcher->flush_peer(peer_id);
-                    }
-                } else if (peer_was_connected) {
-                    // Even if we didn't clear a READY session, drop queued/batched messages that might be stale.
+                    LOG_INFO("MH: Cleared READY Noise session for peer " + peer_id + 
+                             " upon CONTROL_CONNECT (peer_was_connected=true, key_changed=true)");
                     m_sm->clearQueuedMessages(peer_id);
                     if (m_sm->m_message_batcher) {
                         (void)m_sm->m_message_batcher->flush_peer(peer_id);
                     }
                 }
 #else
-                if (peer_was_connected) {
-                    m_sm->clearQueuedMessages(peer_id);
-                    if (m_sm->m_message_batcher) {
-                        (void)m_sm->m_message_batcher->flush_peer(peer_id);
-                    }
-                }
-#endif
-                
-                std::string remote_pk_hex;
-                size_t delimiter = payload.find('|');
-                if (delimiter != std::string::npos) {
-                    // remote_peer_id = payload.substr(0, delimiter); // We use the authenticated peer_id
-                    remote_pk_hex = payload.substr(delimiter + 1);
-                }
-
-#if HAVE_NOISE_PROTOCOL
-                if (m_sm->m_use_noise_protocol && !remote_pk_hex.empty() && m_sm->m_noise_key_store) {
-                    std::vector<uint8_t> pk;
-                    for (size_t i = 0; i < remote_pk_hex.length(); i += 2) {
-                        if (i + 1 < remote_pk_hex.length()) {
-                            std::string byteString = remote_pk_hex.substr(i, 2);
-                            uint8_t byte = (uint8_t)strtol(byteString.c_str(), nullptr, 16);
-                            pk.push_back(byte);
-                        }
-                    }
-                    if (pk.size() == 32) {
-                        m_sm->m_noise_key_store->register_peer_key(peer_id, pk);
-                        LOG_INFO("MH: Registered public key for peer " + peer_id);
-                    }
-                }
+                (void)peer_was_connected;
+                (void)remote_key_changed;
 #endif
 
                 std::string ack_payload = m_sm->m_localPeerId;
