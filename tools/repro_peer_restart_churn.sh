@@ -46,6 +46,7 @@ SLEEP_BETWEEN_SEC="${SLEEP_BETWEEN_SEC:-0.2}"
 VERBOSE="${VERBOSE:-0}"
 PROGRESS_EVERY="${PROGRESS_EVERY:-25}"
 DISCOVERY_RETRIES="${DISCOVERY_RETRIES:-2}"
+SEND_RETRIES="${SEND_RETRIES:-5}"
 
 A_FIFO="$RUN_DIR/peer_a.in"
 B_FIFO="$RUN_DIR/peer_b.in"
@@ -222,15 +223,33 @@ assert_connected_and_messaging() {
   a0="$(line_count "$A_LOG")"
   b0="$(line_count "$B_LOG")"
 
-  send_a "send $PEER_B_ID $msg_a"
-  send_b "send $PEER_A_ID $msg_b"
+  # UDP can drop packets under iptables/tc loss. Retry a few times before declaring failure.
+  local attempt ok_a ok_b
+  ok_a=0
+  ok_b=0
+  for ((attempt=1; attempt<=SEND_RETRIES; attempt++)); do
+    send_a "send $PEER_B_ID $msg_a"
+    if wait_for_pattern_since_line "$B_LOG" "$b0" "$msg_a" "$MSG_TIMEOUT_SEC"; then
+      ok_a=1
+      break
+    fi
+    log_summary "WARN cycle=$cycle reason=B_missing_msg_a attempt=$attempt/$SEND_RETRIES"
+  done
 
-  # Receipt will show up in the opposite peer's log (plain mode prints messages to stdout).
-  if ! wait_for_pattern_since_line "$B_LOG" "$b0" "$msg_a" "$MSG_TIMEOUT_SEC"; then
+  for ((attempt=1; attempt<=SEND_RETRIES; attempt++)); do
+    send_b "send $PEER_A_ID $msg_b"
+    if wait_for_pattern_since_line "$A_LOG" "$a0" "$msg_b" "$MSG_TIMEOUT_SEC"; then
+      ok_b=1
+      break
+    fi
+    log_summary "WARN cycle=$cycle reason=A_missing_msg_b attempt=$attempt/$SEND_RETRIES"
+  done
+
+  if [[ "$ok_a" != "1" ]]; then
     log_summary "FAIL cycle=$cycle reason=B_missing_msg_a"
     return 1
   fi
-  if ! wait_for_pattern_since_line "$A_LOG" "$a0" "$msg_b" "$MSG_TIMEOUT_SEC"; then
+  if [[ "$ok_b" != "1" ]]; then
     log_summary "FAIL cycle=$cycle reason=A_missing_msg_b"
     return 1
   fi
@@ -343,7 +362,8 @@ for ((i=1; i<=CYCLES; i++)); do
 
   if ! assert_connected_and_messaging "$i"; then
     log_summary "STOPPING early at cycle=$i (see logs)"
-    break
+    echo "FAIL (run: $RUN_DIR). See $SUMMARY" >&2
+    exit 2
   fi
 
   # Randomly choose a churn pattern.
@@ -362,3 +382,9 @@ done
 
 log_summary "DONE. Logs in: $RUN_DIR"
 echo "DONE. Logs in: $RUN_DIR"
+
+# If we somehow completed without early-exiting, still fail the process if summary includes FAIL.
+if grep -q "^FAIL " "$SUMMARY"; then
+  echo "FAIL (run: $RUN_DIR). See $SUMMARY" >&2
+  exit 2
+fi
