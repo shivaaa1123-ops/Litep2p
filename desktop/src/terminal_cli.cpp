@@ -381,11 +381,15 @@ void TerminalCLI::calculate_layout() {
     // from the peers/messages height; do not change the LOGS height.
     logs_panel_height = base_logs_h;
 
+    // Allow the command output panel to grow on taller terminals.
+    // Keep a reasonable cap so peers/messages still have room.
+    const int max_cmd_output = std::max(12, remaining / 2);
+
     // Try to grow OUTPUT as much as possible (up to 12) while keeping peers/messages >= 4.
     // This makes the growth obvious even on medium terminals.
     cmd_output_height = remaining - logs_panel_height - 4;
     cmd_output_height = std::max(4, cmd_output_height);
-    cmd_output_height = std::min(12, cmd_output_height);
+    cmd_output_height = std::min(max_cmd_output, cmd_output_height);
     cmd_output_height = std::max(min_cmd, cmd_output_height);
 
     // Ensure peers/messages panel remains usable.
@@ -393,7 +397,7 @@ void TerminalCLI::calculate_layout() {
     if (peers_panel_height < 4) {
         // First, shrink OUTPUT down (but keep at least 3).
         cmd_output_height = std::max(min_cmd, remaining - logs_panel_height - 4);
-        cmd_output_height = std::min(12, cmd_output_height);
+        cmd_output_height = std::min(max_cmd_output, cmd_output_height);
         peers_panel_height = remaining - logs_panel_height - cmd_output_height;
     }
     peers_panel_height = std::max(4, peers_panel_height);
@@ -893,7 +897,8 @@ void TerminalCLI::add_cmd_output(const std::string& msg) {
     }
     std::lock_guard<std::mutex> lock(display_mutex);
     cmd_output_buffer.push_front(msg);
-    while (cmd_output_buffer.size() > 20) cmd_output_buffer.pop_back();
+    // Keep enough history so a taller output panel can show more than a handful of lines.
+    while (cmd_output_buffer.size() > 200) cmd_output_buffer.pop_back();
 
     if (tui_ready_) {
         draw_cmd_output_panel();
