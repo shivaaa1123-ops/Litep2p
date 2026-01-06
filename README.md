@@ -80,6 +80,18 @@ LiteP2P is ideal for:
 
 ## 📦 Installation
 
+### libsodium (required for Noise / encryption)
+
+This repo expects a prebuilt **static** libsodium per ABI at:
+
+- `app/src/main/cpp/libsodium/<abi>/lib/libsodium.a`
+
+If you see a Ninja error saying `libsodium.a` is missing, generate it with:
+
+```bash
+tools/build_libsodium_android.sh
+```
+
 ### 1. Add to your Android project  
 Place the LiteP2P source inside `app/src/main/cpp/litep2p/`.
 

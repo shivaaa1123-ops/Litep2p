@@ -100,7 +100,6 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/jni/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/arm64-v8a/include
 )
 
 # CoreP2P library
@@ -113,11 +112,19 @@ file(GLOB_RECURSE COREP2P_SOURCES
     "modules/corep2p/security/src/*.cpp"
 )
 
+# If Noise is disabled, don't compile the libsodium-dependent sources.
+if(NOT LITEP2P_ENABLE_NOISE_PROTOCOL)
+    list(FILTER COREP2P_SOURCES EXCLUDE REGEX ".*/noise_.*\\.(c|cpp)$")
+endif()
+
 add_library(litep2p_corep2p STATIC ${COREP2P_SOURCES})
 target_link_libraries(litep2p_corep2p PUBLIC)
 
 # Add missing static libraries for modules
 file(GLOB_RECURSE CRYPTO_SOURCES "modules/corep2p/crypto/src/*.cpp" "modules/corep2p/crypto/src/*.c")
+if(NOT LITEP2P_ENABLE_NOISE_PROTOCOL)
+    list(FILTER CRYPTO_SOURCES EXCLUDE REGEX ".*/noise_.*\\.(c|cpp)$")
+endif()
 add_library(litep2p_crypto STATIC ${CRYPTO_SOURCES})
 target_link_libraries(litep2p_crypto PUBLIC)
 
@@ -199,30 +206,51 @@ if(LITEP2P_ENABLE_FILE_TRANSFER)
     target_link_libraries(litep2p_file_transfer litep2p_corep2p)
 endif()
 
-# Add prebuilt libsodium for current ABI
-add_library(sodium STATIC IMPORTED)
-if(ANDROID_ABI STREQUAL "arm64-v8a")
-    set_target_properties(sodium PROPERTIES IMPORTED_LOCATION
-        ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/arm64-v8a/lib/libsodium.a)
-    target_include_directories(sodium INTERFACE
-        ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/arm64-v8a/include)
-elseif(ANDROID_ABI STREQUAL "armeabi-v7a")
-    set_target_properties(sodium PROPERTIES IMPORTED_LOCATION
-        ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/armeabi-v7a/lib/libsodium.a)
-    target_include_directories(sodium INTERFACE
-        ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/armeabi-v7a/include)
-elseif(ANDROID_ABI STREQUAL "x86")
-    set_target_properties(sodium PROPERTIES IMPORTED_LOCATION
-        ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/x86/lib/libsodium.a)
-    target_include_directories(sodium INTERFACE
-        ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/x86/include)
-elseif(ANDROID_ABI STREQUAL "x86_64")
-    set_target_properties(sodium PROPERTIES IMPORTED_LOCATION
-        ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/x86_64/lib/libsodium.a)
-    target_include_directories(sodium INTERFACE
-        ${CMAKE_CURRENT_SOURCE_DIR}/libsodium/x86_64/include)
-else()
-    message(FATAL_ERROR "Unsupported ABI: ${ANDROID_ABI}")
+# Add prebuilt libsodium for current ABI (required when Noise is enabled).
+set(LIBSODIUM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/libsodium")
+set(LIBSODIUM_LIB "")
+set(LIBSODIUM_INCLUDE "")
+
+if(LITEP2P_ENABLE_NOISE_PROTOCOL)
+    if(NOT DEFINED ANDROID_ABI OR "${ANDROID_ABI}" STREQUAL "")
+        message(FATAL_ERROR "ANDROID_ABI is not set. This CMake project is intended to be built via Android Gradle/NDK.")
+    endif()
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        set(LIBSODIUM_LIB "${LIBSODIUM_ROOT}/arm64-v8a/lib/libsodium.a")
+        set(LIBSODIUM_INCLUDE "${LIBSODIUM_ROOT}/arm64-v8a/include")
+    elseif(ANDROID_ABI STREQUAL "armeabi-v7a")
+        set(LIBSODIUM_LIB "${LIBSODIUM_ROOT}/armeabi-v7a/lib/libsodium.a")
+        set(LIBSODIUM_INCLUDE "${LIBSODIUM_ROOT}/armeabi-v7a/include")
+    elseif(ANDROID_ABI STREQUAL "x86")
+        set(LIBSODIUM_LIB "${LIBSODIUM_ROOT}/x86/lib/libsodium.a")
+        set(LIBSODIUM_INCLUDE "${LIBSODIUM_ROOT}/x86/include")
+    elseif(ANDROID_ABI STREQUAL "x86_64")
+        set(LIBSODIUM_LIB "${LIBSODIUM_ROOT}/x86_64/lib/libsodium.a")
+        set(LIBSODIUM_INCLUDE "${LIBSODIUM_ROOT}/x86_64/include")
+    else()
+        message(FATAL_ERROR "Unsupported ABI: ${ANDROID_ABI}")
+    endif()
+
+    if(NOT EXISTS "${LIBSODIUM_LIB}")
+        message(FATAL_ERROR
+            "libsodium is required for Noise (LITEP2P_ENABLE_NOISE_PROTOCOL=ON), but the static library is missing.\n"
+            "Expected: ${LIBSODIUM_LIB}\n"
+            "Fix: build or place libsodium.a for each ABI under app/src/main/cpp/libsodium/<abi>/lib/.\n"
+            "Hint: run tools/build_libsodium_android.sh to generate the missing libsodium.a files.")
+    endif()
+    if(NOT EXISTS "${LIBSODIUM_INCLUDE}/sodium.h")
+        message(FATAL_ERROR
+            "libsodium headers are missing for ABI ${ANDROID_ABI}.\n"
+            "Expected: ${LIBSODIUM_INCLUDE}/sodium.h")
+    endif()
+
+    add_library(sodium STATIC IMPORTED)
+    set_target_properties(sodium PROPERTIES IMPORTED_LOCATION "${LIBSODIUM_LIB}")
+    target_include_directories(sodium INTERFACE "${LIBSODIUM_INCLUDE}")
+
+    # Ensure targets that compile Noise sources see libsodium headers.
+    target_link_libraries(litep2p_corep2p PUBLIC sodium)
+    target_link_libraries(litep2p_crypto PUBLIC sodium)
 endif()
 
 # Main shared library
@@ -238,7 +266,7 @@ target_link_libraries(litep2p
     litep2p_reactor
     litep2p_transport
     litep2p_session
-    sodium
+    $<$<BOOL:${LITEP2P_ENABLE_NOISE_PROTOCOL}>:sodium>
     log
     dl
 )
