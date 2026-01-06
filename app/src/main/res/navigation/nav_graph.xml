@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<navigation xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    app:startDestination="@id/homeFragment">
+
+    <fragment
+        android:id="@+id/homeFragment"
+        android:name="com.zeengal.litep2p.ui.home.HomeFragment"
+        android:label="Home" />
+
+    <fragment
+        android:id="@+id/peersFragment"
+        android:name="com.zeengal.litep2p.ui.peers.PeersFragment"
+        android:label="Peers" />
+
+</navigation>

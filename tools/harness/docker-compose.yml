@@ -1,0 +1,45 @@
+version: "3.8"
+
+# Integration harness skeleton for WAN/LAN reliability testing.
+#
+# Intended usage (outside Cursor sandbox):
+# - docker compose up --build
+# - apply netem shaping to the `wan` network using tc inside the `netem` container
+# - run scripted scenarios from tools/harness/scenarios/
+#
+# NOTE: This file is a starting point; it’s designed to be extended as we add more scenarios.
+
+services:
+  signaling:
+    build:
+      context: ../signaling_server
+      dockerfile: Dockerfile
+    container_name: litep2p_signaling
+    environment:
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8765:8765/tcp"
+
+  # Placeholder TURN/STUN container. We’ll swap this to coturn when you provision the VPS
+  # (or we can add a proper coturn container once we decide on credentials + TLS).
+  turn:
+    image: coturn/coturn:latest
+    container_name: litep2p_turn
+    command: ["-n", "--log-file=stdout", "--lt-cred-mech", "--fingerprint"]
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+
+  # Network emulator / traffic shaper container (used to run tc netem commands).
+  netem:
+    image: alpine:3.19
+    container_name: litep2p_netem
+    cap_add:
+      - NET_ADMIN
+    command: ["sh", "-c", "sleep 999999"]
+
+networks:
+  default:
+    name: litep2p_harness
+
+

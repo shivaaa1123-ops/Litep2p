@@ -1,0 +1,39 @@
+#pragma once
+
+#include "session_events.h"
+#include "session_dependencies.h"
+#include <memory>
+#include <vector>
+#include <string>
+#include <functional>
+#include <future>
+#include "peer.h"
+
+class SessionManager;
+
+namespace detail {
+    class MessageHandler;
+    class PeerLifecycleManager;
+    class MaintenanceManager;
+}
+
+class SessionManager {
+public:
+    SessionManager(std::shared_ptr<ISessionDependenciesFactory> factory = nullptr);
+    ~SessionManager();
+
+    void start(int port, std::function<void(const std::vector<Peer>&)> cb, const std::string& comms_mode, const std::string& peer_id);
+    void stop();
+    std::future<void> stopAsync();
+    void connectToPeer(const std::string& peer_id);
+    void sendMessageToPeer(const std::string& peer_id, const std::string& message);
+    void setMessageReceivedCallback(std::function<void(const std::string&, const std::string&)> cb);
+    bool isPeerConnected(const std::string& peer_id) const;
+
+private:
+    class Impl;
+    friend class detail::MessageHandler;
+    friend class detail::PeerLifecycleManager;
+    friend class detail::MaintenanceManager;
+    std::unique_ptr<Impl> m_impl;
+};
