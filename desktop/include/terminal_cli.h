@@ -47,6 +47,7 @@ struct PeerInfo {
     bool connected;
     std::string last_seen;
     std::string network_id; // ip:port
+    std::string transport;  // e.g. TCP/UDP/QUIC/RELAY
 };
 
 class TerminalCLI {
@@ -111,12 +112,15 @@ private:
     int messages_panel_width;
     int peers_panel_height;
     int cmd_output_height;
+    int sys_resources_width;
+    int engine_resources_width;
     int logs_panel_height;
     
     // Row positions
     int header_row;
     int peers_start_row;
     int cmd_output_start_row;
+    int resources_start_row;
     int logs_start_row;
     int prompt_row;
     
@@ -141,6 +145,8 @@ private:
     void draw_peers_panel();
     void draw_messages_panel();
     void draw_cmd_output_panel();
+    void draw_sys_resources_panel();
+    void draw_engine_resources_panel();
     void draw_logs_panel();
     void draw_prompt();
     void refresh_telemetry_buffer_locked();

@@ -22,13 +22,29 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <cstring>
+#include <vector>
+#include <sys/statvfs.h>
 #include <nlohmann/json.hpp>
 #include "telemetry.h"
+#include <sys/resource.h>
+
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/processor_info.h>
+#include <mach/mach_host.h>
+#include <sys/sysctl.h>
+#include <libproc.h>
+#else
+#include <sys/sysinfo.h>
+#include <fstream>
+#include <dirent.h>
+#endif
 
 struct ParsedPeerEntry {
     std::string peer_id;
     std::string network_id;
     std::string status;
+    std::string transport;
     bool connected = false;
 };
 
@@ -178,6 +194,17 @@ static ParsedPeerEntry parse_peer_entry(const std::string& line) {
         p.status = trim_copy(line.substr(lbr + 1, rbr - (lbr + 1)));
     }
 
+    // Optional transport suffix inside the status field.
+    // Expected format: "CONNECTED|UDP" / "DISCONNECTED|TCP" etc.
+    // We keep p.status as the connection state token and store the remainder in p.transport.
+    if (!p.status.empty()) {
+        const size_t bar = p.status.find('|');
+        if (bar != std::string::npos) {
+            p.transport = trim_copy(p.status.substr(bar + 1));
+            p.status = trim_copy(p.status.substr(0, bar));
+        }
+    }
+
     if (!p.status.empty()) {
         std::string up = p.status;
         std::transform(up.begin(), up.end(), up.begin(), ::toupper);
@@ -199,6 +226,334 @@ static std::string normalize_peer_prefix(std::string s) {
     s = trim_copy(s);
     while (!s.empty() && s.back() == '.') s.pop_back();
     return s;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SYSTEM RESOURCE MONITORING
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct SystemResources {
+    uint64_t total_ram_mb = 0;
+    uint64_t available_ram_mb = 0;
+    uint64_t used_ram_mb = 0;
+    int cpu_count = 0;
+    double cpu_usage_percent = 0.0; // system CPU utilization (0..100)
+    double load_1 = 0.0;
+    double load_5 = 0.0;
+    double load_15 = 0.0;
+    uint64_t uptime_sec = 0;
+    uint64_t total_disk_mb = 0;
+    uint64_t free_disk_mb = 0;
+    uint64_t total_swap_mb = 0;
+    uint64_t free_swap_mb = 0;
+};
+
+struct EngineResources {
+    int pid = 0;
+    uint64_t resident_memory_mb = 0;
+    uint64_t virtual_memory_mb = 0;
+    uint64_t peak_resident_memory_mb = 0;
+    double cpu_time_sec = 0.0;
+    double cpu_usage_percent = 0.0; // process CPU utilization (can exceed 100 on multi-core)
+    int thread_count = 0;
+    int open_fds = 0;
+    long voluntary_ctx_switches = 0;
+    long involuntary_ctx_switches = 0;
+};
+
+static std::string format_uptime(uint64_t sec) {
+    uint64_t days = sec / 86400;
+    sec %= 86400;
+    uint64_t hrs = sec / 3600;
+    sec %= 3600;
+    uint64_t mins = sec / 60;
+    sec %= 60;
+    std::ostringstream oss;
+    if (days > 0) oss << days << "d";
+    oss << hrs << "h" << mins << "m" << sec << "s";
+    return oss.str();
+}
+
+#ifndef __APPLE__
+static bool read_linux_cpu_times(uint64_t& idle_ticks, uint64_t& total_ticks) {
+    std::ifstream stat("/proc/stat");
+    if (!stat.is_open()) return false;
+    std::string cpu;
+    uint64_t user = 0, nice = 0, system = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
+    stat >> cpu >> user >> nice >> system >> idle >> iowait >> irq >> softirq >> steal;
+    if (cpu != "cpu") return false;
+    idle_ticks = idle + iowait;
+    total_ticks = user + nice + system + idle + iowait + irq + softirq + steal;
+    return total_ticks > 0;
+}
+#endif
+
+static SystemResources get_system_resources() {
+    SystemResources res;
+
+    // Disk info (root filesystem)
+    {
+        struct statvfs vfs;
+        if (statvfs("/", &vfs) == 0) {
+            uint64_t total = static_cast<uint64_t>(vfs.f_frsize) * static_cast<uint64_t>(vfs.f_blocks);
+            uint64_t freeb = static_cast<uint64_t>(vfs.f_frsize) * static_cast<uint64_t>(vfs.f_bavail);
+            res.total_disk_mb = total / (1024 * 1024);
+            res.free_disk_mb = freeb / (1024 * 1024);
+        }
+    }
+    
+#ifdef __APPLE__
+    // Get total RAM
+    int64_t mem_size;
+    size_t len = sizeof(mem_size);
+    if (sysctlbyname("hw.memsize", &mem_size, &len, nullptr, 0) == 0) {
+        res.total_ram_mb = static_cast<uint64_t>(mem_size) / (1024 * 1024);
+    }
+    
+    // Get available/used RAM via vm_statistics
+    vm_size_t page_size;
+    mach_port_t mach_port = mach_host_self();
+    host_page_size(mach_port, &page_size);
+    
+    vm_statistics64_data_t vm_stats;
+    mach_msg_type_number_t count = sizeof(vm_stats) / sizeof(natural_t);
+    if (host_statistics64(mach_port, HOST_VM_INFO64, (host_info64_t)&vm_stats, &count) == KERN_SUCCESS) {
+        uint64_t free_pages = vm_stats.free_count + vm_stats.inactive_count;
+        res.available_ram_mb = (free_pages * page_size) / (1024 * 1024);
+        res.used_ram_mb = res.total_ram_mb - res.available_ram_mb;
+    }
+    
+    // Get CPU count
+    int cpu_count;
+    len = sizeof(cpu_count);
+    if (sysctlbyname("hw.ncpu", &cpu_count, &len, nullptr, 0) == 0) {
+        res.cpu_count = cpu_count;
+    }
+
+    // Uptime
+    {
+        struct timeval boottime;
+        size_t blen = sizeof(boottime);
+        int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+        if (sysctl(mib, 2, &boottime, &blen, nullptr, 0) == 0) {
+            time_t now = time(nullptr);
+            if (now >= boottime.tv_sec) {
+                res.uptime_sec = static_cast<uint64_t>(now - boottime.tv_sec);
+            }
+        }
+    }
+
+    // Swap usage
+    {
+        struct xsw_usage swap;
+        size_t slen = sizeof(swap);
+        if (sysctlbyname("vm.swapusage", &swap, &slen, nullptr, 0) == 0) {
+            res.total_swap_mb = static_cast<uint64_t>(swap.xsu_total) / (1024 * 1024);
+            res.free_swap_mb = static_cast<uint64_t>(swap.xsu_avail) / (1024 * 1024);
+        }
+    }
+
+    // CPU usage (system-wide) via host_processor_info deltas
+    {
+        static uint64_t last_total = 0;
+        static uint64_t last_idle = 0;
+        natural_t cpu_count_n = 0;
+        processor_info_array_t cpu_info = nullptr;
+        mach_msg_type_number_t num_cpu_info = 0;
+        if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &cpu_count_n, &cpu_info, &num_cpu_info) == KERN_SUCCESS) {
+            uint64_t total = 0;
+            uint64_t idle = 0;
+            for (natural_t i = 0; i < cpu_count_n; i++) {
+                const size_t base = i * CPU_STATE_MAX;
+                const uint64_t user = cpu_info[base + CPU_STATE_USER];
+                const uint64_t sys = cpu_info[base + CPU_STATE_SYSTEM];
+                const uint64_t nice = cpu_info[base + CPU_STATE_NICE];
+                const uint64_t idl = cpu_info[base + CPU_STATE_IDLE];
+                total += (user + sys + nice + idl);
+                idle += idl;
+            }
+
+            if (last_total > 0 && total > last_total) {
+                const uint64_t d_total = total - last_total;
+                const uint64_t d_idle = idle - last_idle;
+                if (d_total > 0 && d_total >= d_idle) {
+                    res.cpu_usage_percent = (double)(d_total - d_idle) / (double)d_total * 100.0;
+                }
+            }
+            last_total = total;
+            last_idle = idle;
+
+            vm_deallocate(mach_task_self(), (vm_address_t)cpu_info, num_cpu_info * sizeof(integer_t));
+        }
+    }
+    
+    // Load average
+    double la[3] = {0.0, 0.0, 0.0};
+    if (getloadavg(la, 3) == 3) {
+        res.load_1 = la[0];
+        res.load_5 = la[1];
+        res.load_15 = la[2];
+    }
+#else
+    // Linux
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        res.total_ram_mb = (si.totalram * si.mem_unit) / (1024 * 1024);
+        res.available_ram_mb = (si.freeram * si.mem_unit) / (1024 * 1024);
+        res.used_ram_mb = res.total_ram_mb - res.available_ram_mb;
+        res.uptime_sec = static_cast<uint64_t>(si.uptime);
+        res.total_swap_mb = (si.totalswap * si.mem_unit) / (1024 * 1024);
+        res.free_swap_mb = (si.freeswap * si.mem_unit) / (1024 * 1024);
+    }
+    
+    res.cpu_count = sysconf(_SC_NPROCESSORS_ONLN);
+
+    // CPU usage (system-wide) from /proc/stat deltas
+    {
+        static uint64_t last_idle = 0;
+        static uint64_t last_total = 0;
+        uint64_t idle = 0, total = 0;
+        if (read_linux_cpu_times(idle, total)) {
+            if (last_total > 0 && total > last_total) {
+                const uint64_t d_total = total - last_total;
+                const uint64_t d_idle = idle - last_idle;
+                if (d_total > 0 && d_total >= d_idle) {
+                    res.cpu_usage_percent = (double)(d_total - d_idle) / (double)d_total * 100.0;
+                }
+            }
+            last_idle = idle;
+            last_total = total;
+        }
+    }
+
+    // Load average
+    double la[3] = {0.0, 0.0, 0.0};
+    if (getloadavg(la, 3) == 3) {
+        res.load_1 = la[0];
+        res.load_5 = la[1];
+        res.load_15 = la[2];
+    }
+#endif
+    
+    return res;
+}
+
+static EngineResources get_engine_resources() {
+    EngineResources res;
+
+    res.pid = (int)getpid();
+    
+#ifdef __APPLE__
+    // Get process memory info via Mach API
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS) {
+        res.resident_memory_mb = info.resident_size / (1024 * 1024);
+        res.virtual_memory_mb = info.virtual_size / (1024 * 1024);
+    }
+
+    // Thread count via Mach API
+    {
+        thread_act_array_t threads = nullptr;
+        mach_msg_type_number_t thread_count = 0;
+        if (task_threads(mach_task_self(), &threads, &thread_count) == KERN_SUCCESS) {
+            res.thread_count = static_cast<int>(thread_count);
+            if (threads && thread_count > 0) {
+                vm_deallocate(mach_task_self(), (vm_address_t)threads, thread_count * sizeof(thread_act_t));
+            }
+        }
+    }
+
+    // Open FD count via libproc
+    {
+        const pid_t pid = getpid();
+        const int bytes = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nullptr, 0);
+        if (bytes > 0) {
+            std::vector<char> buf((size_t)bytes);
+            const int got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buf.data(), bytes);
+            if (got > 0) {
+                res.open_fds = got / (int)sizeof(proc_fdinfo);
+            }
+        }
+    }
+#else
+    // Linux: read from /proc/self/status
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            uint64_t kb = 0;
+            sscanf(line.c_str(), "VmRSS: %lu kB", &kb);
+            res.resident_memory_mb = kb / 1024;
+        } else if (line.rfind("VmSize:", 0) == 0) {
+            uint64_t kb = 0;
+            sscanf(line.c_str(), "VmSize: %lu kB", &kb);
+            res.virtual_memory_mb = kb / 1024;
+        } else if (line.rfind("Threads:", 0) == 0) {
+            sscanf(line.c_str(), "Threads: %d", &res.thread_count);
+        }
+    }
+
+    // Open FD count via /proc/self/fd
+    {
+        int cnt = 0;
+        DIR* d = opendir("/proc/self/fd");
+        if (d) {
+            while (readdir(d) != nullptr) {
+                cnt++;
+            }
+            closedir(d);
+            // discount . and ..
+            res.open_fds = std::max(0, cnt - 2);
+        }
+    }
+#endif
+    
+    // Get CPU time via getrusage
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        res.cpu_time_sec = usage.ru_utime.tv_sec + usage.ru_stime.tv_sec +
+                          (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1000000.0;
+
+        res.voluntary_ctx_switches = usage.ru_nvcsw;
+        res.involuntary_ctx_switches = usage.ru_nivcsw;
+
+        // Peak RSS
+#ifdef __APPLE__
+        res.peak_resident_memory_mb = static_cast<uint64_t>(usage.ru_maxrss) / (1024 * 1024);
+#else
+        res.peak_resident_memory_mb = static_cast<uint64_t>(usage.ru_maxrss) / 1024;
+#endif
+    }
+
+    // Process CPU utilization (delta-based)
+    {
+        static double last_cpu_sec = 0.0;
+        static auto last_wall = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double wall_sec = std::chrono::duration_cast<std::chrono::duration<double>>(now - last_wall).count();
+        const double cpu_sec = res.cpu_time_sec;
+        if (last_cpu_sec > 0.0 && wall_sec > 0.05 && cpu_sec >= last_cpu_sec) {
+            res.cpu_usage_percent = (cpu_sec - last_cpu_sec) / wall_sec * 100.0;
+
+            int cpus = 1;
+#ifdef __APPLE__
+            int ncpu = 1;
+            size_t len = sizeof(ncpu);
+            if (sysctlbyname("hw.ncpu", &ncpu, &len, nullptr, 0) == 0 && ncpu > 0) cpus = ncpu;
+#else
+            long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            if (ncpu > 0) cpus = (int)ncpu;
+#endif
+            const double max_pct = (double)cpus * 100.0;
+            if (res.cpu_usage_percent < 0.0) res.cpu_usage_percent = 0.0;
+            if (res.cpu_usage_percent > max_pct) res.cpu_usage_percent = max_pct;
+        }
+        last_cpu_sec = cpu_sec;
+        last_wall = now;
+    }
+    
+    return res;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -377,19 +732,15 @@ void TerminalCLI::calculate_layout() {
     base_peers_h = std::min(base_peers_h, std::max(4, remaining - base_cmd_h - min_logs));
     int base_logs_h = std::max(min_logs, remaining - base_peers_h - base_cmd_h);
 
-    // User preference: make OUTPUT taller (>= 4 rows, up to 12) and take that space
-    // from the peers/messages height; do not change the LOGS height.
-    logs_panel_height = base_logs_h;
+    // User preference: make OUTPUT taller (>= 8 rows, up to 16) and take that space
+    // from the logs height (shrink logs by 4 rows).
+    logs_panel_height = std::max(min_logs, base_logs_h - 4);
 
-    // Allow the command output panel to grow on taller terminals.
-    // Keep a reasonable cap so peers/messages still have room.
-    const int max_cmd_output = std::max(12, remaining / 2);
-
-    // Try to grow OUTPUT as much as possible (up to 12) while keeping peers/messages >= 4.
+    // Try to grow OUTPUT as much as possible (up to 16) while keeping peers/messages >= 4.
     // This makes the growth obvious even on medium terminals.
     cmd_output_height = remaining - logs_panel_height - 4;
-    cmd_output_height = std::max(4, cmd_output_height);
-    cmd_output_height = std::min(max_cmd_output, cmd_output_height);
+    cmd_output_height = std::max(8, cmd_output_height);
+    cmd_output_height = std::min(16, cmd_output_height);
     cmd_output_height = std::max(min_cmd, cmd_output_height);
 
     // Ensure peers/messages panel remains usable.
@@ -397,12 +748,22 @@ void TerminalCLI::calculate_layout() {
     if (peers_panel_height < 4) {
         // First, shrink OUTPUT down (but keep at least 3).
         cmd_output_height = std::max(min_cmd, remaining - logs_panel_height - 4);
-        cmd_output_height = std::min(max_cmd_output, cmd_output_height);
+        cmd_output_height = std::min(16, cmd_output_height);
         peers_panel_height = remaining - logs_panel_height - cmd_output_height;
     }
     peers_panel_height = std::max(4, peers_panel_height);
     
+    // Split the output row into 3 panels horizontally:
+    // OUTPUT (left) | SYSTEM RESOURCES (middle) | ENGINE RESOURCES (right)
+    // Each gets roughly 1/3 of the width
+    int output_row_width = w - 2;  // subtract left and right borders
+    sys_resources_width = output_row_width / 3;
+    engine_resources_width = output_row_width / 3;
+    // cmd_output uses the panel width in draw function, no separate width needed
+    // since it shares the row with the resource panels
+    
     cmd_output_start_row = peers_start_row + peers_panel_height + 1;
+    resources_start_row = cmd_output_start_row;  // Same row as output
     logs_start_row = cmd_output_start_row + cmd_output_height + 1;
     prompt_row = logs_start_row + logs_panel_height + 1;
 }
@@ -613,6 +974,8 @@ void TerminalCLI::full_redraw() {
     refresh_telemetry_buffer_locked();
     draw_messages_panel();
     draw_cmd_output_panel();
+    draw_sys_resources_panel();
+    draw_engine_resources_panel();
     draw_logs_panel();
     draw_prompt();
     
@@ -732,19 +1095,22 @@ void TerminalCLI::draw_peers_panel() {
         if (i < (int)peer_list.size()) {
             auto& p = peer_list[i];
             std::string icon = p.connected ? (std::string(C_BGREEN) + "●") : (std::string(C_DIM) + "○");
-            std::string status = p.connected ? C_BGREEN "Conn" : C_DIM "Disc";
+            const std::string status_label = p.connected ? "Conn" : "Disc";
+            std::string status = p.connected ? (std::string(C_BGREEN) + status_label) : (std::string(C_DIM) + status_label);
 
             // Compose: " <icon> <id> (<ip:port>) [Conn]"
             // Keep status always visible; truncate the middle if needed.
             const std::string addr = p.network_id.empty() ? "?" : p.network_id;
-            const std::string status_suffix = " [" + status + C_RESET + "]";
+            const std::string proto = p.transport;
+            const std::string suffix_plain = " [" + status_label + (proto.empty() ? "" : (" " + proto)) + "]";
+            const std::string status_suffix = " [" + status + C_RESET + (proto.empty() ? "" : (" " + proto)) + "]";
 
             // Visible fixed pieces (approx, excluding ANSI inside status):
             // leading: " " + icon + " " => 3
             // addr wrapper: " (" + addr + ")" => 3 + len(addr)
-            // status wrapper: " [Conn]" => 7
+            // status wrapper: " [Conn]" or " [Conn UDP]" => suffix_plain.size()
             int inner = std::max(0, w - 1);
-            int reserved = 3 /*lead*/ + 3 /*space+parens*/ + (int)addr.size() + 7 /*status*/;
+            int reserved = 3 /*lead*/ + 3 /*space+parens*/ + (int)addr.size() + (int)suffix_plain.size();
             int max_id_len = std::max(6, inner - reserved);
 
             std::string display_id = p.id;
@@ -810,26 +1176,252 @@ void TerminalCLI::draw_messages_panel() {
 }
 
 void TerminalCLI::draw_cmd_output_panel() {
-    int w = term_width;
+    // Output panel takes the left 1/3 of the row
+    int panel_width = (term_width - 2) / 3;
     int h = cmd_output_height;
     int start = cmd_output_start_row;
     
     std::ostringstream oss;
     
-    oss << "\033[" << start << ";1H" << C_CYAN << BOX_LT << repeat_str(BOX_H, w - 2) << BOX_RT << C_RESET;
+    // Draw top border for OUTPUT section only (left portion)
+    oss << "\033[" << start << ";1H" << C_CYAN << BOX_LT << repeat_str(BOX_H, panel_width - 1) << BOX_TT << C_RESET;
     
     std::string title = " OUTPUT ";
     oss << "\033[" << start << ";3H" << C_GREEN << C_BOLD << title << C_RESET;
     
     for (int i = 0; i < h; i++) {
         int row = start + 1 + i;
-        oss << "\033[" << row << ";1H" << ESC_CLEAR_LINE << C_CYAN << BOX_V << C_RESET;
+        oss << "\033[" << row << ";1H" << C_CYAN << BOX_V << C_RESET;
         
+        // Clear the panel area
+        for (int j = 0; j < panel_width - 2; j++) oss << " ";
+        
+        // Draw content
+        oss << "\033[" << row << ";2H";
         if (i < (int)cmd_output_buffer.size()) {
-            oss << " " << truncate_str(cmd_output_buffer[i], w - 4);
+            oss << " " << truncate_str(cmd_output_buffer[i], panel_width - 4);
         }
         
-        oss << "\033[" << row << ";" << w << "H" << C_CYAN << BOX_V << C_RESET;
+        // Right border of this panel (also serves as separator)
+        oss << "\033[" << row << ";" << panel_width << "H" << C_CYAN << BOX_V << C_RESET;
+    }
+    
+    write_tty(oss.str());
+}
+
+void TerminalCLI::draw_sys_resources_panel() {
+    // System resources panel takes the middle 1/3 of the row
+    int panel_width = (term_width - 2) / 3;
+    int start_col = panel_width + 1;
+    int h = cmd_output_height;
+    int start = cmd_output_start_row;
+    
+    SystemResources sys = get_system_resources();
+    
+    std::ostringstream oss;
+    
+    // Draw top border for SYSTEM section
+    oss << "\033[" << start << ";" << start_col << "H" << C_CYAN << repeat_str(BOX_H, panel_width - 1) << BOX_TT << C_RESET;
+    
+    std::string title = " RESOURCE AVAILABLE ";
+    oss << "\033[" << start << ";" << (start_col + 2) << "H" << C_MAGENTA << C_BOLD << title << C_RESET;
+    
+    // Build resource lines
+    std::vector<std::string> lines;
+    {
+        std::ostringstream line;
+        line << C_DIM << "CPU: " << C_RESET << sys.cpu_count << " cores";
+        if (sys.cpu_usage_percent > 0.0) {
+            line << ", " << std::fixed << std::setprecision(1) << sys.cpu_usage_percent << "% used";
+        }
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        line << C_DIM << "Load: " << C_RESET
+             << std::fixed << std::setprecision(2) << sys.load_1
+             << " " << sys.load_5
+             << " " << sys.load_15;
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        line << C_DIM << "RAM: " << C_RESET << sys.used_ram_mb << "/" << sys.total_ram_mb << " MB";
+        if (sys.total_ram_mb > 0) {
+            const double pct = (double)sys.used_ram_mb / (double)sys.total_ram_mb * 100.0;
+            line << " (" << std::fixed << std::setprecision(1) << pct << "%)";
+        }
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        line << C_DIM << "RAM Free: " << C_RESET << sys.available_ram_mb << " MB";
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        if (sys.total_swap_mb > 0) {
+            const uint64_t used_swap = (sys.total_swap_mb > sys.free_swap_mb) ? (sys.total_swap_mb - sys.free_swap_mb) : 0;
+            line << C_DIM << "Swap: " << C_RESET << used_swap << "/" << sys.total_swap_mb << " MB";
+        } else {
+            line << C_DIM << "Swap: " << C_RESET << "n/a";
+        }
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        if (sys.total_disk_mb > 0) {
+            line << C_DIM << "Disk(/): " << C_RESET << sys.free_disk_mb << "/" << sys.total_disk_mb << " MB free";
+        } else {
+            line << C_DIM << "Disk(/): " << C_RESET << "n/a";
+        }
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        if (sys.uptime_sec > 0) {
+            line << C_DIM << "Uptime: " << C_RESET << format_uptime(sys.uptime_sec);
+            lines.push_back(line.str());
+        }
+    }
+    {
+        // RAM usage bar
+        int bar_width = panel_width - 10;
+        if (bar_width > 5 && sys.total_ram_mb > 0) {
+            double ratio = (double)sys.used_ram_mb / sys.total_ram_mb;
+            int filled = static_cast<int>(ratio * bar_width);
+            std::ostringstream line;
+            line << C_DIM << "Usage: " << C_RESET << "[";
+            for (int i = 0; i < bar_width; i++) {
+                if (i < filled) line << (ratio > 0.8 ? C_RED : C_GREEN) << "█";
+                else line << C_DIM << "░";
+            }
+            line << C_RESET << "]";
+            lines.push_back(line.str());
+        }
+    }
+    
+    for (int i = 0; i < h; i++) {
+        int row = start + 1 + i;
+        oss << "\033[" << row << ";" << start_col << "H";
+        
+        // Clear panel area
+        for (int j = 0; j < panel_width - 1; j++) oss << " ";
+        
+        // Draw content
+        oss << "\033[" << row << ";" << (start_col + 1) << "H";
+        if (i < (int)lines.size()) {
+            oss << truncate_str(lines[i], panel_width - 4);
+        }
+        
+        // Right border
+        oss << "\033[" << row << ";" << (start_col + panel_width - 1) << "H" << C_CYAN << BOX_V << C_RESET;
+    }
+    
+    write_tty(oss.str());
+}
+
+void TerminalCLI::draw_engine_resources_panel() {
+    // Engine resources panel takes the right 1/3 of the row
+    int panel_width = (term_width - 2) / 3;
+    int start_col = panel_width * 2 + 1;
+    int remaining_width = term_width - start_col;
+    int h = cmd_output_height;
+    int start = cmd_output_start_row;
+    
+    EngineResources eng = get_engine_resources();
+    
+    std::ostringstream oss;
+    
+    // Draw top border for ENGINE section
+    oss << "\033[" << start << ";" << start_col << "H" << C_CYAN << repeat_str(BOX_H, remaining_width - 1) << BOX_RT << C_RESET;
+    
+    std::string title = " RESOURCE UTILIZATION ";
+    oss << "\033[" << start << ";" << (start_col + 2) << "H" << C_BCYAN << C_BOLD << title << C_RESET;
+    
+    // Build resource lines
+    std::vector<std::string> lines;
+    {
+        std::ostringstream line;
+        line << C_DIM << "PID: " << C_RESET << eng.pid;
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        line << C_DIM << "Resident Mem: " << C_RESET << eng.resident_memory_mb << " MB";
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        line << C_DIM << "Virtual Mem:  " << C_RESET << eng.virtual_memory_mb << " MB";
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        line << C_DIM << "CPU: " << C_RESET;
+        if (eng.cpu_usage_percent > 0.0) {
+            line << std::fixed << std::setprecision(1) << eng.cpu_usage_percent << "%";
+            line << " (" << std::fixed << std::setprecision(2) << (eng.cpu_usage_percent / 100.0) << " cores)";
+        } else {
+            line << "n/a";
+        }
+        line << C_DIM << "  time=" << C_RESET << std::fixed << std::setprecision(2) << eng.cpu_time_sec << "s";
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        line << C_DIM << "Threads: " << C_RESET;
+        if (eng.thread_count > 0) line << eng.thread_count;
+        else line << "n/a";
+        line << C_DIM << "  FDs: " << C_RESET;
+        if (eng.open_fds > 0) line << eng.open_fds;
+        else line << "n/a";
+        lines.push_back(line.str());
+    }
+    {
+        std::ostringstream line;
+        if (eng.peak_resident_memory_mb > 0) {
+            line << C_DIM << "Peak RSS: " << C_RESET << eng.peak_resident_memory_mb << " MB";
+            lines.push_back(line.str());
+        }
+    }
+    {
+        std::ostringstream line;
+        if (eng.voluntary_ctx_switches > 0 || eng.involuntary_ctx_switches > 0) {
+            line << C_DIM << "CtxSw: " << C_RESET << eng.voluntary_ctx_switches
+                 << C_DIM << " vol, " << C_RESET << eng.involuntary_ctx_switches
+                 << C_DIM << " invol" << C_RESET;
+            lines.push_back(line.str());
+        }
+    }
+    {
+        // Memory indicator
+        std::ostringstream line;
+        if (eng.resident_memory_mb < 100) {
+            line << C_GREEN << "● " << C_RESET << "Memory: Low";
+        } else if (eng.resident_memory_mb < 500) {
+            line << C_YELLOW << "● " << C_RESET << "Memory: Moderate";
+        } else {
+            line << C_RED << "● " << C_RESET << "Memory: High";
+        }
+        lines.push_back(line.str());
+    }
+    
+    for (int i = 0; i < h; i++) {
+        int row = start + 1 + i;
+        oss << "\033[" << row << ";" << start_col << "H";
+        
+        // Clear panel area
+        for (int j = 0; j < remaining_width - 1; j++) oss << " ";
+        
+        // Draw content
+        oss << "\033[" << row << ";" << (start_col + 1) << "H";
+        if (i < (int)lines.size()) {
+            oss << truncate_str(lines[i], remaining_width - 4);
+        }
+        
+        // Right border
+        oss << "\033[" << row << ";" << term_width << "H" << C_CYAN << BOX_V << C_RESET;
     }
     
     write_tty(oss.str());
@@ -897,8 +1489,7 @@ void TerminalCLI::add_cmd_output(const std::string& msg) {
     }
     std::lock_guard<std::mutex> lock(display_mutex);
     cmd_output_buffer.push_front(msg);
-    // Keep enough history so a taller output panel can show more than a handful of lines.
-    while (cmd_output_buffer.size() > 200) cmd_output_buffer.pop_back();
+    while (cmd_output_buffer.size() > 20) cmd_output_buffer.pop_back();
 
     if (tui_ready_) {
         draw_cmd_output_panel();
@@ -938,6 +1529,7 @@ void TerminalCLI::update_peer_list() {
         info.connected = parsed.connected || (connected_peers.count(parsed.peer_id) > 0);
         info.last_seen = get_short_time();
         info.network_id = parsed.network_id;
+        info.transport = parsed.transport;
         peer_list.push_back(info);
     }
 }
@@ -1320,6 +1912,9 @@ void TerminalCLI::cmd_list_peers() {
         std::string line = p.id;
         line += "  [";
         line += (p.connected ? std::string("CONNECTED") : std::string("DISCONNECTED"));
+        if (!p.transport.empty()) {
+            line += "|" + p.transport;
+        }
         line += "]";
         add_cmd_output(line);
     }

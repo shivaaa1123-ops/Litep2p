@@ -1,6 +1,7 @@
 #include "p2p_node.h"
 #include "logger.h"
 #include "session_manager.h"
+#include "peer_reconnect_policy.h"
 #include <sstream>
 #include <iomanip>
 
@@ -39,7 +40,25 @@ bool P2PNode::start(int port, const std::string& peer_id, const std::string& com
 
         for (const auto& peer : peers) {
             std::string status = peer.connected ? "CONNECTED" : "DISCONNECTED";
-            formatted.push_back(peer.id + " (" + peer.network_id + ") [" + status + "]");
+
+            // Best-effort per-peer transport/protocol label.
+            // Stored as a stable suffix inside the status brackets for parsing by the UI.
+            // Format: [CONNECTED|UDP] / [DISCONNECTED] etc.
+            std::string transport;
+            if (peer.connected) {
+                const PeerConnectionStats stats = PeerReconnectPolicy::getInstance().get_peer_stats(peer.id);
+                if (stats.successful_connections > 0 && !stats.last_used_method.empty()) {
+                    transport = stats.last_used_method;
+                } else {
+                    transport = "UNK";
+                }
+            }
+
+            if (!transport.empty()) {
+                formatted.push_back(peer.id + " (" + peer.network_id + ") [" + status + "|" + transport + "]");
+            } else {
+                formatted.push_back(peer.id + " (" + peer.network_id + ") [" + status + "]");
+            }
             current_state[peer.id] = peer.connected;
         }
 
