@@ -16,4 +16,13 @@ object PeerIdManager {
         }
         return peerId
     }
+
+    fun setPeerId(context: Context, peerId: String) {
+        val trimmed = peerId.trim()
+        if (trimmed.isEmpty()) {
+            return
+        }
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putString(PEER_ID_KEY, trimmed).apply()
+    }
 }

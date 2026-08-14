@@ -1,10 +1,54 @@
 #include "message_handler.h"
 #include "session_manager_p.h"
+#include "device_utils.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "message_types.h"
 #include "config_manager.h"
 #include "telemetry.h"
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <sstream>
+
+#if defined(__ANDROID__)
+#include "../../jni/include/jni_bridge.h"
+#endif
+
+namespace {
+    int64_t now_epoch_ms() {
+        using namespace std::chrono;
+        return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+    }
+}
+
+namespace {
+    std::vector<std::string> splitPipeFields(const std::string& s) {
+        std::vector<std::string> out;
+        std::stringstream ss(s);
+        std::string item;
+        while (std::getline(ss, item, '|')) {
+            out.push_back(item);
+        }
+        return out;
+    }
+
+    uint64_t parseBootId(const std::string& s) {
+        if (s.empty()) return 0;
+        try {
+            // Support decimal and 0x-prefixed hex.
+            size_t idx = 0;
+            int base = 10;
+            if (s.size() > 2 && (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0)) {
+                base = 16;
+            }
+            const uint64_t v = std::stoull(s, &idx, base);
+            if (idx != s.size()) return 0;
+            return v;
+        } catch (...) {
+            return 0;
+        }
+    }
+}
 
 namespace {
     struct NetworkEndpoint {
@@ -13,6 +57,18 @@ namespace {
     };
 
     bool isPrivateIpv4(const std::string& ip) {
+        // IPv6: link-local (fe80::/10), unique-local (fc00::/7) and loopback
+        // are private; global addresses are public.
+        if (is_ipv6_literal(ip)) {
+            struct in6_addr a;
+            if (inet_pton(AF_INET6, ip.c_str(), &a) != 1) return true; // malformed
+            if (IN6_IS_ADDR_LOOPBACK(&a)) return true;
+            if ((a.s6_addr[0] == 0xFE) && ((a.s6_addr[1] & 0xC0) == 0x80)) return true; // fe80::/10
+            if ((a.s6_addr[0] & 0xFE) == 0xFC) return true; // fc00::/7
+            return false; // global IPv6
+        }
+
+        // IPv4: RFC1918 + loopback + link-local.
         if (ip.rfind("10.", 0) == 0) return true;
         if (ip.rfind("127.", 0) == 0) return true;
         if (ip.rfind("192.168.", 0) == 0) return true;
@@ -35,27 +91,15 @@ namespace {
     }
 
     NetworkEndpoint parseNetworkId(const std::string& network_id) {
+        // Delegate to the shared IPv6-aware parser ("a.b.c.d:port" / "[v6]:port").
         NetworkEndpoint endpoint;
-        if (network_id.empty()) {
+        std::string host;
+        uint16_t port = 0;
+        if (!parse_network_id(network_id, host, port)) {
             return endpoint;
         }
-        const auto separator = network_id.find_last_of(':');
-        if (separator == std::string::npos) {
-            endpoint.ip = network_id;
-            return endpoint;
-        }
-        endpoint.ip = network_id.substr(0, separator);
-        const std::string port_str = network_id.substr(separator + 1);
-        if (port_str.empty()) {
-            return endpoint;
-        }
-        try {
-            const int parsed = std::stoi(port_str);
-            if (parsed >= 0 && parsed <= 65535) {
-                endpoint.port = parsed;
-            }
-        } catch (...) {
-        }
+        endpoint.ip = host;
+        endpoint.port = static_cast<int>(port);
         return endpoint;
     }
 }
@@ -80,9 +124,10 @@ namespace detail {
 
         // SCOPE: Brief lock to find peer and get state
         {
-            std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+            // Lock order enforced: peers -> network index
+            SessionManager::Impl::PeersThenNetworkIndexLock guard(*m_sm);
 
-            peer_ptr = m_sm->find_peer_by_network_id(event.network_id);
+            peer_ptr = m_sm->find_peer_by_network_id_locked_(event.network_id);
             
             // If not found by full network_id, try to match by IP address only
             // This handles incoming connections which use ephemeral ports
@@ -115,7 +160,7 @@ namespace detail {
             } else {
                 peer_id = peer_ptr->id;
             }
-        } // Lock released
+        } // locks released
 
         LOG_DEBUG("SM: Data from " + (peer_id.empty() ? "unknown" : peer_id) + " (length=" + std::to_string(event.data.length()) + ")");
 
@@ -143,8 +188,10 @@ namespace detail {
                 
                 // Flag to track if we created a new peer (for notifyPeerUpdate outside lock)
                 bool created_new_peer = false;
+                bool upgraded_endpoint = false;
                 {
-                    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                    // Lock order enforced: peers -> network index
+                    SessionManager::Impl::PeersThenNetworkIndexLock guard(*m_sm);
                     Peer* peer = m_sm->find_peer_by_id(peer_id);
                     if (peer) {
                         // IMPORTANT:
@@ -158,6 +205,9 @@ namespace detail {
                         // If the peer restarted and switched networks, we may have a stale advertised endpoint
                         // (e.g., old WAN STUN result) while the observed source is now a direct LAN address.
                         // Heuristic: upgrade public/placeholder -> private endpoint when we observe a private IPv4 source.
+                        // CRITICAL: Only do this if we're on WiFi (allow_private_endpoints). Otherwise stale LAN packets
+                        // arriving after WiFi-disable can incorrectly switch us to unreachable LAN endpoints.
+                        const bool allow_private_endpoints = m_sm->m_is_wifi.load(std::memory_order_acquire);
                         const std::string observed = event.network_id;
                         const std::string advertised = peer->network_id;
                         const NetworkEndpoint obs_ep = parseNetworkId(observed);
@@ -167,15 +217,15 @@ namespace detail {
                         const bool adv_placeholder = advertised.empty() || looksLikePlaceholderNetworkId(advertised);
                         const bool adv_public_like = !adv_private && !advertised.empty() && !adv_ep.ip.empty();
 
-                        bool upgraded_endpoint = false;
-                        if (obs_private && observed != advertised && (adv_placeholder || adv_public_like)) {
-                            LOG_INFO("MH: Upgrading peer " + peer_id + " endpoint " + (advertised.empty() ? std::string("<empty>") : advertised) + " -> " + observed + " (observed private IPv4)");
-                            m_sm->remove_peer_from_network_index(peer->network_id);
+                        // Only upgrade to private if WiFi is active (allow_private_endpoints)
+                        if (allow_private_endpoints && obs_private && observed != advertised && (adv_placeholder || adv_public_like)) {
+                            LOG_INFO("MH: Upgrading peer " + peer_id + " endpoint " + (advertised.empty() ? std::string("<empty>") : advertised) + " -> " + observed + " (observed private IPv4, WiFi active)");
+                            m_sm->remove_peer_from_network_index_locked_(peer->network_id);
                             peer->network_id = observed;
                             peer->advertised_network_id = observed;
                             peer->ip = obs_ep.ip;
                             peer->port = obs_ep.port;
-                            m_sm->add_peer_to_network_index(peer_id, peer->network_id);
+                            m_sm->add_peer_to_network_index_locked_(peer_id, peer->network_id);
 
                             auto ctx_it = m_sm->m_peer_contexts.find(peer_id);
                             if (ctx_it != m_sm->m_peer_contexts.end()) {
@@ -183,26 +233,30 @@ namespace detail {
                             }
 
                             // Stop any WAN hole-punch work now that we have a direct LAN path.
-                            NATTraversal::getInstance().unregisterPeer(peer_id);
                             upgraded_endpoint = true;
+                        } else if (!allow_private_endpoints && obs_private && observed != advertised && (adv_placeholder || adv_public_like)) {
+                            // Stale LAN packet arrived after WiFi disabled - ignore the private endpoint
+                            LOG_INFO("MH: IGNORING stale LAN packet from " + observed + " (WiFi OFF, keeping " + advertised + ")");
                         }
 
-
                         // Store ephemeral -> advertised mapping only if we did not upgrade the advertised endpoint.
+                        // CRITICAL FIX: Also skip if this would create a LAN->WAN redirection mapping.
                         if (!upgraded_endpoint) {
-                            {
-                                std::lock_guard<std::mutex> index_lock(m_sm->m_network_index_mutex);
-                                // Keep only the newest ephemeral mapping for this peer's advertised network_id.
-                                // Multiple stale mappings can cause sends to route to a dead socket.
-                                for (auto it = m_sm->m_ephemeral_to_advertised_port_map.begin();
-                                     it != m_sm->m_ephemeral_to_advertised_port_map.end();) {
-                                    if (it->second == peer->network_id) {
-                                        it = m_sm->m_ephemeral_to_advertised_port_map.erase(it);
-                                    } else {
-                                        ++it;
-                                    }
-                                }
-                                m_sm->m_ephemeral_to_advertised_port_map[event.network_id] = peer->network_id;
+                            // Check if peer is now on LAN but packet came from WAN
+                            bool peer_is_lan = (peer->network_id.find("192.168.") == 0 ||
+                                               peer->network_id.find("10.") == 0 ||
+                                               (peer->network_id.find("172.") == 0));  // simplified check
+                            bool event_is_lan = (event.network_id.find("192.168.") == 0 ||
+                                                event.network_id.find("10.") == 0 ||
+                                                (event.network_id.find("172.") == 0));
+                            
+                            if (peer_is_lan && !event_is_lan) {
+                                // Skip - would redirect LAN traffic to WAN
+                                LOG_INFO("MH: CONTROL_CONNECT: Skipping ephemeral mapping - would redirect LAN " +
+                                         peer->network_id + " to WAN " + event.network_id);
+                            } else {
+                                // Keep only the newest ephemeral mapping for this advertised network_id.
+                                m_sm->upsert_ephemeral_mapping_locked_(event.network_id, peer->network_id);
                             }
                         }
 
@@ -222,12 +276,17 @@ namespace detail {
                         new_peer.latency = -1;
                         new_peer.tier = (m_sm->m_peer_tier_manager) ? m_sm->m_peer_tier_manager->get_peer_tier(peer_id) : PeerTier::TIER_1;
                         m_sm->m_peers[peer_id] = new_peer;
-                        m_sm->add_peer_to_network_index(peer_id, event.network_id);
+                        m_sm->add_peer_to_network_index_locked_(peer_id, event.network_id);
                         m_sm->m_peer_contexts[peer_id] = PeerContext{peer_id, event.network_id};
                         m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::DISCOVERED});
                         created_new_peer = true;  // Defer notifyPeerUpdate to avoid deadlock
                     }
                 }
+
+                if (upgraded_endpoint) {
+                    NATTraversal::getInstance().unregisterPeer(peer_id);
+                }
+
                 // CRITICAL: notifyPeerUpdate() acquires m_peers_mutex, so call OUTSIDE the lock scope
                 if (created_new_peer) {
                     m_sm->notifyPeerUpdate();
@@ -250,7 +309,8 @@ namespace detail {
                 // advertised endpoint and can create mapping chains (ephemeral -> ephemeral), which
                 // breaks peer lookup and routing after restarts.
                 {
-                    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                    // Lock order enforced: peers -> network index
+                    SessionManager::Impl::PeersThenNetworkIndexLock guard(*m_sm);
                     Peer* peer = m_sm->find_peer_by_id(peer_id);
                     if (peer) {
                         // Refresh liveness.
@@ -260,18 +320,45 @@ namespace detail {
                         }
 
                         // Update ephemeral->advertised mapping if needed.
+                        // CRITICAL FIX: Only create ephemeral mappings when appropriate.
+                        // If peer->network_id is a LAN IP and event.network_id is a WAN IP,
+                        // do NOT create a mapping because it would redirect LAN traffic to WAN.
+                        // This commonly happens after WiFi handoff when stale WAN packets arrive.
                         if (!peer->network_id.empty() && peer->network_id != event.network_id) {
-                            std::lock_guard<std::mutex> index_lock(m_sm->m_network_index_mutex);
-                            // Keep only the newest ephemeral mapping for this peer's advertised network_id.
-                            for (auto it = m_sm->m_ephemeral_to_advertised_port_map.begin();
-                                 it != m_sm->m_ephemeral_to_advertised_port_map.end();) {
-                                if (it->second == peer->network_id) {
-                                    it = m_sm->m_ephemeral_to_advertised_port_map.erase(it);
-                                } else {
-                                    ++it;
+                            // Check if this would create a bad LAN->WAN redirection
+                            bool peer_is_lan = false;
+                            bool event_is_lan = false;
+                            
+                            // Simple heuristic: 192.168.x.x, 10.x.x.x, 172.16-31.x.x are LAN
+                            auto isLanIp = [](const std::string& network_id) -> bool {
+                                if (network_id.empty()) return false;
+                                if (network_id.find("192.168.") == 0) return true;
+                                if (network_id.find("10.") == 0) return true;
+                                if (network_id.find("172.") == 0) {
+                                    // Check 172.16-31.x.x range
+                                    size_t dot = network_id.find('.', 4);
+                                    if (dot != std::string::npos) {
+                                        try {
+                                            int second_octet = std::stoi(network_id.substr(4, dot - 4));
+                                            if (second_octet >= 16 && second_octet <= 31) return true;
+                                        } catch (...) {}
+                                    }
                                 }
+                                return false;
+                            };
+                            
+                            peer_is_lan = isLanIp(peer->network_id);
+                            event_is_lan = isLanIp(event.network_id);
+                            
+                            // Only create ephemeral mapping if it doesn't redirect LAN to WAN
+                            if (peer_is_lan && !event_is_lan) {
+                                // This would create WAN -> LAN, which when reversed during send
+                                // would redirect LAN traffic to WAN. Skip it.
+                                LOG_INFO("SM: PING: Skipping ephemeral mapping creation - would redirect LAN " +
+                                         peer->network_id + " to WAN " + event.network_id);
+                            } else {
+                                m_sm->upsert_ephemeral_mapping_locked_(event.network_id, peer->network_id);
                             }
-                            m_sm->m_ephemeral_to_advertised_port_map[event.network_id] = peer->network_id;
                         }
                     }
                 }
@@ -283,35 +370,80 @@ namespace detail {
             }
             case MessageType::CONTROL_PONG: {
                 LOG_INFO("SM: Received PONG from " + peer_id);
-                std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
-                Peer* peer = m_sm->find_peer_by_id(peer_id);
-                if (peer) {
-                    if (peer->last_discovery_seen.time_since_epoch().count() == 0) {
-                        peer->last_discovery_seen = peer->last_seen;
-                    }
-                    try {
-                        auto sent_time = std::chrono::steady_clock::time_point(std::chrono::nanoseconds(std::stoll(payload)));
-                        auto now = std::chrono::steady_clock::now();
-                        auto latency = std::chrono::duration_cast<std::chrono::milliseconds>(now - sent_time);
-                        peer->latency = latency.count();
-                        LOG_INFO("SM: PONG latency from " + peer_id + ": " + std::to_string(latency.count()) + "ms");
+                uint64_t token = 0;
+                try {
+                    token = static_cast<uint64_t>(std::stoull(payload));
+                } catch (...) {
+                    LOG_WARN("SM: Error parsing PONG token from " + peer_id + ": payload='" + payload + "'");
+                    break;
+                }
 
-                        if (m_sm->m_peer_tier_manager) {
-                            m_sm->m_peer_tier_manager->record_latency(peer_id, peer->latency);
-                        }
-                    } catch (const std::exception& e) {
-                        LOG_WARN("SM: Error parsing PONG payload: " + std::string(e.what()));
+                // Look up the send timestamp recorded when we sent the last PING to this peer.
+                std::chrono::steady_clock::time_point sent_time;
+                bool have_sent_time = false;
+                {
+                    std::lock_guard<std::mutex> lk(m_sm->m_ping_mutex);
+                    auto it = m_sm->m_last_ping_by_peer.find(peer_id);
+                    if (it != m_sm->m_last_ping_by_peer.end() && it->second.first == token) {
+                        sent_time = it->second.second;
+                        have_sent_time = true;
                     }
+                }
+
+                if (!have_sent_time) {
+                    // Either we rebooted, the peer is running an older build, or this PONG is stale/out-of-order.
+                    // Do not fabricate a latency value.
+                    LOG_DEBUG("SM: Ignoring unmatched PONG token from " + peer_id + ": token=" + std::to_string(token));
+                    // Still treat this as liveness.
+                    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                    Peer* peer = m_sm->find_peer_by_id(peer_id);
+                    if (peer) {
+                        peer->last_seen = std::chrono::steady_clock::now();
+                        if (peer->last_discovery_seen.time_since_epoch().count() == 0) {
+                            peer->last_discovery_seen = peer->last_seen;
+                        }
+                    }
+                    break;
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - sent_time).count();
+                if (ms < 0 || ms > 30000) {
+                    LOG_WARN("SM: Ignoring implausible PONG RTT from " + peer_id + ": " + std::to_string(ms) + "ms");
+                    break;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                    Peer* peer = m_sm->find_peer_by_id(peer_id);
+                    if (peer) {
+                        peer->last_seen = now;
+                        if (peer->last_discovery_seen.time_since_epoch().count() == 0) {
+                            peer->last_discovery_seen = peer->last_seen;
+                        }
+                        peer->latency = static_cast<int>(ms);
+                    }
+                }
+                LOG_INFO("SM: PONG latency from " + peer_id + ": " + std::to_string(ms) + "ms");
+
+                if (m_sm->m_peer_tier_manager) {
+                    m_sm->m_peer_tier_manager->record_latency(peer_id, static_cast<int>(ms));
                 }
                 break;
             }
             case MessageType::CONTROL_CONNECT: {
-                // Extract the remote public key from CONTROL_CONNECT payload FIRST
-                // Format: "peer_id|public_key_hex"
+                // Extract the remote public key and optional boot id from CONTROL_CONNECT payload.
+                // Format: "peer_id|public_key_hex|boot_id"
                 std::string remote_pk_hex;
-                size_t delimiter = payload.find('|');
-                if (delimiter != std::string::npos) {
-                    remote_pk_hex = payload.substr(delimiter + 1);
+                uint64_t remote_boot_id = 0;
+                {
+                    const auto fields = splitPipeFields(payload);
+                    if (fields.size() >= 2) {
+                        remote_pk_hex = fields[1];
+                    }
+                    if (fields.size() >= 3) {
+                        remote_boot_id = parseBootId(fields[2]);
+                    }
                 }
                 
                 // Parse the public key bytes
@@ -324,11 +456,17 @@ namespace detail {
                 
                 // Check if we're getting a CONNECT from a peer that was already connected
                 bool peer_was_connected = false;
+                uint64_t stored_remote_boot_id = 0;
                 {
                     std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
                     Peer* peer = m_sm->find_peer_by_id(peer_id);
                     if (peer && peer->connected) {
                         peer_was_connected = true;
+                    }
+
+                    auto ctx_it = m_sm->m_peer_contexts.find(peer_id);
+                    if (ctx_it != m_sm->m_peer_contexts.end()) {
+                        stored_remote_boot_id = ctx_it->second.remote_boot_id;
                     }
                 }
                 
@@ -337,6 +475,7 @@ namespace detail {
                 // If the key is the SAME, the remote is just retrying CONTROL_CONNECT (common
                 // during reconnect storms or endpoint flaps) and we should NOT disrupt the session.
                 bool remote_key_changed = false;
+                bool remote_boot_changed = false;
 #if HAVE_NOISE_PROTOCOL
                 if (m_sm->m_use_noise_protocol && incoming_pk.size() == 32 && m_sm->m_noise_key_store) {
                     auto stored_pk = m_sm->m_noise_key_store->get_peer_key(peer_id);
@@ -354,8 +493,13 @@ namespace detail {
                 }
                 
                 bool cleared_ready_noise = false;
-                // Only clear READY session if: peer was connected AND key changed (true restart)
-                if (peer_was_connected && remote_key_changed && m_sm->m_secure_session_manager) {
+                // Restart safety: clear READY session if:
+                //  - peer was connected AND (key changed OR boot id changed)
+                if (remote_boot_id != 0 && stored_remote_boot_id != 0 && remote_boot_id != stored_remote_boot_id) {
+                    remote_boot_changed = true;
+                    LOG_INFO("MH: Peer " + peer_id + " boot id CHANGED - likely process restart (old=" + std::to_string(stored_remote_boot_id) + ", new=" + std::to_string(remote_boot_id) + ")");
+                }
+                if (peer_was_connected && (remote_key_changed || remote_boot_changed) && m_sm->m_secure_session_manager) {
                     std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
                     auto existing = m_sm->m_secure_session_manager->get_session(peer_id);
                     if (existing && existing->is_ready()) {
@@ -365,15 +509,28 @@ namespace detail {
                 }
                 if (cleared_ready_noise) {
                     LOG_INFO("MH: Cleared READY Noise session for peer " + peer_id + 
-                             " upon CONTROL_CONNECT (peer_was_connected=true, key_changed=true)");
+                             " upon CONTROL_CONNECT (peer_was_connected=true, key_changed=" + std::string(remote_key_changed ? "true" : "false") +
+                             ", boot_id_changed=" + std::string(remote_boot_changed ? "true" : "false") + ")");
                     m_sm->clearQueuedMessages(peer_id);
                     if (m_sm->m_message_batcher) {
                         (void)m_sm->m_message_batcher->flush_peer(peer_id);
                     }
                 }
+
+                // Persist the remote boot id for this peer (even if we didn't clear).
+                if (remote_boot_id != 0) {
+                    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                    auto ctx_it = m_sm->m_peer_contexts.find(peer_id);
+                    if (ctx_it != m_sm->m_peer_contexts.end()) {
+                        ctx_it->second.remote_boot_id = remote_boot_id;
+                    }
+                }
 #else
                 (void)peer_was_connected;
                 (void)remote_key_changed;
+(void)remote_boot_id;
+(void)stored_remote_boot_id;
+(void)remote_boot_changed;
 #endif
 
                 std::string ack_payload = m_sm->m_localPeerId;
@@ -387,12 +544,23 @@ namespace detail {
                         pk_hex.push_back(hex_chars[b & 0x0F]);
                     }
                     ack_payload += "|" + pk_hex;
+                    ack_payload += "|" + std::to_string(m_sm->m_local_boot_id);
                 }
 #endif
 
                 std::string ack_message = wire::encode_message(MessageType::CONTROL_CONNECT_ACK, ack_payload);
                 m_sm->send_message_to_peer(event.network_id, ack_message);
-                m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_SUCCESS});
+                
+                // Get current epoch for this peer to gate stale events
+                uint64_t current_epoch = 0;
+                {
+                    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                    auto ctx_it = m_sm->m_peer_contexts.find(peer_id);
+                    if (ctx_it != m_sm->m_peer_contexts.end()) {
+                        current_epoch = ctx_it->second.connect_epoch;
+                    }
+                }
+                m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_SUCCESS, current_epoch});
 #if HAVE_NOISE_PROTOCOL
                 if (m_sm->m_use_noise_protocol && m_sm->shouldInitiateNoiseHandshake(peer_id)) {
                     bool ready = false;
@@ -412,10 +580,17 @@ namespace detail {
                 break;
             }
             case MessageType::CONTROL_CONNECT_ACK: {
+                // Format: "peer_id|public_key_hex|boot_id"
                 std::string remote_pk_hex;
-                size_t delimiter = payload.find('|');
-                if (delimiter != std::string::npos) {
-                    remote_pk_hex = payload.substr(delimiter + 1);
+                uint64_t remote_boot_id = 0;
+                {
+                    const auto fields = splitPipeFields(payload);
+                    if (fields.size() >= 2) {
+                        remote_pk_hex = fields[1];
+                    }
+                    if (fields.size() >= 3) {
+                        remote_boot_id = parseBootId(fields[2]);
+                    }
                 }
 
 #if HAVE_NOISE_PROTOCOL
@@ -435,6 +610,27 @@ namespace detail {
                 }
 #endif
 
+                // Update remote boot id opportunistically, but avoid letting late ACKs overwrite
+                // the boot id for already-connected peers.
+                if (remote_boot_id != 0) {
+                    bool accept = false;
+                    {
+                        std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                        Peer* peer = m_sm->find_peer_by_id(peer_id);
+                        const bool connected = (peer && peer->connected);
+                        auto ctx_it = m_sm->m_peer_contexts.find(peer_id);
+                        if (ctx_it != m_sm->m_peer_contexts.end()) {
+                            if (!connected || ctx_it->second.remote_boot_id == 0) {
+                                ctx_it->second.remote_boot_id = remote_boot_id;
+                                accept = true;
+                            }
+                        }
+                    }
+                    if (accept) {
+                        LOG_DEBUG("MH: Stored remote boot id for peer " + peer_id + " from CONTROL_CONNECT_ACK: " + std::to_string(remote_boot_id));
+                    }
+                }
+
                 // IMPORTANT:
                 // Do NOT clear an existing READY Noise session on CONTROL_CONNECT_ACK.
                 // A CONNECT_ACK can arrive after the handshake completed (reordering / fast paths),
@@ -443,7 +639,16 @@ namespace detail {
                 // Restart safety is handled on inbound CONTROL_CONNECT (fresh connect) where the receiver
                 // can deterministically clear READY sessions and re-handshake.
                 
-                m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_SUCCESS});
+                // Get current epoch for this peer
+                uint64_t current_epoch = 0;
+                {
+                    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                    auto ctx_it = m_sm->m_peer_contexts.find(peer_id);
+                    if (ctx_it != m_sm->m_peer_contexts.end()) {
+                        current_epoch = ctx_it->second.connect_epoch;
+                    }
+                }
+                m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_SUCCESS, current_epoch});
 #if HAVE_NOISE_PROTOCOL
                 LOG_INFO("MH: Checking noise handshake initiation. use_noise=" + std::string(m_sm->m_use_noise_protocol ? "true" : "false"));
                 if (m_sm->m_use_noise_protocol && m_sm->shouldInitiateNoiseHandshake(peer_id)) {
@@ -455,7 +660,7 @@ namespace detail {
                     }
                     if (!ready) {
                         LOG_INFO("MH: Scheduling Noise handshake (initiator) for peer " + peer_id);
-                        m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_REQUIRED});
+                        m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_REQUIRED, current_epoch});
                     } else {
                         LOG_DEBUG("MH: Noise session already READY for " + peer_id + " - skipping handshake scheduling");
                     }
@@ -486,7 +691,16 @@ namespace detail {
                             LOG_WARN("MH: Received handshake payload for unknown context " + peer_id);
                         }
                     }
-                    m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_MESSAGE_RECEIVED});
+                    // Get current epoch for this peer
+                    uint64_t current_epoch = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                        auto ctx_it = m_sm->m_peer_contexts.find(peer_id);
+                        if (ctx_it != m_sm->m_peer_contexts.end()) {
+                            current_epoch = ctx_it->second.connect_epoch;
+                        }
+                    }
+                    m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_MESSAGE_RECEIVED, current_epoch});
                 } else {
                     LOG_WARN("MH: Noise handshake payload received but protocol disabled");
                 }
@@ -510,7 +724,7 @@ namespace detail {
                         LOG_INFO("MH: Decryption complete, decrypted_length=" + std::to_string(decrypted_message.length()));
                         if (!decrypted_message.empty()) {
                             LOG_INFO("MH: Recursively processing decrypted message");
-                            DataReceivedEvent decrypted_event{event.network_id, decrypted_message};
+                            DataReceivedEvent decrypted_event{event.network_id, decrypted_message, std::chrono::steady_clock::now()};
                             handleDataReceived(decrypted_event); // Recursive call with decrypted data
                         } else {
                             LOG_WARN("SM: Failed to decrypt message from " + peer_id + " (stale key/session?)");
@@ -528,10 +742,20 @@ namespace detail {
                                 (void)m_sm->m_message_batcher->flush_peer(peer_id);
                             }
 
+                            // Get current epoch for this peer
+                            uint64_t current_epoch = 0;
+                            {
+                                std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                                auto ctx_it = m_sm->m_peer_contexts.find(peer_id);
+                                if (ctx_it != m_sm->m_peer_contexts.end()) {
+                                    current_epoch = ctx_it->second.connect_epoch;
+                                }
+                            }
+                            
                             // If we are the deterministic initiator, start handshake now.
                             // Otherwise, send a CONTROL_CONNECT to prompt the initiator side.
                             if (m_sm->shouldInitiateNoiseHandshake(peer_id)) {
-                                m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_REQUIRED});
+                                m_sm->pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_REQUIRED, current_epoch});
                             } else {
                                 std::string connect_payload = m_sm->m_localPeerId;
                                 if (m_sm->m_noise_key_store) {
@@ -542,7 +766,7 @@ namespace detail {
                                         pk_hex.push_back(hex_chars[b >> 4]);
                                         pk_hex.push_back(hex_chars[b & 0x0F]);
                                     }
-                                    connect_payload += "|" + pk_hex;
+                                    connect_payload += "|" + pk_hex + "|" + std::to_string(m_sm->m_local_boot_id);
                                 }
                                 const std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, connect_payload);
                                 m_sm->send_message_to_peer(event.network_id, connect_msg);
@@ -562,6 +786,60 @@ namespace detail {
             case MessageType::APPLICATION_DATA:
                 Telemetry::getInstance().inc_counter("rx_app_messages_total");
                 Telemetry::getInstance().inc_counter("rx_app_bytes_total", static_cast<int64_t>(payload.size()));
+
+                // ------------------------------------------------------------
+                // App-level ACK protocol (LP_APP envelope)
+                // ------------------------------------------------------------
+                // Expected payload (JSON):
+                // {
+                //   "type": "LP_APP",
+                //   "msg_id": "...",
+                //   "requires_ack": true,
+                //   "sent_ts_ms": 123456789,
+                //   "body": "..."   // UTF-8 text for now
+                // }
+                // If requires_ack=true, receiver responds with APPLICATION_ACK:
+                // {
+                //   "type": "LP_APP_ACK",
+                //   "msg_id": "...",
+                //   "sent_ts_ms": 123456789,
+                //   "recv_ts_ms": 123456790
+                // }
+                if (!payload.empty() && payload.front() == '{') {
+                    // Cheap substring gate to avoid parsing arbitrary app payloads.
+                    if (payload.find("\"type\"") != std::string::npos && payload.find("LP_APP") != std::string::npos) {
+                        try {
+                            const auto j = nlohmann::json::parse(payload);
+                            if (j.is_object() && j.value("type", std::string{}) == "LP_APP") {
+                                const std::string msg_id = j.value("msg_id", std::string{});
+                                const bool requires_ack = j.value("requires_ack", false);
+                                const int64_t sent_ts_ms = j.value("sent_ts_ms", static_cast<int64_t>(0));
+                                const std::string body = j.value("body", std::string{});
+
+                                if (requires_ack && !msg_id.empty()) {
+                                    nlohmann::json ack;
+                                    ack["type"] = "LP_APP_ACK";
+                                    ack["msg_id"] = msg_id;
+                                    if (sent_ts_ms > 0) ack["sent_ts_ms"] = sent_ts_ms;
+                                    ack["recv_ts_ms"] = now_epoch_ms();
+                                    const std::string ack_payload = ack.dump();
+                                    const std::string ack_msg = wire::encode_message(MessageType::APPLICATION_ACK, ack_payload);
+                                    m_sm->send_message_to_peer(event.network_id, ack_msg);
+                                    Telemetry::getInstance().inc_counter("tx_app_acks_total");
+                                }
+
+                                // Forward only the body to the normal app callback (keeps UI compatibility).
+                                if (m_sm->m_message_received_cb) {
+                                    m_sm->m_message_received_cb(peer_id, body);
+                                }
+                                break;
+                            }
+                        } catch (...) {
+                            // Fall through to legacy handling.
+                        }
+                    }
+                }
+
                 // Remote control plane: LP_ADMIN is carried over APPLICATION_DATA as JSON.
                 // If recognized, handle it here and prevent it from reaching the normal app callback.
                 if (!payload.empty() && payload.front() == '{') {
@@ -589,6 +867,35 @@ namespace detail {
                 }
                 LOG_INFO("========================================");
                 break;
+
+            case MessageType::APPLICATION_ACK: {
+                Telemetry::getInstance().inc_counter("rx_app_acks_total");
+                if (!payload.empty() && payload.front() == '{') {
+                    // Cheap substring gate
+                    if (payload.find("LP_APP_ACK") != std::string::npos && payload.find("\"msg_id\"") != std::string::npos) {
+                        try {
+                            const auto j = nlohmann::json::parse(payload);
+                            if (j.is_object() && j.value("type", std::string{}) == "LP_APP_ACK") {
+                                const std::string msg_id = j.value("msg_id", std::string{});
+                                const int64_t sent_ts_ms = j.value("sent_ts_ms", static_cast<int64_t>(0));
+                                const int64_t recv_ts_ms = j.value("recv_ts_ms", static_cast<int64_t>(0));
+                                (void)sent_ts_ms;   // used only in Android UI path
+                                (void)recv_ts_ms;
+
+#if defined(__ANDROID__)
+                                if (!msg_id.empty()) {
+                                    sendMessageAckToUI(msg_id, sent_ts_ms, recv_ts_ms);
+                                }
+#endif
+                                break;
+                            }
+                        } catch (...) {
+                            // ignore
+                        }
+                    }
+                }
+                break;
+            }
 
             case MessageType::PROXY_CONTROL:
                 LOG_INFO("MH: Received PROXY_CONTROL from " + peer_id + " len=" + std::to_string(payload.length()));
@@ -737,8 +1044,20 @@ namespace detail {
                              std::to_string(silent_ms) + ", discovery_ms=" + std::to_string(discovery_ms) +
                              ") - forcing reconnect and queueing message");
 
+#if HAVE_NOISE_PROTOCOL
                     m_sm->queueMessage(event.peerId, internal_msg);
-                    m_sm->pushEvent(FSMEvent{event.peerId, PeerEvent::DISCONNECT_DETECTED});
+#endif
+                    
+                    // Get current epoch for this peer
+                    uint64_t current_epoch = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                        auto ctx_it = m_sm->m_peer_contexts.find(event.peerId);
+                        if (ctx_it != m_sm->m_peer_contexts.end()) {
+                            current_epoch = ctx_it->second.connect_epoch;
+                        }
+                    }
+                    m_sm->pushEvent(FSMEvent{event.peerId, PeerEvent::DISCONNECT_DETECTED, current_epoch});
                     m_sm->pushEvent(ConnectToPeerEvent{event.peerId});
                     return;
                 }
@@ -769,7 +1088,9 @@ namespace detail {
                 case PeerState::CONNECTING: {
                     if (!is_control) {
                         LOG_INFO("MH: Queueing message for peer " + event.peerId + " while connecting (state=" + m_sm->state_to_string(peer_state) + ")");
+#if HAVE_NOISE_PROTOCOL
                         m_sm->queueMessage(event.peerId, internal_msg);
+#endif
                         return;
                     }
                     // Control messages may still be useful during connect attempts.
@@ -859,7 +1180,9 @@ namespace detail {
                 case PeerState::UNKNOWN: {
                     if (!is_control) {
                         LOG_INFO("MH: Queueing message for peer " + event.peerId + " while peer context initializes (state=UNKNOWN)");
+#if HAVE_NOISE_PROTOCOL
                         m_sm->queueMessage(event.peerId, internal_msg);
+#endif
                         return;
                     }
                     LOG_WARN("MH: Cannot send control message to peer " + event.peerId + " - state is UNKNOWN");

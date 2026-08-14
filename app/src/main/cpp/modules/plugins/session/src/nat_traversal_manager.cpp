@@ -33,7 +33,7 @@ void NATTraversalManager::initiateAsyncNATTraversal(const std::string& peer_id,
     }
     
     // Launch NAT traversal in a background thread and track it with a future
-    auto future = std::async(std::launch::async, [this, peer_id, event_callback, &stopping, &force_stop]() {
+    auto future = std::async(std::launch::async, [peer_id, event_callback, &stopping, &force_stop]() {
         LOG_INFO("NTM: [DIAG] NAT traversal operation started for peer: " + peer_id);
         
         // Check stopping flag at the beginning of the operation
@@ -102,6 +102,7 @@ void NATTraversalManager::handleNATTraversalCompleteEvent(const NATTraversalComp
                                                      std::mutex& scheduled_events_mutex,
                                                      std::atomic<bool>& stopping,
                                                      std::atomic<bool>& force_stop) {
+    (void)scheduled_events_mutex;
     LOG_INFO("NTM: NAT traversal complete for peer: " + event.peerId + 
              ", success: " + (event.success ? "true" : "false"));
     
@@ -122,7 +123,8 @@ void NATTraversalManager::handleNATTraversalCompleteEvent(const NATTraversalComp
             
             // Schedule a retry
             PeerReconnectPolicy& policy = PeerReconnectPolicy::getInstance();
-            policy.on_connection_failure(event.peerId, comms_mode);
+            policy.on_connection_failure(event.peerId, comms_mode, 
+                ConnectionFailureReason::NAT_TRAVERSAL_FAIL, 0.0f);
             
             // Check if we're forcing stop before scheduling retry
             if (force_stop) {

@@ -23,6 +23,7 @@
 #include "message_types.h"
 #include "wire_codec.h"
 #include "local_peer_db.h"
+#include "rugged_recovery_manager.h"
 #if ENABLE_PROXY_MODULE
 #include "proxy_endpoint.h"
 #endif
@@ -42,6 +43,8 @@
 #include <unordered_set>
 #include <future>
 #include <deque>
+
+#include <cstdint>
 
 // Wire encode/decode helpers are in wire_codec.h (wire::encode_message / wire::decode_message)
 
@@ -73,9 +76,12 @@ public:
     void stop();
     std::future<void> stopAsync();
     void connectToPeer(const std::string& peer_id);
+    void connectToPeer(const std::string& peer_id, bool bypass_reconnect_policy, const char* source);
     void sendMessageToPeer(const std::string& peer_id, const std::string& message);
     void setMessageReceivedCallback(std::function<void(const std::string&, const std::string&)> cb);
     bool isPeerConnected(const std::string& peer_id) const;
+    std::string getPeerFsmState(const std::string& peer_id) const;
+    std::string getPeerConnectionType(const std::string& peer_id) const;
     void set_battery_level_public(int percent, bool is_charging);
     void set_network_info_public(bool is_wifi, bool is_available);
     void set_reconnect_mode_public(const std::string& mode);
@@ -127,12 +133,21 @@ private:
     void clearQueuedMessages(const std::string& peer_id);
     bool shouldInitiateNoiseHandshake(const std::string& peer_id) const;
     void sendNoiseHandshakeMessage(const std::string& peer_id, const std::string& handshake_payload);
+    
+    // PROACTIVE RELAY ESCALATION: Re-send handshake via signaling relay when UDP handshake is stuck
+    void proactiveHandshakeRelay(const std::string& peer_id);
 #endif
 
+    // Discovery response handling - now supports full response with local IP info
     void handleDiscoveryResponse(const std::string& discovered_peer_id);
+    void handleDiscoveryResponseWithEndpoint(const std::string& discovered_peer_id, 
+                                              const std::string& responder_ip, 
+                                              int responder_port,
+                                              int latency_ms);
     void handlePeerDiscovered(const std::string& network_id, const std::string& peer_id);
     void handlePeerLeftFromSignaling(const std::string& peer_id);
     void handleFSMEvent(const FSMEvent& event);
+    void handleLanDiscoveryResult(const LanDiscoveryResultEvent& event);
 
     // Local peer persistence (SQLite)
     void maybe_init_peer_db_();
@@ -143,6 +158,21 @@ private:
     void setup_signaling_callbacks(SignalingClient& client);
     void ensure_signaling_connected_async(bool force = false);
     void refresh_external_address_async(bool force = false);
+    
+    // Broadcast updated LAN IP to all known peers via signaling (called on WiFi handoff)
+    void broadcastLanIpUpdate();
+    void schedule_lan_ip_broadcast_(std::chrono::milliseconds delay);
+    void join_owned_recovery_workers_();
+
+    // NATTraversal uses a raw pointer to the active IUdpConnectionManager. stop() clears it.
+    // start()/network recovery MUST re-register it so STUN bound-socket probing + hole punching work.
+    void ensure_nat_connection_manager_registered_();
+
+    // Hook NAT hole-punch completion into the peer FSM so peers don't get stuck CONNECTING
+    // when hole punching exhausts retries.
+    void ensure_nat_punch_observer_registered_();
+    void unregister_nat_punch_observer_();
+    void handle_nat_punch_result_(const std::string& peer_id, bool success);
 
     // Remote admin/control plane (LP_ADMIN over APPLICATION_DATA)
     void load_remote_control_config();
@@ -159,6 +189,32 @@ private:
     // Helper function to get mutex for a specific peer
     std::mutex& get_peer_mutex(const std::string& peer_id) const;
     
+    // =====================================================================
+    // Mutex ordering (DEADLOCK AVOIDANCE)
+    // =====================================================================
+    // The session layer uses multiple mutexes that can be taken together.
+    // When more than one of these must be held at the same time, ALWAYS
+    // acquire them in the order listed below:
+    //
+    //   1) m_peers_mutex
+    //   2) m_network_index_mutex
+    //
+    // Rationale:
+    // - m_peers_mutex protects: m_peers, m_peer_contexts, and peer state fields.
+    // - m_network_index_mutex protects: m_network_id_to_peer_id and
+    //   m_ephemeral_to_advertised_port_map.
+    //
+    // IMPORTANT RULES:
+    // - Never acquire m_peers_mutex while holding m_network_index_mutex.
+    // - If you need both, use PeersThenNetworkIndexLock and call the *_locked_
+    //   helpers below (they assume the appropriate mutex(es) are already held).
+    struct PeersThenNetworkIndexLock {
+        std::lock_guard<std::mutex> peers_lock;
+        std::lock_guard<std::mutex> index_lock;
+        explicit PeersThenNetworkIndexLock(Impl& sm)
+            : peers_lock(sm.m_peers_mutex), index_lock(sm.m_network_index_mutex) {}
+    };
+
     // Synchronization for async operations
     mutable std::mutex m_lifecycle_mutex;
     mutable std::mutex m_stop_mutex;
@@ -169,12 +225,24 @@ private:
     // Helper functions for fast peer lookups
     Peer* find_peer_by_id(const std::string& peer_id);
     const Peer* find_peer_by_id(const std::string& peer_id) const;
-    Peer* find_peer_by_network_id(const std::string& network_id);
-    const Peer* find_peer_by_network_id(const std::string& network_id) const;
+    // Peer lookup by network_id requires BOTH m_peers_mutex and m_network_index_mutex.
+    // Callers should take PeersThenNetworkIndexLock first and then call these.
+    std::string peer_id_by_network_id_locked_(const std::string& network_id) const;
+    Peer* find_peer_by_network_id_locked_(const std::string& network_id);
+    const Peer* find_peer_by_network_id_locked_(const std::string& network_id) const;
     
     // Network ID index management
     void add_peer_to_network_index(const std::string& peer_id, const std::string& network_id);
     void remove_peer_from_network_index(const std::string& network_id);
+
+    // Variants that REQUIRE m_network_index_mutex to already be held.
+    void add_peer_to_network_index_locked_(const std::string& peer_id, const std::string& network_id);
+    void remove_peer_from_network_index_locked_(const std::string& network_id);
+
+    // Ephemeral mapping helpers that REQUIRE m_network_index_mutex to already be held.
+    void prune_ephemeral_mappings_for_advertised_locked_(const std::string& advertised_network_id);
+    void upsert_ephemeral_mapping_locked_(const std::string& ephemeral_network_id,
+                                         const std::string& advertised_network_id);
     void update_peer_network_index(const std::string& old_network_id, const std::string& peer_id, const std::string& new_network_id);
     void update_peer_indexes();
     void remove_peer_from_indexes(size_t index);
@@ -193,6 +261,9 @@ private:
     std::function<void(const std::vector<Peer>&)> m_peer_update_cb;
     std::function<void(const std::string&, const std::string&)> m_message_received_cb;  // peer_id, message
     std::string m_localPeerId;
+    // Process-lifetime identifier used to detect restarts across CONTROL_CONNECT.
+    // (Noise sessions cannot survive process restarts even if static keys persist.)
+    uint64_t m_local_boot_id{0};
     std::string m_comms_mode;
     
     std::shared_ptr<ISessionDependenciesFactory> m_factory;
@@ -217,6 +288,9 @@ private:
     std::unique_ptr<detail::MessageHandler> m_message_handler;
     std::unique_ptr<detail::PeerLifecycleManager> m_peer_lifecycle_manager;
     std::unique_ptr<detail::MaintenanceManager> m_maintenance_manager;
+    
+    // Rugged Recovery Manager - handles automatic recovery from network failures
+    std::unique_ptr<recovery::RuggedRecoveryManager> m_recovery_manager;
 
     // Optional persistence: local peer database (SQLite).
     std::unique_ptr<LocalPeerDb> m_local_peer_db;
@@ -255,6 +329,25 @@ private:
     std::unique_ptr<BatteryOptimizer> m_battery_optimizer;
     std::unique_ptr<SessionCache> m_session_cache;
     std::unique_ptr<MessageBatcher> m_message_batcher;
+
+    // ---------------------------------------------------------------------
+    // Peer latency measurement (PING/PONG)
+    // ---------------------------------------------------------------------
+    // IMPORTANT:
+    // Never embed steady_clock timestamps into the wire payload.
+    // steady_clock epochs are process/device-specific, so subtracting a
+    // remote timestamp produces nonsense. Instead, we send a small token
+    // and compute RTT using the *local* steady_clock timestamp recorded
+    // when we sent the PING.
+    std::atomic<uint64_t> m_ping_seq{0};
+    mutable std::mutex m_ping_mutex;
+    // peer_id -> (last_ping_token, last_ping_sent_time)
+    std::unordered_map<std::string, std::pair<uint64_t, std::chrono::steady_clock::time_point>> m_last_ping_by_peer;
+    
+    // LAN_IP_UPDATE debounce: peer_id -> last sent time
+    // Prevents ping-pong loops when both sides send reciprocal LAN_IP_UPDATE
+    mutable std::mutex m_lan_ip_update_mutex;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_last_lan_ip_update_sent;
     
     // Peer discovery and message queuing
     std::unordered_set<std::string> m_peers_being_discovered;
@@ -269,13 +362,39 @@ private:
     std::condition_variable m_timer_cv;
     std::thread m_timer_thread;
 
+    // Short-lived recovery work is owned by the session manager. stop() joins
+    // these workers before dependent state is destroyed.
+    std::thread m_network_recovery_thread;
+    std::thread m_lan_broadcast_thread;
+    std::mutex m_owned_recovery_workers_mutex;
+    std::atomic<bool> m_network_recovery_in_progress{false};
+    std::atomic<bool> m_lan_broadcast_in_progress{false};
+
     std::unique_ptr<SignalingClient> m_signaling_client;
     std::atomic<bool> m_signaling_registered{false};
+    // Monotonic (steady_clock) ms timestamp of last signaling message received.
+    // Used to detect stalled-but-connected sockets and force re-register.
+    std::atomic<int64_t> m_last_signaling_rx_ms{0};
+    // Monotonic (steady_clock) ms timestamp of last forced re-register due to signaling staleness.
+    std::atomic<int64_t> m_last_signaling_forced_reregister_ms{0};
+    // When true, bypass the "already connected" fast-path and force a full signaling reconnect.
+    // This is set on network transitions where the old TCP route may be stale (common on Android).
+    std::atomic<bool> m_force_signaling_reconnect_requested{false};
+    // Dedupe: remember the network-change timestamp for which we already initiated a forced reconnect.
+    // If a forced reconnect attempt fails, we clear this so the next tick can retry.
+    std::atomic<int64_t> m_last_forced_signaling_reconnect_change_ms{0};
+    // Monotonic ms timestamp of last detected network transition (used for recovery tuning/logging).
+    std::atomic<int64_t> m_last_network_change_ms{0};
+    // Sequence counter for reconnect attempts (observability).
+    std::atomic<uint64_t> m_signaling_reconnect_seq{0};
     std::mutex m_signaling_update_mutex;
     std::string m_pending_signaling_network_id;
     // Joinable signaling reconnect thread (replaces detached thread to avoid UAF during teardown).
     std::thread m_signaling_reconnect_thread;
     std::thread m_nat_detect_thread;
+
+    // NATTraversal observer id (hole punching completion).
+    int m_nat_punch_observer_id{-1};
 
     // Runtime state for signaling/NAT reconnection.
     int m_listen_port{0};
@@ -287,8 +406,24 @@ private:
     std::atomic<bool> m_network_available{true};
     // Track last observed network type so we can treat WiFi<->cell transitions as network changes
     // even if "available" never flips false (common on Android during LTE->WiFi handoff).
-    std::atomic<bool> m_is_wifi{false};
+    // Default to true so that LAN endpoints are preferred on startup.
+    // The Android/iOS side should call set_network_info() to update this
+    // when the actual network state is known.
+    // IMPORTANT: Defaulting to false causes LAN_IP_UPDATE handling to be
+    // skipped during initial connection, resulting in WAN-only handshakes
+    // even when both peers are on the same LAN.
+    std::atomic<bool> m_is_wifi{true};
     std::mutex m_signaling_lifecycle_mutex;
+    
+    // PRODUCTION-READY: IP change detection
+    std::string m_last_known_primary_ip;
+    std::thread m_ip_monitor_thread;
+    std::atomic<bool> m_ip_monitor_running{false};
+    std::mutex m_ip_monitor_wait_mutex;
+    std::condition_variable m_ip_monitor_wait_cv;
+    void start_ip_monitor();
+    void stop_ip_monitor();
+    void ip_monitor_loop();
 
     // DB-first reconnect and on-demand signaling bootstrap.
     std::deque<std::string> m_db_reconnect_queue;

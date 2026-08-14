@@ -32,14 +32,12 @@ class ConnectionManager::Impl {
 public:
     Impl() : m_running(false), m_server_sock(-1), m_buffer_pool(std::make_unique<BufferPool>()) {}
     ~Impl() { 
-        nativeLog("TCP_DEBUG: Impl destructor called for " + std::to_string((uintptr_t)this));
+        LOG_DEBUG("TCP_DEBUG: Impl destructor called for " + std::to_string((uintptr_t)this));
         stop(); 
     }
 
     bool startServer(int port, OnDataCallback on_data, OnDisconnectCallback on_disconnect) {
-        std::cout << "TCP_DEBUG_RAW: startServer called on Impl " << (uintptr_t)this << std::endl;
         if (isRunning()) {
-            std::cout << "TCP_DEBUG_RAW: startServer returning false because isRunning() is true" << std::endl;
             return false;
         }
         m_on_data = on_data;
@@ -47,7 +45,6 @@ public:
 
         m_server_sock = socket(AF_INET, SOCK_STREAM, 0);
         if (m_server_sock < 0) {
-            std::cout << "TCP_DEBUG_RAW: socket() failed: " << strerror(errno) << std::endl;
             nativeLog("TCP Error: Failed to create server socket.");
             return false;
         }
@@ -59,7 +56,6 @@ public:
 
         int opt = 1;
         if (setsockopt(m_server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-            std::cout << "TCP_DEBUG_RAW: setsockopt() failed: " << strerror(errno) << std::endl;
             nativeLog("TCP Error: setsockopt(SO_REUSEADDR) failed: " + std::string(strerror(errno)));
             close(m_server_sock);
             m_server_sock = -1;
@@ -71,7 +67,6 @@ public:
         addr.sin_addr.s_addr = INADDR_ANY;
         addr.sin_port = htons(port);
         if (bind(m_server_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
-            std::cout << "TCP_DEBUG_RAW: bind() failed: " << strerror(errno) << std::endl;
             nativeLog("TCP Error: Failed to bind server socket to port " + std::to_string(port) + ": " + std::string(strerror(errno)));
             close(m_server_sock);
             m_server_sock = -1;
@@ -79,7 +74,6 @@ public:
         }
 
         if (listen(m_server_sock, DEFAULT_LISTEN_BACKLOG) < 0) {
-            std::cout << "TCP_DEBUG_RAW: listen() failed: " << strerror(errno) << std::endl;
             nativeLog("TCP Error: Failed to listen on server socket: " + std::string(strerror(errno)));
             close(m_server_sock);
             m_server_sock = -1;
@@ -89,13 +83,12 @@ public:
         setRunning(true);
         m_acceptThread = std::thread(&Impl::acceptLoop, this);
 
-        std::cout << "TCP_DEBUG_RAW: startServer success" << std::endl;
         nativeLog("TCP server started successfully on port " + std::to_string(port));
         return true;
     }
 
     void stop() {
-        nativeLog("TCP_DEBUG: stop() called on Impl " + std::to_string((uintptr_t)this));
+        LOG_DEBUG("TCP_DEBUG: stop() called on Impl " + std::to_string((uintptr_t)this));
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!isRunning()) {
@@ -337,7 +330,7 @@ private:
     void handleClient(int client_sock, std::string network_id) {
         auto buf = m_buffer_pool->acquire();
         std::vector<uint8_t> receive_buffer; // Buffer for partial reads/framing
-        nativeLog("TCP_DEBUG: handleClient started for " + network_id + " on Impl " + std::to_string((uintptr_t)this) + ", m_running=" + (isRunning() ? "true" : "false"));
+        LOG_DEBUG("TCP_DEBUG: handleClient started for " + network_id + " on Impl " + std::to_string((uintptr_t)this) + ", m_running=" + (isRunning() ? "true" : "false"));
         
         while (isRunning()) {
             fd_set read_fds;
@@ -351,20 +344,20 @@ private:
                  if (errno != EINTR && isRunning()) {
                     nativeLog("TCP Error: select() failed for client " + network_id + ": " + std::string(strerror(errno)));
                 } else {
-                    nativeLog("TCP_DEBUG: select() returned < 0, errno=" + std::to_string(errno));
+                    LOG_DEBUG("TCP_DEBUG: select() returned < 0, errno=" + std::to_string(errno));
                 }
                 break;
             }
 
             if (select_res == 0) {
-                // nativeLog("TCP_DEBUG: select() timed out for " + network_id);
+                // LOG_DEBUG("TCP_DEBUG: select() timed out for " + network_id);
                 continue;
             }
             
             if (FD_ISSET(client_sock, &read_fds)) {
-                // nativeLog("TCP_DEBUG: Calling recv for " + network_id);
+                // LOG_DEBUG("TCP_DEBUG: Calling recv for " + network_id);
                 ssize_t n = recv(client_sock, buf->data(), buf->size(), 0);
-                // nativeLog("TCP_DEBUG: recv returned " + std::to_string(n) + " for " + network_id);
+                // LOG_DEBUG("TCP_DEBUG: recv returned " + std::to_string(n) + " for " + network_id);
                 
                 if (n > 0) {
                     // LOG_DEBUG("TCP: Received " + std::to_string(n) + " bytes from " + network_id);
@@ -376,7 +369,7 @@ private:
                     auto messages = TcpMessage::extractMessages(receive_buffer);
                     for (const auto& encrypted_data : messages) {
                         // Decrypt and process
-                        std::string decrypted_data = decrypt_message(encrypted_data);
+                        std::string decrypted_data = decrypt_message_for_peer(network_id, encrypted_data);
                         if (m_on_data) {
                             m_on_data(network_id, decrypted_data);
                         }
@@ -391,11 +384,11 @@ private:
                     }
                 }
             } else {
-                nativeLog("TCP_DEBUG: select > 0 but FD_ISSET false");
+                LOG_DEBUG("TCP_DEBUG: select > 0 but FD_ISSET false");
             }
         }
         
-        nativeLog("TCP_DEBUG: handleClient exiting for " + network_id);
+        LOG_DEBUG("TCP_DEBUG: handleClient exiting for " + network_id);
         m_buffer_pool->release(buf);
 
         bool was_connected = false;
@@ -411,7 +404,7 @@ private:
     }
 
     void setRunning(bool val) {
-        nativeLog("TCP_DEBUG: setRunning(" + std::string(val ? "true" : "false") + ") called on Impl " + std::to_string((uintptr_t)this));
+        LOG_DEBUG("TCP_DEBUG: setRunning(" + std::string(val ? "true" : "false") + ") called on Impl " + std::to_string((uintptr_t)this));
         m_running = val;
     }
 

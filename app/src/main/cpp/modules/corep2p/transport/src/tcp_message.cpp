@@ -65,7 +65,7 @@ bool TcpMessage::send(int sock, const std::string& framed_msg, const std::string
         return false;
     }
 
-    nativeLog("TCP_DEBUG: Sending framed message, total size=" + std::to_string(framed_msg.size()));
+    LOG_DEBUG("TCP_DEBUG: Sending framed message, total size=" + std::to_string(framed_msg.size()));
     errno = 0;
     size_t total_sent = 0;
     size_t msg_len = framed_msg.size();
@@ -105,24 +105,37 @@ bool TcpMessage::send(int sock, const std::string& framed_msg, const std::string
 
 std::vector<std::string> TcpMessage::extractMessages(std::vector<uint8_t>& buffer) {
     std::vector<std::string> messages;
-    
+
+    // Hard cap on a single framed message. A 4-byte length prefix is
+    // attacker-controlled; without a cap a forged length would force a huge
+    // allocation/erase. 8 MB is far beyond any legitimate LiteP2P payload.
+    constexpr uint32_t kMaxTcpFrameLen = 8u * 1024u * 1024u;
+
     while (buffer.size() >= 4) {
         // Read length
         uint32_t msg_len;
         std::memcpy(&msg_len, buffer.data(), 4);
         msg_len = ntohl(msg_len);
-        
+
+        // Reject (and drop) frames that exceed the cap: discard the length
+        // prefix and continue, so a malicious stream cannot wedge the reader.
+        if (msg_len > kMaxTcpFrameLen) {
+            LOG_WARN("TCP: Dropping oversized framed message (len=" + std::to_string(msg_len) + ")");
+            buffer.erase(buffer.begin(), buffer.begin() + 4);
+            continue;
+        }
+
         if (buffer.size() < 4 + msg_len) {
             // Wait for more data
             break;
         }
-        
+
         // Extract message
         messages.emplace_back(reinterpret_cast<char*>(buffer.data() + 4), msg_len);
-        
+
         // Remove from buffer
         buffer.erase(buffer.begin(), buffer.begin() + 4 + msg_len);
     }
-    
+
     return messages;
 }

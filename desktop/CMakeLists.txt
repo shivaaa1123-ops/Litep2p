@@ -114,19 +114,18 @@ set(SESSION_SOURCES
     ../app/src/main/cpp/modules/plugins/session/src/sqlite3_dyn.cpp
     ../app/src/main/cpp/modules/plugins/session/src/session_cache.cpp
     ../app/src/main/cpp/modules/plugins/session/src/tier_manager.cpp
+    ../app/src/main/cpp/modules/plugins/session/src/rugged_recovery_manager.cpp
 )
 
 # Transport layer
 set(TRANSPORT_SOURCES
     ../app/src/main/cpp/modules/corep2p/transport/src/connection_manager.cpp
     ../app/src/main/cpp/modules/corep2p/transport/src/udp_connection_manager.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/network.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/batch_connection_manager.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/multi_socket_manager.cpp
     ../app/src/main/cpp/modules/corep2p/transport/src/tcp_message.cpp
     ../app/src/main/cpp/modules/corep2p/transport/src/udp_message.cpp
     ../app/src/main/cpp/modules/corep2p/transport/src/quic_message.cpp
     ../app/src/main/cpp/modules/corep2p/transport/src/quic_connection_manager.cpp
+    ../app/src/main/cpp/modules/corep2p/transport/src/real_quic_transport.cpp
 )
 
 # Security and crypto
@@ -135,7 +134,7 @@ set(CRYPTO_SOURCES
     ../app/src/main/cpp/modules/corep2p/crypto/src/noise_nk.cpp
     ../app/src/main/cpp/modules/corep2p/crypto/src/noise_protocol.cpp
     ../app/src/main/cpp/modules/corep2p/crypto/src/crypto_utils.cpp
-    ../app/src/main/cpp/modules/corep2p/crypto/src/aes.cpp
+    ../app/src/main/cpp/modules/corep2p/crypto/src/sha1_md5.cpp
     ../app/src/main/cpp/modules/corep2p/crypto/src/aes.c
 )
 
@@ -243,6 +242,53 @@ target_link_libraries(litep2p_engine PUBLIC
     ${CMAKE_DL_LIBS}
 )
 
+# ---------------------------------------------------------------------------
+# Real QUIC (RFC 9000) via picoquic + picotls (minicrypto).
+# Enabled automatically when third_party/picoquic has been built
+# (see third_party/README-style notes in CMake output). Disable explicitly
+# with -DLITEP2P_ENABLE_REAL_QUIC=OFF.
+# ---------------------------------------------------------------------------
+option(LITEP2P_ENABLE_REAL_QUIC "Enable real QUIC transport (picoquic)" ON)
+
+set(PICOQUIC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/picoquic")
+set(PICOTLS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/picotls")
+
+if(LITEP2P_ENABLE_REAL_QUIC)
+    if(NOT EXISTS "${PICOQUIC_ROOT}/build/libpicoquic-core.a" OR
+       NOT EXISTS "${PICOTLS_ROOT}/build/libpicotls-core.a" OR
+       NOT EXISTS "${PICOTLS_ROOT}/build/libpicotls-minicrypto.a")
+        message(WARNING
+            "Real QUIC (picoquic) libraries not found under third_party/ - "
+            "disabling real QUIC. Build them with:\n"
+            "  cd third_party/picotls && cmake -S . -B build -DPTLS_BUILD_TESTS=OFF && make -C build\n"
+            "  cd third_party/picoquic && cmake -S . -B build -DWITH_OPENSSL=OFF \\\n"
+            "    -Dpicoquic_BUILD_TESTS=OFF -DBUILD_DEMO=OFF -DBUILD_HTTP=OFF \\\n"
+            "    -DBUILD_PQBENCH=OFF -DBUILD_LOGLIB=OFF -DBUILD_LOGREADER=OFF \\\n"
+            "    -DPTLS_PREFIX=${PICOTLS_ROOT}/build && make -C build")
+        set(LITEP2P_ENABLE_REAL_QUIC OFF)
+    endif()
+endif()
+
+if(LITEP2P_ENABLE_REAL_QUIC)
+    add_compile_definitions(LITEP2P_ENABLE_REAL_QUIC=1)
+
+    target_include_directories(litep2p_engine PUBLIC
+        ${PICOQUIC_ROOT}
+        ${PICOQUIC_ROOT}/picoquic
+        ${PICOTLS_ROOT}/include
+    )
+
+    # Link order matters: picoquic-log depends on picoquic-core which depends
+    # on picotls-core + minicrypto.
+    target_link_libraries(litep2p_engine PUBLIC
+        ${PICOQUIC_ROOT}/build/libpicoquic-log.a
+        ${PICOQUIC_ROOT}/build/libpicoquic-core.a
+        ${PICOTLS_ROOT}/build/libpicotls-core.a
+        ${PICOTLS_ROOT}/build/libpicotls-minicrypto.a
+    )
+    message(STATUS "Real QUIC: ENABLED (picoquic + picotls minicrypto)")
+endif()
+
 if(UNIX AND NOT APPLE AND UUID_FOUND)
     target_link_libraries(litep2p_engine PUBLIC ${UUID_LIBRARIES})
     target_include_directories(litep2p_engine PUBLIC ${UUID_INCLUDE_DIRS})
@@ -289,6 +335,12 @@ target_link_libraries(wan_integration_runner PRIVATE litep2p_engine)
 add_executable(message_size_runner tests/message_size_runner.cpp)
 target_include_directories(message_size_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(message_size_runner PRIVATE litep2p_engine)
+
+if(LITEP2P_ENABLE_REAL_QUIC)
+    add_executable(quic_test tests/quic_test.cpp)
+    target_include_directories(quic_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(quic_test PRIVATE litep2p_engine)
+endif()
 
 if(ENABLE_PROXY_MODULE)
     add_executable(proxy_test tests/proxy_test.cpp)

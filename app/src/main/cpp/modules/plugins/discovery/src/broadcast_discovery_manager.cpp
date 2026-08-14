@@ -1,4 +1,5 @@
 #include "../include/broadcast_discovery_manager.h"
+#include "../include/discovery.h"
 #include "logger.h"
 #include <algorithm>
 #include <sstream>
@@ -161,6 +162,33 @@ std::string BroadcastDiscoveryManager::discover_peer(const std::string& target_p
     }
 }
 
+std::string BroadcastDiscoveryManager::discover_peer_with_hint(const std::string& target_peer_id,
+                                                                const std::string& hint_ip,
+                                                                int hint_port,
+                                                                OnDiscoveryComplete on_complete) {
+    // First, register the pending discovery like normal
+    std::string request_id = discover_peer(target_peer_id, on_complete);
+    
+    if (request_id.empty()) {
+        return "";
+    }
+    
+    // Now send a direct probe to the hint IP
+    // This bypasses AP isolation that may block broadcasts
+    if (!hint_ip.empty() && hint_port > 0 && hint_port <= 65535) {
+        Discovery* discovery = getGlobalDiscoveryInstance();
+        if (discovery) {
+            LOG_INFO("BroadcastDiscoveryManager: Sending direct probe to " + hint_ip + ":" + 
+                     std::to_string(hint_port) + " for peer " + target_peer_id);
+            discovery->sendDirectProbe(hint_ip, hint_port);
+        } else {
+            LOG_WARN("BroadcastDiscoveryManager: No discovery instance available for direct probe");
+        }
+    }
+    
+    return request_id;
+}
+
 bool BroadcastDiscoveryManager::cancel_discovery(const std::string& request_id) {
     try {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -185,50 +213,48 @@ bool BroadcastDiscoveryManager::cancel_discovery(const std::string& request_id) 
 
 bool BroadcastDiscoveryManager::process_broadcast_message(const BroadcastMessage& message) {
     try {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        
-        if (!m_running) {
-            return false;
+        OnBroadcastReceived callback;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_running) {
+                return false;
+            }
+
+            const std::string validation_error = validate_broadcast_message(message);
+            if (!validation_error.empty()) {
+                LOG_WARN("BroadcastDiscoveryManager: Invalid broadcast message: " + validation_error);
+                return false;
+            }
+
+            if (m_seen_broadcasts.count(message.request_id) > 0) {
+                LOG_DEBUG("BroadcastDiscoveryManager: Duplicate broadcast dropped (request_id=" + message.request_id + ")");
+                m_stats.broadcasts_dropped_dedup++;
+                return false;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            m_seen_broadcasts[message.request_id] = now;
+            auto& times = m_peer_broadcast_times[message.source_peer_id];
+            times.erase(std::remove_if(times.begin(), times.end(), [&](const auto& timestamp) {
+                return std::chrono::duration_cast<std::chrono::seconds>(now - timestamp).count() >= 60;
+            }), times.end());
+            if (times.size() >= static_cast<size_t>(m_config.max_broadcasts_per_peer_per_min)) {
+                LOG_WARN("BroadcastDiscoveryManager: Peer " + message.source_peer_id + " is rate-limited");
+                m_stats.broadcasts_dropped_rate_limit++;
+                return false;
+            }
+            times.push_back(now);
+            callback = m_on_broadcast_callback;
+            m_stats.broadcasts_received++;
         }
-        
-        // Validate message
-        // Using validate_broadcast_message helper
-        std::string validation_error = validate_broadcast_message(message);
-        if (!validation_error.empty()) {
-            LOG_WARN("BroadcastDiscoveryManager: Invalid broadcast message: " + validation_error);
-            return false;
-        }
-        
-        // Check for duplicates
-        if (is_broadcast_duplicate(message.request_id)) { // dedup_key is request_id now
-            LOG_DEBUG("BroadcastDiscoveryManager: Duplicate broadcast dropped (request_id=" + message.request_id + ")");
-            m_stats.broadcasts_dropped_dedup++;
-            return false;
-        }
-        
-        // Mark as seen
-        mark_broadcast_seen(message.request_id);
-        
-        // Record broadcast for rate limiting
-        record_peer_broadcast(message.source_peer_id);
-        
-        // Check rate limits
-        if (is_peer_rate_limited(message.source_peer_id)) {
-            LOG_WARN("BroadcastDiscoveryManager: Peer " + message.source_peer_id + " is rate-limited");
-            m_stats.broadcasts_dropped_rate_limit++;
-            return false;
-        }
-        
-        // Call callback if registered
-        if (m_on_broadcast_callback) {
+
+        if (callback) {
             try {
-                m_on_broadcast_callback(message);
+                callback(message);
             } catch (const std::exception& e) {
                 LOG_WARN("BroadcastDiscoveryManager: OnBroadcastReceived callback error: " + std::string(e.what()));
             }
         }
-        
-        m_stats.broadcasts_received++;
         
         return true;
     } catch (const std::exception& e) {
@@ -292,52 +318,106 @@ BroadcastMessage BroadcastDiscoveryManager::create_broadcast_message(
 
 bool BroadcastDiscoveryManager::process_discovery_response(const DiscoveryResponse& response) {
     try {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        
-        // Validate response
-        std::string validation_error = validate_discovery_response(response);
-        if (!validation_error.empty()) {
-            LOG_WARN("BroadcastDiscoveryManager: Invalid discovery response: " + validation_error);
-            return false;
-        }
-        
-        auto it = m_pending_discoveries.find(response.request_id);
-        if (it == m_pending_discoveries.end()) {
-            LOG_WARN("BroadcastDiscoveryManager: Received response for unknown discovery request: " + response.request_id);
-            return false;
-        }
-        
-        auto pending = it->second;
-        
-        // Check if the response is for the correct target peer
-        if (pending->target_peer_id != response.responder_peer_id) {
-            LOG_WARN("BroadcastDiscoveryManager: Mismatched target/responder in discovery response for request " + response.request_id);
-            return false;
+        OnDiscoveryComplete callback;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const std::string validation_error = validate_discovery_response(response);
+            if (!validation_error.empty()) {
+                LOG_WARN("BroadcastDiscoveryManager: Invalid discovery response: " + validation_error);
+                return false;
+            }
+
+            auto it = m_pending_discoveries.find(response.request_id);
+            if (it == m_pending_discoveries.end()) {
+                LOG_WARN("BroadcastDiscoveryManager: Received response for unknown discovery request: " + response.request_id);
+                return false;
+            }
+
+            const auto& pending = it->second;
+            if (pending->target_peer_id != response.responder_peer_id) {
+                LOG_WARN("BroadcastDiscoveryManager: Mismatched target/responder in discovery response for request " + response.request_id);
+                return false;
+            }
+
+            pending->responses.push_back(response);
+            pending->is_satisfied = true;
+            callback = pending->on_complete_callback;
+            m_stats.successful_discoveries++;
         }
 
-        pending->responses.push_back(response);
-        pending->is_satisfied = true; // At least one response received
-
-        // Optionally, update best latency or other metrics here
-
-        // If a callback was provided, call it.
-        if (pending->on_complete_callback) {
+        if (callback) {
             try {
-                pending->on_complete_callback(response);
-                // For a successful discovery, we might want to remove the pending request here
-                // m_pending_discoveries.erase(it);
+                callback(response);
             } catch (const std::exception& e) {
                 LOG_WARN("BroadcastDiscoveryManager: Discovery complete callback error: " + std::string(e.what()));
             }
         }
-        
         LOG_INFO("BroadcastDiscoveryManager: Discovery response processed for request " + response.request_id +
                  " from peer " + response.responder_peer_id);
-        m_stats.successful_discoveries++;
         
         return true;
     } catch (const std::exception& e) {
         LOG_WARN("BroadcastDiscoveryManager: process_discovery_response error: " + std::string(e.what()));
+        return false;
+    }
+}
+
+bool BroadcastDiscoveryManager::notify_peer_discovered(const std::string& peer_id, 
+                                                       const std::string& ip, 
+                                                       int port) {
+    try {
+        DiscoveryResponse response;
+        OnDiscoveryComplete callback;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (!m_running) {
+                return false;
+            }
+
+            std::shared_ptr<PendingDiscovery> matching_pending;
+            std::string matching_request_id;
+            for (const auto& kv : m_pending_discoveries) {
+                if (kv.second && kv.second->target_peer_id == peer_id) {
+                    matching_pending = kv.second;
+                    matching_request_id = kv.first;
+                    break;
+                }
+            }
+            if (!matching_pending) {
+                return false;
+            }
+
+            LOG_INFO("BroadcastDiscoveryManager: Peer " + peer_id + " discovered via LAN at " +
+                     ip + ":" + std::to_string(port) + " (request_id=" + matching_request_id + ")");
+            const auto now = std::chrono::steady_clock::now();
+            response.request_id = matching_request_id;
+            response.responder_peer_id = peer_id;
+            response.responder_ip = ip;
+            response.responder_port = port;
+            response.latency_ms = static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - matching_pending->created_at).count());
+            response.hop_count = 1;
+            response.received_at = now;
+            response.created_at = matching_pending->created_at;
+            matching_pending->responses.push_back(response);
+            matching_pending->is_satisfied = true;
+            callback = matching_pending->on_complete_callback;
+            m_pending_discoveries.erase(matching_request_id);
+            m_stats.successful_discoveries++;
+        }
+
+        if (callback) {
+            try {
+                callback(response);
+            } catch (const std::exception& e) {
+                LOG_WARN("BroadcastDiscoveryManager: notify_peer_discovered callback error: " +
+                         std::string(e.what()));
+            }
+        }
+        
+        return true;
+    } catch (const std::exception& e) {
+        LOG_WARN("BroadcastDiscoveryManager: notify_peer_discovered error: " + std::string(e.what()));
         return false;
     }
 }
@@ -624,43 +704,42 @@ void BroadcastDiscoveryManager::response_timeout_loop() {
 
             if (!m_running) break;
 
-            std::lock_guard<std::mutex> lock(m_mutex);
-            
             auto now = std::chrono::steady_clock::now();
-            std::vector<std::string> to_remove;
-            
-            for (auto& pair : m_pending_discoveries) { // Iterate over shared_ptr in map
-                auto& pending = pair.second;
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    now - pending->created_at).count(); // Use created_at for timeout
-                
-                if (elapsed > m_config.discovery_timeout_sec) { // Use config timeout
-                    to_remove.push_back(pending->request_id);
-                    
-                    // Call callback with timeout notification if no response was received
-                    if (pending->on_complete_callback && !pending->is_satisfied) { // Updated callback name and check
-                        try {
-                            // Create fake response indicating timeout
+            std::vector<std::pair<OnDiscoveryComplete, DiscoveryResponse>> timeout_callbacks;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                std::vector<std::string> to_remove;
+                for (auto& pair : m_pending_discoveries) {
+                    auto& pending = pair.second;
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - pending->created_at).count();
+                    if (elapsed > m_config.discovery_timeout_sec) {
+                        to_remove.push_back(pending->request_id);
+                        if (pending->on_complete_callback && !pending->is_satisfied) {
                             DiscoveryResponse timeout_response;
-                            timeout_response.request_id = pending->request_id; // Set request_id
-                            timeout_response.responder_peer_id = "TIMEOUT"; // Updated responder_peer
+                            timeout_response.request_id = pending->request_id;
+                            timeout_response.responder_peer_id = "TIMEOUT";
                             timeout_response.latency_ms = m_config.discovery_timeout_sec * 1000;
                             timeout_response.received_at = now;
-                            pending->on_complete_callback(timeout_response); // Pass the response object
-                        } catch (const std::exception& e) {
-                            LOG_WARN("BroadcastDiscoveryManager: Timeout callback error: " + std::string(e.what()));
+                            timeout_callbacks.emplace_back(pending->on_complete_callback,
+                                                           std::move(timeout_response));
                         }
+                        LOG_WARN("BroadcastDiscoveryManager: Discovery timeout: request_id=" + pending->request_id +
+                                 ", responses=" + std::to_string(pending->responses.size()));
+                        m_stats.failed_discoveries++;
                     }
-                    
-                    LOG_WARN("BroadcastDiscoveryManager: Discovery timeout: request_id=" + pending->request_id +
-                            ", responses=" + std::to_string(pending->responses.size()));
-                    m_stats.failed_discoveries++;
+                }
+                for (const std::string& request_id : to_remove) {
+                    m_pending_discoveries.erase(request_id);
                 }
             }
-            
-            // Remove timed out discoveries
-            for (const std::string& request_id : to_remove) {
-                m_pending_discoveries.erase(request_id);
+
+            for (auto& [callback, response] : timeout_callbacks) {
+                try {
+                    callback(response);
+                } catch (const std::exception& e) {
+                    LOG_WARN("BroadcastDiscoveryManager: Timeout callback error: " + std::string(e.what()));
+                }
             }
             
         } catch (const std::exception& e) {

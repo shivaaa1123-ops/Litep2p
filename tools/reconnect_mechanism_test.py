@@ -32,6 +32,8 @@ import json
 import os
 import re
 import signal
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -54,11 +56,87 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def strip_jsonc_comments(s: str) -> str:
+    """Strip // and /* */ comments from JSON-with-comments (JSONC).
+
+    This repo's `config.json` and `config.example.json` intentionally contain
+    block comments for documentation. The desktop peer supports it, but Python's
+    stdlib `json` does not.
+
+    This is a small, string-aware stripper (won't remove comment markers inside
+    JSON strings).
+    """
+
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_string = False
+    escape = False
+    in_line_comment = False
+    in_block_comment = False
+
+    while i < n:
+        ch = s[i]
+        nxt = s[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+                out.append(ch)
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            # Preserve newlines to keep error line numbers vaguely useful.
+            if ch == "\n":
+                out.append(ch)
+            i += 1
+            continue
+
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        # Not in string/comment.
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
 @dataclass
 class PeerProc:
     name: str
     proc: subprocess.Popen
     lines: Deque[str]
+    workdir: Path
 
 
 def find_default_binary() -> Path:
@@ -83,9 +161,24 @@ def find_default_binary() -> Path:
     )
 
 
+def pick_free_udp_port() -> int:
+    """Best-effort free port selection for local integration tests."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind(("0.0.0.0", 0))
+        return int(s.getsockname()[1])
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 def build_test_config_path(
     *,
     explicit_config: Optional[Path],
+    workdir: Optional[Path],
+    peer_label: str,
     peer_expiration_timeout_ms: int,
     heartbeat_interval_sec: int,
 ) -> Tuple[Optional[Path], Optional[Path]]:
@@ -102,10 +195,15 @@ def build_test_config_path(
     if explicit_config is not None:
         return explicit_config, None
 
+    if workdir is None:
+        raise ValueError("workdir must be provided when generating a test config")
+    workdir.mkdir(parents=True, exist_ok=True)
+
     repo_root = Path(__file__).resolve().parents[1]
     repo_config = repo_root / "config.json"
     try:
-        data = json.loads(repo_config.read_text(encoding="utf-8"))
+        raw = repo_config.read_text(encoding="utf-8")
+        data = json.loads(strip_jsonc_comments(raw))
     except Exception as e:
         raise RuntimeError(f"Failed to read/parse repo config.json at {repo_config}: {e}")
 
@@ -137,21 +235,35 @@ def build_test_config_path(
     # Keep mandatory default as-is unless missing.
     data["security"]["noise_nk_protocol"].setdefault("mandatory", True)
 
-    tmp = tempfile.NamedTemporaryFile(prefix="litep2p_reconnect_", suffix=".json", delete=False)
-    tmp_path = Path(tmp.name)
-    try:
-        tmp.write(json.dumps(data, indent=2).encode("utf-8"))
-        tmp.flush()
-    finally:
-        tmp.close()
+    # IMPORTANT: isolate local state.
+    # The repo's default config points at a shared `keystore/` which may already
+    # contain many peer identities/keys, and can trigger network_id collisions.
+    # For this integration harness we want clean, per-peer state that persists
+    # across *that peer's* restarts only.
+    ks_dir = (workdir / "keystore")
+    ks_dir.mkdir(parents=True, exist_ok=True)
+    data["security"]["noise_nk_protocol"]["key_store_path"] = str(ks_dir)
 
-    return tmp_path, tmp_path
+    data.setdefault("storage", {})
+    data["storage"].setdefault("peer_db", {})
+    data["storage"]["peer_db"]["enabled"] = True
+    data["storage"]["peer_db"]["path"] = str(workdir / "litep2p_peers.sqlite")
+
+    data.setdefault("logging", {})
+    # Keep console output enabled so the harness can parse logs.
+    data["logging"]["console_output"] = True
+    data["logging"]["file_path"] = str(workdir / f"litep2p_{peer_label}.log")
+
+    cfg_path = workdir / "config.json"
+    cfg_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return cfg_path, workdir
 
 
 def start_peer(
     *,
     name: str,
     binary: Path,
+    workdir: Path,
     port: int,
     peer_id: str,
     log_level: str,
@@ -173,7 +285,7 @@ def start_peer(
 
     proc = subprocess.Popen(
         cmd,
-        cwd=str(Path(__file__).resolve().parents[1]),
+        cwd=str(workdir),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -196,7 +308,7 @@ def start_peer(
     t = threading.Thread(target=reader, daemon=True)
     t.start()
 
-    return PeerProc(name=name, proc=proc, lines=lines)
+    return PeerProc(name=name, proc=proc, lines=lines, workdir=workdir)
 
 
 def send_cmd(peer: PeerProc, cmd: str) -> None:
@@ -363,6 +475,7 @@ def restart_side(
     restarted = start_peer(
         name=side_name,
         binary=binary,
+        workdir=peer.workdir,
         port=port,
         peer_id=peer_id,
         log_level=log_level,
@@ -399,6 +512,16 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true", help="Stream peer output prefixed with [A]/[B]")
     args = ap.parse_args()
 
+    # If the default ports are busy (common when another LiteP2P instance is running),
+    # pick free ports to make the harness "just work".
+    if args.port_a == 31001 and args.port_b == 31002:
+        a_port = pick_free_udp_port()
+        b_port = pick_free_udp_port()
+        while b_port == a_port:
+            b_port = pick_free_udp_port()
+        args.port_a = a_port
+        args.port_b = b_port
+
     binary = Path(args.binary).expanduser() if args.binary else find_default_binary()
 
     # Support per-peer configs to ensure isolated Noise keystores.
@@ -406,16 +529,34 @@ def main() -> int:
     config_a_path = Path(args.config_a).expanduser() if args.config_a else explicit_config
     config_b_path = Path(args.config_b).expanduser() if args.config_b else explicit_config
 
-    temp_to_delete: Optional[Path] = None
+    repo_root = Path(__file__).resolve().parents[1]
+    workdir_a = repo_root
+    workdir_b = repo_root
+
+    temp_to_delete: list[Path] = []
     if config_a_path is None:
-        # No explicit config; generate one (shared is okay for generated temp configs).
-        config, temp_to_delete = build_test_config_path(
+        # No explicit config; generate *per-peer* isolated configs.
+        wd_a = Path(tempfile.mkdtemp(prefix=f"litep2p_reconnect_{args.id_a}_"))
+        wd_b = Path(tempfile.mkdtemp(prefix=f"litep2p_reconnect_{args.id_b}_"))
+        workdir_a = wd_a
+        workdir_b = wd_b
+        cfg_a, cleanup_a = build_test_config_path(
             explicit_config=None,
+            workdir=wd_a,
+            peer_label="A",
             peer_expiration_timeout_ms=args.peer_expiration_timeout_ms,
             heartbeat_interval_sec=args.heartbeat_interval_sec,
         )
-        config_a_path = config
-        config_b_path = config
+        cfg_b, cleanup_b = build_test_config_path(
+            explicit_config=None,
+            workdir=wd_b,
+            peer_label="B",
+            peer_expiration_timeout_ms=args.peer_expiration_timeout_ms,
+            heartbeat_interval_sec=args.heartbeat_interval_sec,
+        )
+        config_a_path = cfg_a
+        config_b_path = cfg_b
+        temp_to_delete.extend([cleanup_a, cleanup_b])
 
     print(f"[test] binary: {binary}")
     if config_a_path:
@@ -439,6 +580,7 @@ def main() -> int:
         b = start_peer(
             name="B",
             binary=binary,
+            workdir=workdir_b,
             port=args.port_b,
             peer_id=args.id_b,
             log_level=args.log_level,
@@ -452,6 +594,7 @@ def main() -> int:
         a = start_peer(
             name="A",
             binary=binary,
+            workdir=workdir_a,
             port=args.port_a,
             peer_id=args.id_a,
             log_level=args.log_level,
@@ -653,9 +796,12 @@ def main() -> int:
         return 2
 
     finally:
-        if temp_to_delete is not None:
+        for p in temp_to_delete:
             try:
-                temp_to_delete.unlink(missing_ok=True)
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
             except Exception:
                 pass
 

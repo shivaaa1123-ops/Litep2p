@@ -10,6 +10,7 @@ enum class MessageType : uint8_t {
     HANDSHAKE_NOISE      = 0x10,
     ENCRYPTED_DATA       = 0x11,
     APPLICATION_DATA     = 0x12,
+    APPLICATION_ACK      = 0x13,
 
     // Proxy module frames (optional module, but enum values are always reserved).
     PROXY_CONTROL        = 0x30,

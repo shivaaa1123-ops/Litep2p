@@ -28,6 +28,7 @@ adb_*.txt
 /udp_smoke_test_run
 /wan_test_logs
 /message_test_*/
+/tools/harness/runs/
 /repro_work_dir/
 /test_restart_2peer/
 /desktop_peer_repro.log
@@ -37,6 +38,15 @@ adb_*.txt
 /litep2p_peers.sqlite*
 /litep2p_peers.sqlite-*
 /keystore/
+
+# Noise keystores contain private key material and must never be committed.
+**/keystore/noise_keystore.json
+/tools/harness/keystore/
+
+# Vendored upstream sources checked out as nested git repositories.
+# These are NOT tracked here; add them as submodules or fetch them via a
+# bootstrap script instead. Committing them would create broken gitlinks.
+/third_party/
 
 # Local developer tooling settings (may contain API keys)
 /cline_mcp_settings.json

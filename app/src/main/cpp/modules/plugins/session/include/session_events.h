@@ -26,7 +26,21 @@ struct PeerDisconnectEvent {
 
 // --- Event to explicitly connect to a peer ---
 struct ConnectToPeerEvent {
+    // Target peer ID to connect to.
     std::string peerId;
+
+    // When true, bypass reconnect-policy gating for this connect attempt.
+    // Used for remote-initiated recovery signals (e.g., CONNECT_REQUEST) where
+    // suppression can prevent forward progress under network flaps.
+    bool bypass_reconnect_policy = false;
+
+    // Optional debug source tag (e.g., "ui", "signaling_connect_request", "discovery").
+    std::string source;
+
+    ConnectToPeerEvent() = default;
+    explicit ConnectToPeerEvent(std::string peer) : peerId(std::move(peer)) {}
+    ConnectToPeerEvent(std::string peer, bool bypass, std::string src = {})
+        : peerId(std::move(peer)), bypass_reconnect_policy(bypass), source(std::move(src)) {}
 };
 
 // --- Event to send a message to a peer ---
@@ -82,10 +96,20 @@ struct MessageSendCompleteEvent {
     std::string error_message;
 };
 
+// --- Event for LAN discovery result (local endpoint discovered) ---
+struct LanDiscoveryResultEvent {
+    std::string peerId;          // Target peer ID that responded
+    std::string lanIp;           // Discovered LAN IP address (RFC1918)
+    int lanPort = -1;            // Discovered LAN port
+    int hopCount = 0;            // Number of hops in discovery
+    int latencyMs = 0;           // Discovery round-trip latency
+};
+
 // --- Event for FSM state transitions ---
 struct FSMEvent {
     std::string peerId;
     PeerEvent fsmEvent;
+    uint64_t connect_epoch = 0;  // Connection epoch for gating stale events
 };
 
 // --- A variant to hold any of the possible event types ---
@@ -102,7 +126,8 @@ using SessionEvent = std::variant<
     EnhancedDataReceivedEvent,
     EnhancedPeerDisconnectEvent,
     MessageSendCompleteEvent,
-    FSMEvent
+    FSMEvent,
+    LanDiscoveryResultEvent
 >;
 
 #endif // SESSION_EVENTS_H

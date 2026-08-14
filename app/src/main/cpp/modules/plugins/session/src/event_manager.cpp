@@ -276,7 +276,7 @@ void EventManager::processEventQueue(std::function<void(const SessionEvent&)> ev
             std::unique_lock<std::mutex> lock(m_eventMutex);
             // NATIVELOGW("EM_NATIVE: processEventQueue - lock acquired, waiting");
             // Add timeout to prevent indefinite blocking during shutdown
-            bool has_event = m_eventCv.wait_for(lock, std::chrono::milliseconds(QUEUE_WAIT_TIMEOUT_MS), 
+            (void)m_eventCv.wait_for(lock, std::chrono::milliseconds(QUEUE_WAIT_TIMEOUT_MS), 
                               [this] { return !m_eventQueue.empty() || !m_running || m_stopping; });
             
             // NATIVELOGW("EM_NATIVE: processEventQueue - wait returned");
@@ -299,6 +299,12 @@ void EventManager::processEventQueue(std::function<void(const SessionEvent&)> ev
             empty_iterations = 0;  // Reset counter when we get an event
             SessionEvent event = std::move(m_eventQueue.front());
             m_eventQueue.pop();
+            
+            // DIAGNOSTIC: Log queue size after pop, especially when going to empty
+            int remaining_size = m_eventQueue.size();
+            if (remaining_size == 0) {
+                NATIVELOGW(("EM_NATIVE: Queue now EMPTY after pop (processed event #" + std::to_string(event_count + 1) + ")").c_str());
+            }
             
             event_count++;
             

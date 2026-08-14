@@ -6,6 +6,7 @@
 #include <vector>
 #include <jni.h>
 #include <string>
+#include <cstdint>
 
 /**
  * @file jni_bridge.h
@@ -36,6 +37,20 @@ void sendPeersToUI(const std::vector<Peer>& peers);
  * @param message The message to send.
  */
 void sendToLogUI(const std::string& message);
+
+/**
+ * @brief Sends a telemetry JSON snapshot to the UI (Telemetry tab).
+ * @param telemetry_json The JSON payload (no "TELEMETRY" prefix).
+ */
+void sendTelemetryToUI(const std::string& telemetry_json);
+
+/**
+ * @brief Notifies the Android UI that an application-level ACK was received.
+ * @param msg_id The message id being acknowledged.
+ * @param sent_ts_ms Sender-provided send timestamp (epoch ms), if present (else 0).
+ * @param recv_ts_ms Receiver-provided receive timestamp (epoch ms), if present (else 0).
+ */
+void sendMessageAckToUI(const std::string& msg_id, int64_t sent_ts_ms, int64_t recv_ts_ms);
 
 /**
  * @brief Sets the log level.

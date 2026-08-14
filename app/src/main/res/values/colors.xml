@@ -8,4 +8,12 @@
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
     <color name="red">#FF0000</color>
+
+    <!-- Peer status colors (UI peers list) -->
+    <color name="peer_status_discovered">#FFD32F2F</color>
+    <color name="peer_status_connecting">#FFFFB74D</color>
+    <color name="peer_status_connected">#FFFB8C00</color>
+    <color name="peer_status_handshaking">#FF9CCC65</color>
+    <color name="peer_status_ready">#FF2E7D32</color>
+    <color name="peer_status_disconnected">#FF9E9E9E</color>
 </resources>

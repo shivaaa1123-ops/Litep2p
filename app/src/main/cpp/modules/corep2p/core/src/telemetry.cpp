@@ -2,6 +2,10 @@
 
 #include "logger.h"
 
+#if defined(__ANDROID__)
+#include "../../../plugins/jni/include/jni_bridge.h"
+#endif
+
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -96,6 +100,12 @@ void Telemetry::tick() {
 void Telemetry::flush(const std::string& reason) {
     if (!is_enabled()) return;
     const std::string line = build_flush_json_(reason);
+
+#if defined(__ANDROID__)
+    // Android: push telemetry snapshots to the UI directly (Telemetry tab) instead of logging.
+    sendTelemetryToUI(line);
+#endif
+
     if (m_log_json.load(std::memory_order_acquire)) {
         LOG_INFO("TELEMETRY " + line);
     }
@@ -143,6 +153,35 @@ void Telemetry::observe_hist_ms(const std::string& name, int64_t ms) {
     atomic_update_max(h->max, ms);
 }
 
+void Telemetry::set_peer_connection(const std::string& peer_id, const std::string& connection_path, bool is_connected) {
+    if (!is_enabled()) return;
+    std::lock_guard<std::mutex> lk(m_mu);
+    
+    auto it = m_peer_connections.find(peer_id);
+    if (it == m_peer_connections.end()) {
+        PeerConnectionInfo info;
+        info.peer_id = peer_id;
+        info.connection_path = connection_path;
+        info.is_connected = is_connected;
+        info.connected_at_ms = is_connected ? now_ms() : 0;
+        m_peer_connections[peer_id] = std::move(info);
+    } else {
+        it->second.connection_path = connection_path;
+        it->second.is_connected = is_connected;
+        if (is_connected && it->second.connected_at_ms == 0) {
+            it->second.connected_at_ms = now_ms();
+        } else if (!is_connected) {
+            it->second.connected_at_ms = 0;
+        }
+    }
+}
+
+void Telemetry::remove_peer_connection(const std::string& peer_id) {
+    if (!is_enabled()) return;
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_peer_connections.erase(peer_id);
+}
+
 std::string Telemetry::build_flush_json_(const std::string& reason) {
     const int64_t t = now_ms();
     const int64_t start = m_start_ms.load(std::memory_order_acquire);
@@ -153,6 +192,7 @@ std::string Telemetry::build_flush_json_(const std::string& reason) {
     std::unordered_map<std::string, int64_t> gauges;
     struct HistSnap { int64_t count, sum, min, max; };
     std::unordered_map<std::string, HistSnap> hists;
+    std::vector<PeerConnectionInfo> peer_connections_snapshot;
     std::string engine_id;
     std::string file_path;
     bool include_peer_ids = true;
@@ -187,6 +227,12 @@ std::string Telemetry::build_flush_json_(const std::string& reason) {
                 if (s.max == INT64_MIN) s.max = 0;
             }
             hists.emplace(kv.first, s);
+        }
+        
+        // Snapshot peer connections
+        peer_connections_snapshot.reserve(m_peer_connections.size());
+        for (const auto& kv : m_peer_connections) {
+            peer_connections_snapshot.push_back(kv.second);
         }
     }
 
@@ -228,7 +274,45 @@ std::string Telemetry::build_flush_json_(const std::string& reason) {
             << "\"max\":" << kv.second.max
             << "}";
     }
-    oss << "}";
+    oss << "},";
+    
+    // Per-peer connection info
+    oss << "\"peers\":[";
+    first = true;
+    for (const auto& pc : peer_connections_snapshot) {
+        if (!first) oss << ",";
+        first = false;
+        oss << "{"
+            << "\"peer_id\":\"" << json_escape(pc.peer_id) << "\","
+            << "\"connection_path\":\"" << json_escape(pc.connection_path) << "\","
+            << "\"is_connected\":" << (pc.is_connected ? "true" : "false") << ","
+            << "\"connected_at_ms\":" << pc.connected_at_ms
+            << "}";
+    }
+    oss << "],";
+    
+    // Connection path summary (counts by path type)
+    int lan_direct = 0, wan_hole_punch = 0, turn_relay = 0, signaling_relay = 0, unknown = 0;
+    int total_connected = 0;
+    for (const auto& pc : peer_connections_snapshot) {
+        if (pc.is_connected) {
+            total_connected++;
+            if (pc.connection_path == "LAN_DIRECT") lan_direct++;
+            else if (pc.connection_path == "WAN_HOLE_PUNCH") wan_hole_punch++;
+            else if (pc.connection_path == "TURN_RELAY") turn_relay++;
+            else if (pc.connection_path == "SIGNALING_RELAY") signaling_relay++;
+            else unknown++;
+        }
+    }
+    oss << "\"connection_summary\":{"
+        << "\"total_peers\":" << peer_connections_snapshot.size() << ","
+        << "\"connected\":" << total_connected << ","
+        << "\"lan_direct\":" << lan_direct << ","
+        << "\"wan_hole_punch\":" << wan_hole_punch << ","
+        << "\"turn_relay\":" << turn_relay << ","
+        << "\"signaling_relay\":" << signaling_relay << ","
+        << "\"unknown\":" << unknown
+        << "}";
 
     oss << "}";
     return oss.str();

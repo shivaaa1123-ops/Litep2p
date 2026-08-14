@@ -108,6 +108,16 @@ public:
      */
     const std::string& get_session_id() const { return m_session_id; }
 
+    /**
+     * Derive per-peer transport keys from the Noise session keys.
+     * Uses BLAKE2b KDF (crypto_kdf_derive_from_key) to derive a distinct
+     * key pair so the transport AEAD's nonce space is independent of the
+     * Noise application-data AEAD. Returns false when the session is not
+     * READY (keys not yet derived).
+     */
+    bool get_transport_keys(std::vector<uint8_t>& send_key_out,
+                            std::vector<uint8_t>& recv_key_out) const;
+
 private:
     // Session metadata
     std::string m_peer_id;

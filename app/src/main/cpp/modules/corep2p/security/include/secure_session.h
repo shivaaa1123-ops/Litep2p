@@ -30,6 +30,10 @@ public:
     // Check if handshake is complete and session is ready
     bool is_ready() const;
 
+    // Forward Noise session transport key derivation. See NoiseNKSession::get_transport_keys.
+    bool get_transport_keys(std::vector<uint8_t>& send_key_out,
+                            std::vector<uint8_t>& recv_key_out) const;
+
     // Send a message (automatically encrypted)
     std::string send_message(const std::string& plaintext);
 

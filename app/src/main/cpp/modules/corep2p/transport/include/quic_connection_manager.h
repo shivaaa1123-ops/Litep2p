@@ -7,6 +7,8 @@
 #include <memory>
 #include "../../../plugins/session/include/iudp_connection_manager.h"
 
+class RealQuicTransport; // global forward declaration (picoquic-backed transport)
+
 // QuicConnectionManager implements the UDP interface but uses QUIC framing
 class QuicConnectionManager : public IUdpConnectionManager {
 public:
@@ -25,10 +27,17 @@ public:
     void sendMessageToPeer(const std::string& peer_id, const std::string& message) override;
     void sendRawPacket(const std::string& ip, int port, const std::vector<uint8_t>& data) override;
     void setStunPacketCallback(OnStunPacketCallback callback) override;
+    
+    // Restart socket for network interface change - not fully implemented for QUIC yet
+    bool restartSocket() override { return false; }
 
 private:
     class QuicImpl;
     std::unique_ptr<QuicImpl> m_impl;
+
+    // Real QUIC (picoquic) transport, used when LITEP2P_ENABLE_REAL_QUIC=1.
+    std::unique_ptr<RealQuicTransport> m_real;
+    bool m_using_real = false;
 };
 
 #endif // QUIC_CONNECTION_MANAGER_H

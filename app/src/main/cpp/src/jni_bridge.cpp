@@ -12,6 +12,7 @@
 #include <mutex>
 #include <atomic>
 #include <signal.h>
+#include <fstream>
 
 #if ENABLE_PROXY_MODULE
 #include "proxy_endpoint.h"
@@ -188,6 +189,90 @@ void maybe_configure_noise_keystore_path_from_files_dir(JNIEnv* env, jobject act
     env->DeleteLocalRef(activity_cls);
 }
 
+bool file_readable(const std::string& path) {
+    std::ifstream f(path);
+    return f.good();
+}
+
+void maybe_load_config_from_files_dir(JNIEnv* env, jobject activity) {
+    if (!env || !activity) return;
+
+    ConfigManager& cfg = ConfigManager::getInstance();
+    // If we already loaded a config from disk, don't clobber it.
+    if (!cfg.getConfigPath().empty()) {
+        return;
+    }
+
+    // Optional override (useful for local testing / CI on emulators).
+    if (const char* env_path = std::getenv("LITEP2P_CONFIG_PATH")) {
+        std::string p(env_path);
+        if (!p.empty() && file_readable(p) && cfg.loadConfig(p)) {
+            nativeLog("NATIVE: Loaded config via LITEP2P_CONFIG_PATH=" + p);
+            return;
+        }
+    }
+
+    jclass activity_cls = env->GetObjectClass(activity);
+    if (!activity_cls) return;
+
+    jmethodID mid_get_files_dir = env->GetMethodID(activity_cls, "getFilesDir", "()Ljava/io/File;");
+    if (!mid_get_files_dir) {
+        env->DeleteLocalRef(activity_cls);
+        return;
+    }
+
+    jobject files_dir_file = env->CallObjectMethod(activity, mid_get_files_dir);
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+
+    if (!files_dir_file) {
+        env->DeleteLocalRef(activity_cls);
+        return;
+    }
+
+    jclass file_cls = env->GetObjectClass(files_dir_file);
+    if (!file_cls) {
+        env->DeleteLocalRef(files_dir_file);
+        env->DeleteLocalRef(activity_cls);
+        return;
+    }
+
+    jmethodID mid_get_abs_path = env->GetMethodID(file_cls, "getAbsolutePath", "()Ljava/lang/String;");
+    if (!mid_get_abs_path) {
+        env->DeleteLocalRef(file_cls);
+        env->DeleteLocalRef(files_dir_file);
+        env->DeleteLocalRef(activity_cls);
+        return;
+    }
+
+    jstring dir_str = static_cast<jstring>(env->CallObjectMethod(files_dir_file, mid_get_abs_path));
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+
+    const std::string dir = jstring_to_utf8(env, dir_str);
+    if (!dir.empty()) {
+        const std::string config_path = dir + "/config.json";
+        if (file_readable(config_path)) {
+            if (cfg.loadConfig(config_path)) {
+                nativeLog("NATIVE: Loaded config from " + config_path);
+            } else {
+                nativeLog("NATIVE: Found config.json but failed to load: " + config_path);
+            }
+        } else {
+            nativeLog("NATIVE: No config.json found at " + config_path + "; using built-in defaults");
+        }
+    }
+
+    if (dir_str) env->DeleteLocalRef(dir_str);
+    env->DeleteLocalRef(file_cls);
+    env->DeleteLocalRef(files_dir_file);
+    env->DeleteLocalRef(activity_cls);
+}
+
 } // namespace
 #endif
 
@@ -221,6 +306,7 @@ namespace {
 
     std::mutex g_engine_state_mutex;
     std::atomic<EngineLifecycleState> g_engine_state{EngineLifecycleState::STOPPED};
+    std::thread g_stop_completion_thread;
 
     const char* stateToString(EngineLifecycleState s) {
         switch (s) {
@@ -243,6 +329,10 @@ static jclass g_peerInfoClass = nullptr;
 static jmethodID g_peerInfoCtor = nullptr;
 static jclass g_loggerClass = nullptr;
 static jmethodID g_addLogMethod = nullptr;
+static jclass g_telemetryStoreClass = nullptr;
+static jmethodID g_addTelemetryJsonMethod = nullptr;
+static jclass g_messageTraceStoreClass = nullptr;
+static jmethodID g_onAckReceivedMethod = nullptr;
 
 namespace {
     std::mutex g_jni_cache_mutex;
@@ -273,6 +363,9 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 
 extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
     (void)reserved;
+    if (g_stop_completion_thread.joinable()) {
+        g_stop_completion_thread.join();
+    }
     jni_helpers_on_unload(vm);
 }
 
@@ -289,6 +382,12 @@ Java_com_zeengal_litep2p_MainActivity_nativeStartLiteP2PWithPeerId(JNIEnv* env, 
             return env->NewStringUTF(msg.c_str());
         }
         g_engine_state.store(EngineLifecycleState::STARTING, std::memory_order_release);
+    }
+
+    // A completed stop callback may still be returning through JNI even though
+    // the engine state is STOPPED. Join it before starting a new lifecycle.
+    if (g_stop_completion_thread.joinable()) {
+        g_stop_completion_thread.join();
     }
     
     if (!jniBridgeInit(env)) {
@@ -325,6 +424,15 @@ Java_com_zeengal_litep2p_MainActivity_nativeStartLiteP2PWithPeerId(JNIEnv* env, 
     env->ReleaseStringUTFChars(peerId, peerIdStr);
 
 #ifdef __ANDROID__
+    // Load an on-device config.json first (if present) so Android behavior matches desktop.
+    // This must happen BEFORE we inject any Android-specific defaults into the ConfigManager.
+    maybe_load_config_from_files_dir(env, thiz);
+
+    // Ensure the Noise keystore path is writable on Android (default "keystore" is relative
+    // and commonly unwritable). This must run after config load so isNoiseNKEnabled() reflects
+    // the active config.
+    maybe_configure_noise_keystore_path_from_files_dir(env, thiz);
+
     // If peer DB is enabled but no explicit path is configured, inject a safe default
     // using the app-private files directory.
     maybe_configure_peer_db_path_from_files_dir(env, thiz);
@@ -469,7 +577,10 @@ Java_com_zeengal_litep2p_MainActivity_nativeStopLiteP2P(JNIEnv* env, jobject /* 
     std::future<void> stopFuture = g_sessionManager.stopAsync();
 
     // Create a new thread to wait for the engine to stop and then notify the UI
-    std::thread([](std::future<void> future) {
+    if (g_stop_completion_thread.joinable()) {
+        g_stop_completion_thread.join();
+    }
+    g_stop_completion_thread = std::thread([](std::future<void> future) {
         future.wait(); // Wait for the stop operation to complete
 
         nativeLog("NATIVE: LiteP2P engine stopped.");
@@ -511,7 +622,7 @@ Java_com_zeengal_litep2p_MainActivity_nativeStopLiteP2P(JNIEnv* env, jobject /* 
                 }
             }
         }
-    }, std::move(stopFuture)).detach();
+    }, std::move(stopFuture));
 
     // Check for exceptions after calling stopAsync
     if (env->ExceptionCheck()) {
@@ -700,7 +811,7 @@ bool jniBridgeInit(JNIEnv* env) {
         safeDeleteGlobalRef(env, (jobject&)newMainActivityClass);
         return false;
     }
-    newPeerInfoCtor = env->GetMethodID(newPeerInfoClass, "<init>", "(Ljava/lang/String;Ljava/lang/String;IIZLjava/lang/String;)V");
+    newPeerInfoCtor = env->GetMethodID(newPeerInfoClass, "<init>", "(Ljava/lang/String;Ljava/lang/String;IIZLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
     if (!newPeerInfoCtor) {
         nativeLog("JNI_BRIDGE: Failed to get PeerInfo constructor method ID");
         if (env->ExceptionCheck()) {
@@ -749,16 +860,70 @@ bool jniBridgeInit(JNIEnv* env) {
         return false;
     }
 
+    // TelemetryStore class (optional but recommended)
+    jclass localTelemetryStoreClass = env->FindClass("com/zeengal/litep2p/TelemetryStore");
+    jclass newTelemetryStoreClass = nullptr;
+    jmethodID newAddTelemetryJsonMethod = nullptr;
+    if (localTelemetryStoreClass) {
+        newTelemetryStoreClass = (jclass)env->NewGlobalRef(localTelemetryStoreClass);
+        env->DeleteLocalRef(localTelemetryStoreClass);
+        if (newTelemetryStoreClass) {
+            newAddTelemetryJsonMethod = env->GetStaticMethodID(newTelemetryStoreClass, "addTelemetryJson", "(Ljava/lang/String;)V");
+            if (!newAddTelemetryJsonMethod) {
+                nativeLog("JNI_BRIDGE: TelemetryStore.addTelemetryJson not found (telemetry UI updates disabled)");
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                }
+            }
+        } else {
+            nativeLog("JNI_BRIDGE: Failed to create global ref for TelemetryStore class");
+        }
+    } else {
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
+
+    // MessageTraceStore class (optional)
+    jclass localMessageTraceStoreClass = env->FindClass("com/zeengal/litep2p/MessageTraceStore");
+    jclass newMessageTraceStoreClass = nullptr;
+    jmethodID newOnAckReceivedMethod = nullptr;
+    if (localMessageTraceStoreClass) {
+        newMessageTraceStoreClass = (jclass)env->NewGlobalRef(localMessageTraceStoreClass);
+        env->DeleteLocalRef(localMessageTraceStoreClass);
+        if (newMessageTraceStoreClass) {
+            newOnAckReceivedMethod = env->GetStaticMethodID(newMessageTraceStoreClass, "onAckReceived", "(Ljava/lang/String;JJ)V");
+            if (!newOnAckReceivedMethod) {
+                nativeLog("JNI_BRIDGE: MessageTraceStore.onAckReceived not found (message ACK tracing disabled)");
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                }
+            }
+        } else {
+            nativeLog("JNI_BRIDGE: Failed to create global ref for MessageTraceStore class");
+        }
+    } else {
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+        }
+    }
+
     // If we ever re-init (e.g., future code calls cleanup explicitly), drop existing refs first.
     safeDeleteGlobalRef(env, (jobject&)g_p2pClass);
     safeDeleteGlobalRef(env, (jobject&)g_mainActivityClass);
     safeDeleteGlobalRef(env, (jobject&)g_peerInfoClass);
     safeDeleteGlobalRef(env, (jobject&)g_loggerClass);
+    safeDeleteGlobalRef(env, (jobject&)g_telemetryStoreClass);
+    safeDeleteGlobalRef(env, (jobject&)g_messageTraceStoreClass);
 
     g_p2pClass = newP2pClass;
     g_mainActivityClass = newMainActivityClass;
     g_peerInfoClass = newPeerInfoClass;
     g_loggerClass = newLoggerClass;
+    g_telemetryStoreClass = newTelemetryStoreClass;
+    g_messageTraceStoreClass = newMessageTraceStoreClass;
 
     g_onPeersUpdated = newOnPeersUpdated;
     g_onEngineStartComplete = newOnEngineStartComplete;
@@ -766,6 +931,8 @@ bool jniBridgeInit(JNIEnv* env) {
     g_onMessageReceived = newOnMessageReceived;
     g_peerInfoCtor = newPeerInfoCtor;
     g_addLogMethod = newAddLogMethod;
+    g_addTelemetryJsonMethod = newAddTelemetryJsonMethod;
+    g_onAckReceivedMethod = newOnAckReceivedMethod;
 
     g_jni_cache_initialized = true;
     nativeLog("JNI_BRIDGE: Initialization complete.");
@@ -783,6 +950,8 @@ void jniBridgeCleanup(JNIEnv* env) {
     safeDeleteGlobalRef(env, (jobject&)g_mainActivityClass);
     safeDeleteGlobalRef(env, (jobject&)g_peerInfoClass);
     safeDeleteGlobalRef(env, (jobject&)g_loggerClass);
+    safeDeleteGlobalRef(env, (jobject&)g_telemetryStoreClass);
+    safeDeleteGlobalRef(env, (jobject&)g_messageTraceStoreClass);
 
     g_onPeersUpdated = nullptr;
     g_onEngineStartComplete = nullptr;
@@ -790,6 +959,8 @@ void jniBridgeCleanup(JNIEnv* env) {
     g_onMessageReceived = nullptr;
     g_peerInfoCtor = nullptr;
     g_addLogMethod = nullptr;
+    g_addTelemetryJsonMethod = nullptr;
+    g_onAckReceivedMethod = nullptr;
 
     g_jni_cache_initialized = false;
 }
@@ -821,8 +992,27 @@ void sendPeersToUI(const std::vector<Peer>& peers) {
 
     for (size_t i = 0; i < peers.size(); ++i) {
         const Peer& p = peers[i];
-        nativeLog("JNI_BRIDGE: Processing peer " + std::to_string(i) + " - ID: " + p.id + ", IP: " + p.ip + 
-                  ", Port: " + std::to_string(p.port) + ", Network ID: " + p.network_id);
+
+        // UI/debugging: Prefer the active endpoint used for the current session, but fall back to the
+        // latest advertised endpoint when the active one is missing/invalid.
+        // We have seen cases where the UI shows CONNECTED but networkId is "0" (or empty) due to
+        // stale peer records or placeholder endpoints during handoff.
+        std::string effective_network_id = p.network_id;
+        if (effective_network_id.empty() || effective_network_id == "0") {
+            if (!p.advertised_network_id.empty() && p.advertised_network_id != "0") {
+                effective_network_id = p.advertised_network_id;
+            }
+        }
+
+        nativeLog(
+            "JNI_BRIDGE: Processing peer " + std::to_string(i) +
+            " - ID: " + p.id +
+            ", IP: " + p.ip +
+            ", Port: " + std::to_string(p.port) +
+            ", network_id: " + p.network_id +
+            ", advertised_network_id: " + p.advertised_network_id +
+            ", effective_network_id: " + effective_network_id
+        );
         
         jstring jid = env->NewStringUTF(p.id.c_str());
         if (!jid) {
@@ -847,7 +1037,7 @@ void sendPeersToUI(const std::vector<Peer>& peers) {
             return;
         }
         
-        jstring jnetworkId = env->NewStringUTF(p.network_id.c_str());
+        jstring jnetworkId = env->NewStringUTF(effective_network_id.c_str());
         if (!jnetworkId) {
             nativeLog("JNI_ERROR: Failed to create jstring for peer network ID.");
             if (env->ExceptionCheck()) {
@@ -864,8 +1054,56 @@ void sendPeersToUI(const std::vector<Peer>& peers) {
         nativeLog("JNI_BRIDGE: Calling g_sessionManager.isPeerConnected for peer: " + p.id);
         bool is_connected = g_sessionManager.isPeerConnected(p.id);
         nativeLog("JNI_BRIDGE: g_sessionManager.isPeerConnected returned " + std::to_string(is_connected) + " for peer: " + p.id);
+
+        if (is_connected && (effective_network_id.empty() || effective_network_id == "0")) {
+            nativeLog("JNI_WARN: Peer is CONNECTED but networkId is missing/invalid (effective_network_id='" + effective_network_id + "') peer=" + p.id);
+        }
+
+        // Also expose FSM state to UI so it can show CONNECTING/HANDSHAKING/READY promptly.
+        std::string fsm_state = g_sessionManager.getPeerFsmState(p.id);
+        jstring jFsmState = env->NewStringUTF(fsm_state.c_str());
+        if (!jFsmState) {
+            nativeLog("JNI_ERROR: Failed to create jstring for peer FSM state.");
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+            env->DeleteLocalRef(jid);
+            env->DeleteLocalRef(jip);
+            env->DeleteLocalRef(jnetworkId);
+            env->DeleteLocalRef(arr);
+            return;
+        }
         
-        jobject obj = env->NewObject(g_peerInfoClass, g_peerInfoCtor, jid, jip, (jint)p.port, (jint)p.latency, (jboolean)is_connected, jnetworkId);
+        // Get connection type (LAN/WAN/RELAY/UNKNOWN)
+        std::string connection_type = g_sessionManager.getPeerConnectionType(p.id);
+        jstring jConnectionType = env->NewStringUTF(connection_type.c_str());
+        if (!jConnectionType) {
+            nativeLog("JNI_ERROR: Failed to create jstring for peer connection type.");
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+            env->DeleteLocalRef(jid);
+            env->DeleteLocalRef(jip);
+            env->DeleteLocalRef(jnetworkId);
+            env->DeleteLocalRef(jFsmState);
+            env->DeleteLocalRef(arr);
+            return;
+        }
+        
+        jobject obj = env->NewObject(
+            g_peerInfoClass,
+            g_peerInfoCtor,
+            jid,
+            jip,
+            (jint)p.port,
+            (jint)p.latency,
+            (jboolean)is_connected,
+            jnetworkId,
+            jFsmState,
+            jConnectionType
+        );
         if (!obj) {
             nativeLog("JNI_ERROR: Failed to create PeerInfo object for peer " + p.id);
             if (env->ExceptionCheck()) {
@@ -875,6 +1113,8 @@ void sendPeersToUI(const std::vector<Peer>& peers) {
             env->DeleteLocalRef(jid);
             env->DeleteLocalRef(jip);
             env->DeleteLocalRef(jnetworkId);
+            env->DeleteLocalRef(jFsmState);
+            env->DeleteLocalRef(jConnectionType);
             env->DeleteLocalRef(arr);
             return;
         }
@@ -887,6 +1127,8 @@ void sendPeersToUI(const std::vector<Peer>& peers) {
             env->DeleteLocalRef(jid);
             env->DeleteLocalRef(jip);
             env->DeleteLocalRef(jnetworkId);
+            env->DeleteLocalRef(jFsmState);
+            env->DeleteLocalRef(jConnectionType);
             env->DeleteLocalRef(obj);
             env->DeleteLocalRef(arr);
             return;
@@ -895,6 +1137,8 @@ void sendPeersToUI(const std::vector<Peer>& peers) {
         env->DeleteLocalRef(jid);
         env->DeleteLocalRef(jip);
         env->DeleteLocalRef(jnetworkId);
+        env->DeleteLocalRef(jFsmState);
+        env->DeleteLocalRef(jConnectionType);
         env->DeleteLocalRef(obj);
     }
 
@@ -918,4 +1162,31 @@ void sendToLogUI(const std::string& message) {
     jstring jmsg = env->NewStringUTF(message.c_str());
     env->CallStaticVoidMethod(g_loggerClass, g_addLogMethod, jmsg);
     env->DeleteLocalRef(jmsg);
+}
+
+void sendTelemetryToUI(const std::string& telemetry_json) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_telemetryStoreClass || !g_addTelemetryJsonMethod) return;
+    jstring jjson = env->NewStringUTF(telemetry_json.c_str());
+    env->CallStaticVoidMethod(g_telemetryStoreClass, g_addTelemetryJsonMethod, jjson);
+    if (env->ExceptionCheck()) {
+        // Best-effort: do not crash the engine if UI side is missing/broken.
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jjson);
+}
+
+void sendMessageAckToUI(const std::string& msg_id, int64_t sent_ts_ms, int64_t recv_ts_ms) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_messageTraceStoreClass || !g_onAckReceivedMethod) return;
+
+    jstring jMsgId = env->NewStringUTF(msg_id.c_str());
+    env->CallStaticVoidMethod(g_messageTraceStoreClass, g_onAckReceivedMethod, jMsgId,
+                              static_cast<jlong>(sent_ts_ms), static_cast<jlong>(recv_ts_ms));
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jMsgId);
 }

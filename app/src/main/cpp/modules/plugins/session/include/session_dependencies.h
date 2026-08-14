@@ -58,13 +58,11 @@ public:
 
 // Default factory implementation
 class DefaultSessionDependenciesFactory : public ISessionDependenciesFactory {
-private:
-    int m_batchDelayMs;
-    int m_maxMessages;
-    
 public:
-    DefaultSessionDependenciesFactory(int batchDelayMs = 100, int maxMessages = 10) 
-        : m_batchDelayMs(batchDelayMs), m_maxMessages(maxMessages) {}
+    DefaultSessionDependenciesFactory(int batchDelayMs = 100, int maxMessages = 10) {
+        (void)batchDelayMs;
+        (void)maxMessages;
+    }
     
     std::unique_ptr<PeerIndex> createPeerIndex() override {
         return std::make_unique<PeerIndex>();

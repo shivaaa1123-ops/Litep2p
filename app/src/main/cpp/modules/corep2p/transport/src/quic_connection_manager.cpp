@@ -1,6 +1,7 @@
 #include "quic_connection_manager.h"
 #include "quic_message.h"
 #include "udp_message.h" // For STUN check
+#include "real_quic_transport.h"
 #include "logger.h"
 #include "crypto_utils.h"
 #include "constants.h"
@@ -24,9 +25,7 @@ public:
     ~QuicImpl() { stop(); }
 
     bool startServer(int port, OnDataCallback on_data, OnDisconnectCallback on_disconnect) {
-        std::cout << "DEBUG: QuicImpl::startServer called on port " << port << std::endl;
         if (m_running) {
-            std::cout << "DEBUG: QuicImpl::startServer - already running" << std::endl;
             return false;
         }
         m_on_data = on_data;
@@ -36,7 +35,6 @@ public:
         if (m_sock < 0) {
             std::string err = "QUIC Error: Failed to create socket: " + std::string(strerror(errno));
             nativeLog(err);
-            std::cout << "DEBUG: " << err << std::endl;
             return false;
         }
 
@@ -44,7 +42,6 @@ public:
         if (setsockopt(m_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
             std::string err = "QUIC Error: setsockopt(SO_REUSEADDR) failed: " + std::string(strerror(errno));
             nativeLog(err);
-            std::cout << "DEBUG: " << err << std::endl;
             close(m_sock);
             m_sock = -1;
             return false;
@@ -55,18 +52,15 @@ public:
         if (setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) < 0) {
             std::string err = "QUIC Warning: Failed to set SO_RCVBUF: " + std::string(strerror(errno));
             nativeLog(err);
-            std::cout << "DEBUG: " << err << std::endl;
         }
         if (setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) < 0) {
             std::string err = "QUIC Warning: Failed to set SO_SNDBUF: " + std::string(strerror(errno));
             nativeLog(err);
-            std::cout << "DEBUG: " << err << std::endl;
         }
         
         if (fcntl(m_sock, F_SETFL, O_NONBLOCK) < 0) {
             std::string err = "QUIC Error: fcntl(O_NONBLOCK) failed: " + std::string(strerror(errno));
             nativeLog(err);
-            std::cout << "DEBUG: " << err << std::endl;
             close(m_sock);
             m_sock = -1;
             return false;
@@ -79,7 +73,6 @@ public:
         if (bind(m_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
             std::string err = "QUIC Error: Failed to bind socket: " + std::string(strerror(errno));
             nativeLog(err);
-            std::cout << "DEBUG: " << err << std::endl;
             close(m_sock);
             m_sock = -1;
             return false;
@@ -89,7 +82,6 @@ public:
         m_listenThread = std::thread(&QuicImpl::listenLoop, this);
 
         nativeLog("QUIC server started successfully on port " + std::to_string(port));
-        std::cout << "DEBUG: QUIC server started successfully on port " << port << std::endl;
         return true;
     }
 
@@ -106,7 +98,6 @@ public:
     }
 
     void sendMessageToPeer(const std::string& peer_id, const std::string& message) {
-        std::cout << "DEBUG: QuicImpl::sendMessageToPeer called for " << peer_id << std::endl;
         size_t colon_pos = peer_id.find(':');
         if (colon_pos == std::string::npos) {
             nativeLog("QUIC Error: Invalid peer ID format.");
@@ -128,20 +119,19 @@ public:
         // Generate a pseudo connection ID based on peer hash for now
         uint64_t conn_id = std::hash<std::string>{}(peer_id);
 
-        std::string encrypted_msg = encrypt_message_udp(message);
+        std::string encrypted_msg = encrypt_message_for_peer(peer_id, message);
         
         if (QuicMessage::send(m_sock, ip, port, conn_id, pkt_num, encrypted_msg)) {
-            LOG_INFO("QUIC_SEND_SUCCESS: Sent packet #" + std::to_string(pkt_num) + " to " + peer_id);
-            std::cout << "DEBUG: QUIC_SEND_SUCCESS" << std::endl;
+            LOG_DEBUG("QUIC_SEND_SUCCESS: Sent packet #" + std::to_string(pkt_num) + " to " + peer_id);
         } else {
-            LOG_INFO("QUIC_SEND_ERROR: Failed to send to " + peer_id);
-            std::cout << "DEBUG: QUIC_SEND_ERROR" << std::endl;
+            LOG_DEBUG("QUIC_SEND_ERROR: Failed to send to " + peer_id);
         }
     }
 
     // Add connectToPeer implementation to QuicImpl
     bool connectToPeer(const std::string& ip, int port) {
-        std::cout << "DEBUG: QuicImpl::connectToPeer called for " << ip << ":" << port << std::endl;
+        (void)ip;
+        (void)port;
         // For QUIC/UDP, "connecting" is just ensuring we can send to the address.
         // We could send a dummy packet or handshake here if needed.
         // For now, we just return true to satisfy the interface.
@@ -205,9 +195,9 @@ private:
                 std::string payload;
                 
                 if (QuicMessage::parsePacket(packet_data, header, payload)) {
-                    std::string decrypted_data = decrypt_message_udp(payload);
+                    std::string decrypted_data = decrypt_message_for_peer(peer_id, payload);
                     if (!decrypted_data.empty() && m_on_data) {
-                        LOG_INFO("QUIC_RECEIVE: Pkt#" + std::to_string(header.packet_number) + " from " + peer_id);
+                        LOG_DEBUG("QUIC_RECEIVE: Pkt#" + std::to_string(header.packet_number) + " from " + peer_id);
                         m_on_data(peer_id, decrypted_data);
                     }
                 } else {
@@ -231,18 +221,97 @@ private:
 };
 
 QuicConnectionManager::QuicConnectionManager() : m_impl(std::make_unique<QuicImpl>()) {
-    std::cout << "DEBUG: QuicConnectionManager constructor called" << std::endl;
+#if defined(LITEP2P_ENABLE_REAL_QUIC)
+    // Real QUIC (picoquic) transport; constructed lazily so builds without
+    // the library still work through the legacy path.
+    if (RealQuicTransport::available()) {
+        m_real = std::make_unique<RealQuicTransport>();
+    }
+#endif
 }
 QuicConnectionManager::~QuicConnectionManager() = default;
-bool QuicConnectionManager::startServer(int port, OnDataCallback on_data, OnDisconnectCallback on_disconnect) { 
-    std::cout << "DEBUG: QuicConnectionManager::startServer called" << std::endl;
-    return m_impl->startServer(port, on_data, on_disconnect); 
+
+bool QuicConnectionManager::startServer(int port, OnDataCallback on_data,
+                                        OnDisconnectCallback on_disconnect) {
+#if defined(LITEP2P_ENABLE_REAL_QUIC)
+    if (m_real) {
+        if (m_using_real) return false;
+
+        OnDataCallback wrapped_data = [this, on_data](const std::string& peer_id,
+                                                      const std::string& payload) {
+            // Parity with the UDP/mock-QUIC paths: the session layer expects
+            // transport-layer decryption here.
+            const std::string decrypted = decrypt_message_udp(payload);
+            if (!decrypted.empty() && on_data) {
+                on_data(peer_id, decrypted);
+            }
+        };
+        const bool ok = m_real->start(static_cast<uint16_t>(port), wrapped_data,
+                                      nullptr /* on_ready */, on_disconnect);
+        if (ok) {
+            m_using_real = true;
+            LOG_INFO("QUIC: using real QUIC transport (picoquic)");
+            return true;
+        }
+        LOG_WARN("QUIC: real QUIC failed to start; falling back to legacy QUIC framing");
+        m_real.reset();
+    }
+#endif
+    return m_impl->startServer(port, on_data, on_disconnect);
 }
-void QuicConnectionManager::stop() { m_impl->stop(); }
-bool QuicConnectionManager::connectToPeer(const std::string& ip, int port) { 
-    std::cout << "DEBUG: QuicConnectionManager::connectToPeer called for " << ip << ":" << port << std::endl;
-    return m_impl->connectToPeer(ip, port); 
+
+void QuicConnectionManager::stop() {
+#if defined(LITEP2P_ENABLE_REAL_QUIC)
+    if (m_using_real && m_real) {
+        m_real->stop();
+        m_using_real = false;
+        return;
+    }
+#endif
+    m_impl->stop();
 }
-void QuicConnectionManager::sendMessageToPeer(const std::string& peer_id, const std::string& message) { m_impl->sendMessageToPeer(peer_id, message); }
-void QuicConnectionManager::sendRawPacket(const std::string& ip, int port, const std::vector<uint8_t>& data) { m_impl->sendRawPacket(ip, port, data); }
-void QuicConnectionManager::setStunPacketCallback(OnStunPacketCallback callback) { m_impl->setStunPacketCallback(callback); }
+
+bool QuicConnectionManager::connectToPeer(const std::string& ip, int port) {
+#if defined(LITEP2P_ENABLE_REAL_QUIC)
+    if (m_using_real && m_real) {
+        const std::string peer_id = ip + ":" + std::to_string(port);
+        return m_real->connect(peer_id, ip, static_cast<uint16_t>(port));
+    }
+#endif
+    return m_impl->connectToPeer(ip, port);
+}
+
+void QuicConnectionManager::sendMessageToPeer(const std::string& peer_id,
+                                              const std::string& message) {
+#if defined(LITEP2P_ENABLE_REAL_QUIC)
+    if (m_using_real && m_real) {
+        const std::string encrypted = encrypt_message_udp(message);
+        if (encrypted.empty()) return;
+        m_real->send(peer_id, encrypted);
+        return;
+    }
+#endif
+    m_impl->sendMessageToPeer(peer_id, message);
+}
+
+void QuicConnectionManager::sendRawPacket(const std::string& ip, int port,
+                                          const std::vector<uint8_t>& data) {
+#if defined(LITEP2P_ENABLE_REAL_QUIC)
+    if (m_using_real) {
+        // Raw/STUN packets are handled by the UDP manager; ignore here.
+        return;
+    }
+#endif
+    m_impl->sendRawPacket(ip, port, data);
+}
+
+void QuicConnectionManager::setStunPacketCallback(OnStunPacketCallback callback) {
+#if defined(LITEP2P_ENABLE_REAL_QUIC)
+    if (m_using_real) {
+        // STUN is handled by the UDP connection manager, not QUIC.
+        return;
+    }
+#endif
+    m_impl->setStunPacketCallback(callback);
+}
+

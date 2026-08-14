@@ -9,7 +9,11 @@
 #include <thread>
 #include <chrono>
 
-#if !BUILD_TARGET_DESKTOP
+// epoll is Linux-specific (Android/bionic and Linux). On macOS/Windows there is
+// no <sys/epoll.h>, so select the stub unless we are building a Linux/Android
+// target. This also keeps IDEs parsing the file on macOS from flagging the
+// Linux-only includes as missing.
+#if !BUILD_TARGET_DESKTOP && defined(__linux__)
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -159,26 +163,34 @@ private:
             }
             for (auto& t : tasks) t();
 
+            // Collect due timers under the lock, then execute them outside the
+            // lock. Running a timer task may call back into runAfter/runEvery (or
+            // otherwise re-enter the reactor), so holding m_timerMutex while
+            // executing the task risks a deadlock. Repeating timers are rescheduled
+            // afterwards under a fresh lock acquisition.
+            std::vector<Timer> due_timers;
             {
                 std::lock_guard<std::mutex> lock(m_timerMutex);
-                long long now = nowMs();
+                const long long now = nowMs();
                 auto it = m_timers.begin();
                 while (it != m_timers.end() && it->first <= now) {
-                    Timer t = it->second;
+                    due_timers.push_back(it->second);
                     it = m_timers.erase(it);
-                    
-                    // Release lock before executing task to prevent deadlock
-                    lock.~lock_guard();
-                    if(t.task) t.task();
-                    
-                    // Reacquire lock for multimap operations
-                    new (&lock) std::lock_guard<std::mutex>(m_timerMutex);
-                    
-                    // If this is a repeating timer, reschedule it
+                }
+            }
+
+            for (const Timer& t : due_timers) {
+                if (t.task) t.task();
+            }
+
+            if (!due_timers.empty()) {
+                std::lock_guard<std::mutex> lock(m_timerMutex);
+                const long long now = nowMs();
+                for (const Timer& t : due_timers) {
                     if (t.intervalMs > 0) {
-                        t.expirationMs = now + t.intervalMs;
-                        m_timers.insert({t.expirationMs, t});
-                        it = m_timers.lower_bound(now);
+                        Timer rescheduled = t;
+                        rescheduled.expirationMs = now + t.intervalMs;
+                        m_timers.insert({rescheduled.expirationMs, rescheduled});
                     }
                 }
             }

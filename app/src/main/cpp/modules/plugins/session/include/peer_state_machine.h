@@ -8,8 +8,15 @@
 #include "peer.h"
 #include "../../routing/include/peer_tier_manager.h"
 
-// Maximum number of handshake retries before giving up
-static constexpr int MAX_HANDSHAKE_RETRIES = 3;
+// =======================================================
+// Self-Healing Configuration Constants
+// =======================================================
+// These values are tuned for rugged, self-healing P2P networks:
+// - MAX_HANDSHAKE_RETRIES: Increased from 3 to 5 for better resilience
+//   during network transitions (WiFi<->LTE handoffs)
+// - MAX_CONNECT_RETRIES: Matches handshake retries for consistency
+static constexpr int MAX_HANDSHAKE_RETRIES = 5;
+static constexpr int MAX_CONNECT_RETRIES = 5;
 
 // =======================================================
 // Authoritative Peer State (FSM owns this exclusively)
@@ -43,7 +50,9 @@ enum class PeerEvent {
     TIMEOUT,
     LATENCY_UPDATE,
     RETRY_EXHAUSTED,
-    SHUTDOWN
+    SHUTDOWN,
+    // RUGGED RECOVERY: Force immediate recovery attempt (resets counters)
+    RECOVERY_REQUESTED
 };
 
 // =======================================================
@@ -56,7 +65,9 @@ enum class PeerAction {
     RETRY_HANDSHAKE,
     FLUSH_QUEUED_MESSAGES,
     CLEANUP_RESOURCES,
-    RECORD_METRICS
+    RECORD_METRICS,
+    // RUGGED RECOVERY: Trigger aggressive reconnect
+    TRIGGER_RECOVERY
 };
 
 // =======================================================
@@ -84,6 +95,11 @@ struct PeerContext {
     // Identity
     std::string peer_id;
     std::string network_id;
+
+    // Remote process identity (changes on remote restart).
+    // Used by the control plane to decide when to tear down cached secure sessions
+    // even if the remote static public key is unchanged.
+    uint64_t remote_boot_id = 0;
 
     // FSM state
     PeerState state = PeerState::UNKNOWN;
@@ -113,11 +129,28 @@ struct PeerContext {
     std::chrono::steady_clock::time_point last_connect_attempt;
     std::string last_connect_target_network_id;
 
+    // Connection epoch: Monotonic counter incremented on each new connect attempt.
+    // Used to gate stale events from previous connection attempts during network transitions.
+    // Any event (handshake packets, CONNECT_ACK, decrypt results) that doesn't match
+    // the current connect_epoch is ignored, preventing stale packets from confusing the FSM.
+    uint64_t connect_epoch = 0;
+
     // Message queue (FSM owns lifecycle)
     std::deque<std::string> pending_messages;
     
     // Temporary storage for handshake message
     std::string pending_handshake_message;
+    
+    // Flag indicating handshake arrived via relay - allows resetting READY session
+    // This enables re-connection when peer loses direct path (e.g., WiFi toggle)
+    bool is_relay_reconnect = false;
+    
+    // Timestamp of last successful handshake completion - used for cooldown
+    // to prevent infinite handshake loops when both sides relay-reconnect
+    std::chrono::steady_clock::time_point last_handshake_completed;
+    
+    // Timestamp of last proactive relay escalation - throttle to once per handshake attempt
+    std::chrono::steady_clock::time_point last_relay_escalation;
 
     explicit PeerContext(const std::string& id = "",
                          const std::string& network = "")
@@ -127,6 +160,8 @@ struct PeerContext {
         last_state_change = now;
         last_handshake_attempt = now;
         last_connect_attempt = now;
+        last_handshake_completed = std::chrono::steady_clock::time_point{};  // Epoch (never completed)
+        last_relay_escalation = std::chrono::steady_clock::time_point{};  // Epoch (never escalated)
     }
 };
 

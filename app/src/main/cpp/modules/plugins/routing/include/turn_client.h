@@ -38,5 +38,8 @@ private:
     int m_socket{-1};
     
     bool sendRequest(const STUNMessage& req, STUNMessage& res);
-    void addAuthAttributes(STUNMessage& msg, const std::string& realm, const std::string& nonce);
+    bool sendAuthenticatedRequest(const STUNMessage& req, STUNMessage& res);
+    bool buildAuthenticatedMessage(const STUNMessage& msg, std::vector<uint8_t>& raw);
+    void addAuthAttributes(STUNMessage& msg, const std::string& realm, const std::string& nonce,
+                           const uint8_t* unused1 = nullptr, const uint8_t* unused2 = nullptr);
 };

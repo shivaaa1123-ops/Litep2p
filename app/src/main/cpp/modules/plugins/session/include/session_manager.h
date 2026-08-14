@@ -37,9 +37,21 @@ public:
     void stop();
     std::future<void> stopAsync();
     void connectToPeer(const std::string& peer_id);
+    // Bypass reconnect-policy gating for this connect attempt (use sparingly).
+    // Intended for remote-initiated recovery signals (e.g., CONNECT_REQUEST) where suppression
+    // can prevent progress after interface/NAT mapping changes.
+    void connectToPeer(const std::string& peer_id, bool bypass_reconnect_policy);
     void addPeer(const std::string& peer_id, const std::string& network_id);
     void sendMessageToPeer(const std::string& peer_id, const std::string& message);
     bool isPeerConnected(const std::string& peer_id) const;
+
+    // Expose the Peer FSM state as a stable string for UI/debugging.
+    // This is intentionally best-effort and returns "UNKNOWN" if the peer context is missing.
+    std::string getPeerFsmState(const std::string& peer_id) const;
+    
+    // Get the connection type for a peer: "LAN", "WAN", "RELAY", or "UNKNOWN".
+    // Returns the type of the current endpoint being used for communication.
+    std::string getPeerConnectionType(const std::string& peer_id) const;
     
     // Set callback for received messages from peers (peer_id, message)
     void setMessageReceivedCallback(std::function<void(const std::string&, const std::string&)> cb);

@@ -215,6 +215,12 @@ int ConfigManager::getKeyRotationInterval() const {
     return jsonGetOr<int>(m_config, {"security", "noise_nk_protocol", "key_rotation_interval_hours"}, 24);
 }
 
+std::string ConfigManager::getTransportKeyHex() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return "";
+    return jsonGetOr<std::string>(m_config, {"security", "transport_key"}, "");
+}
+
 bool ConfigManager::isBatchManagerEnabled() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return true;
@@ -683,8 +689,10 @@ std::string ConfigManager::getSignalingUrl() const {
 
 int ConfigManager::getSignalingReconnectIntervalMs() const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_config.is_object()) return 5000;
-    return jsonGetOr<int>(m_config, {"signaling", "reconnect_interval_ms"}, 5000);
+    // Default aggressively for mobile handoffs: transient ENETUNREACH is common and we
+    // want multiple retries inside the strict <=8s recovery window.
+    if (!m_config.is_object()) return 1000;
+    return jsonGetOr<int>(m_config, {"signaling", "reconnect_interval_ms"}, 1000);
 }
 
 bool ConfigManager::isPeerDbEnabled() const {

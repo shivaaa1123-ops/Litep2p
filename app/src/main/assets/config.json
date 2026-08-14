@@ -1,0 +1,109 @@
+{
+    "_comment": [
+        "Android default config for LiteP2P.",
+        "This file is copied to the app's private storage on first launch: <filesDir>/config.json",
+        "After that, you can replace it (e.g., via adb) to keep Android and desktop behavior consistent.",
+        "NOTE: Avoid baking real TURN credentials into the APK.",
+        "NOTE: The desktop version can read repo-root config.json; Android cannot."
+    ],
+    "network": {
+        "default_server_port": 30001,
+        "discovery_port": 30000,
+        "listen_backlog": 5,
+        "select_max_retries": 3
+    },
+    "communication": {
+        "default_protocol": "UDP",
+        "quic": {
+            "enabled": true,
+            "port": 30001,
+            "buffer_size": 1048576
+        },
+        "udp": {
+            "enabled": true,
+            "port": 30001,
+            "buffer_size": 65535,
+            "timeout_ms": 5000,
+            "select_timeout_sec": 1
+        },
+        "tcp": {
+            "enabled": true,
+            "port": 30001,
+            "nodelay": true,
+            "buffer_size": 4096,
+            "connect_timeout_sec": 5,
+            "select_timeout_sec": 1
+        }
+    },
+    "security": {
+        "noise_nk_protocol": {
+            "enabled": true,
+            "mandatory": true,
+            "key_store_path": "keystore",
+            "key_rotation_interval_hours": 24
+        },
+        "selective_encryption_enabled": true
+    },
+    "nat_traversal": {
+        "enabled": true,
+        "mode": "auto",
+        "stun_enabled": true,
+        "stun_timeout_ms": 2000,
+        "upnp_enabled": false,
+        "upnp_timeout_ms": 5000,
+        "upnp_lease_duration_sec": 3600,
+        "hole_punching_enabled": true,
+        "hole_punch_max_attempts": 5,
+        "hole_punch_retry_backoff_ms": 100,
+        "hole_punch_thread_pool_size": 10,
+        "heartbeat_interval_sec": 15,
+        "cleanup_interval_sec": 60,
+        "heartbeat_timeout_ms": 45000,
+        "max_external_port_attempts": 10,
+        "turn_enabled": false,
+        "turn_config": {
+            "server_ip": "TURN_SERVER_IP",
+            "server_port": 3478,
+            "username": "TURN_USERNAME",
+            "password": "TURN_PASSWORD",
+            "realm": "TURN_REALM"
+        },
+        "stun_servers": [
+            {"hostname": "stun.l.google.com", "port": 19302},
+            {"hostname": "stun1.l.google.com", "port": 19302},
+            {"hostname": "stun.stunprotocol.org", "port": 3478}
+        ],
+        "peer_discovery": {
+            "enabled": true,
+            "discovery_interval_ms": 5000,
+            "max_peer_cache": 100,
+            "verified_peer_timeout_ms": 300000
+        }
+    },
+    "signaling": {
+        "enabled": true,
+        "url": "ws://64.227.140.251:8765",
+        "reconnect_interval_ms": 5000
+    },
+    "remote_control": {
+        "enabled": false,
+        "allowed_senders": []
+    },
+    "storage": {
+        "peer_db": {
+            "enabled": false,
+            "path": "",
+            "reconnect_candidate_limit": 2000,
+            "prune_after_days": 15
+        }
+    },
+    "monitoring": {
+        "enabled": false,
+        "telemetry": {
+            "enabled": true,
+            "log_json": false,
+            "flush_interval_ms": 2000,
+            "include_peer_ids": true
+        }
+    }
+}

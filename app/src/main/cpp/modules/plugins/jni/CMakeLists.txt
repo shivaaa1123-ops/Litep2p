@@ -18,8 +18,6 @@ if(JNI_FOUND)
     
     add_library(litep2p_jni OBJECT
         src/jni_helpers.cpp
-        src/p2p_api.cpp
-        src/p2p_entry.cpp
     )
 
     # NOTE:

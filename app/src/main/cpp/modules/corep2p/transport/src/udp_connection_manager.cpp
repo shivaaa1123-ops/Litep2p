@@ -1,5 +1,6 @@
 #include "udp_connection_manager.h"
 #include "udp_message.h"
+#include "device_utils.h"
 #include "logger.h"
 #include "crypto_utils.h"
 #include "constants.h"
@@ -28,7 +29,25 @@ public:
         m_on_disconnect = on_disconnect;
         m_bound_port = port;
 
-        m_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        // IPv6-preferred dual-stack socket: bind AF_INET6 with IPV6_V6ONLY=0
+        // so both IPv6 peers and IPv4 (v4-mapped) peers are accepted. Falls
+        // back to AF_INET when the platform has no usable IPv6.
+        m_sock_family = AF_INET6;
+        m_sock = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (m_sock >= 0) {
+#ifdef IPV6_V6ONLY
+            int v6only = 0;
+            if (setsockopt(m_sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only)) != 0) {
+                // Non-fatal: without dual-stack, IPv6-only still works.
+                nativeLog("UDP Warning: IPV6_V6ONLY=0 failed: " + std::string(strerror(errno)));
+            }
+#endif
+        }
+        if (m_sock < 0) {
+            // IPv4 fallback.
+            m_sock_family = AF_INET;
+            m_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        }
         if (m_sock < 0) {
             nativeLog("UDP Error: Failed to create socket: " + std::string(strerror(errno)));
             return false;
@@ -41,6 +60,12 @@ public:
             m_sock = -1;
             return false;
         }
+#ifdef SO_REUSEPORT
+        // SO_REUSEPORT allows multiple processes to bind to the same port on macOS/BSD.
+        // This prevents "Address already in use" errors when ports are in TIME_WAIT state
+        // or when multiple desktop peers start simultaneously on the same machine.
+        setsockopt(m_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
 
         // Increase socket buffers to 1MB to reduce packet loss during bursts/churn
         int buf_size = 1048576; // 1MB
@@ -50,7 +75,7 @@ public:
         if (setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size))) {
              nativeLog("UDP Warning: Failed to set SO_SNDBUF: " + std::string(strerror(errno)));
         }
-        
+
         if (fcntl(m_sock, F_SETFL, O_NONBLOCK) < 0) {
             nativeLog("UDP Error: fcntl(O_NONBLOCK) failed: " + std::string(strerror(errno)));
             close(m_sock);
@@ -58,25 +83,40 @@ public:
             return false;
         }
 
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
-        if (bind(m_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
-            nativeLog("UDP Error: Failed to bind socket: " + std::string(strerror(errno)));
-            close(m_sock);
-            m_sock = -1;
-            return false;
+        if (m_sock_family == AF_INET6) {
+            sockaddr_in6 addr6{};
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_addr = in6addr_any;
+            addr6.sin6_port = htons(port);
+            if (bind(m_sock, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) < 0) {
+                nativeLog("UDP Error: Failed to bind IPv6 socket: " + std::string(strerror(errno)));
+                close(m_sock);
+                m_sock = -1;
+                return false;
+            }
+        } else {
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = INADDR_ANY;
+            addr.sin_port = htons(port);
+            if (bind(m_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+                nativeLog("UDP Error: Failed to bind socket: " + std::string(strerror(errno)));
+                close(m_sock);
+                m_sock = -1;
+                return false;
+            }
         }
 
         m_running = true;
         m_event_loop_mode = false;
         m_listenThread = std::thread(&UdpImpl::listenLoop, this);
 
-        nativeLog("UDP server started successfully on port " + std::to_string(port) + " (sock_fd=" + std::to_string(m_sock) + ")");
+        nativeLog("UDP server started successfully on port " + std::to_string(port) +
+                  (m_sock_family == AF_INET6 ? " (IPv6 dual-stack)" : " (IPv4)") +
+                  " sock_fd=" + std::to_string(m_sock));
         return true;
     }
-    
+
     // Event-loop mode: start without spawning a thread
     bool startServerEventLoop(int port, OnDataCallback on_data, OnDisconnectCallback on_disconnect) {
         if (m_running) return false;
@@ -140,6 +180,131 @@ public:
         m_bound_port = -1;
         nativeLog("UDP server stopped.");
     }
+    
+    // Restart the socket to rebind to a new network interface after WiFi<->LTE change.
+    // This is critical on Android where the old socket may be associated with the old interface
+    // and packets sent after network change may be routed through the wrong interface or dropped.
+    //
+    // IMPORTANT: This function must properly stop the listen thread before closing the socket,
+    // otherwise the thread will be left using a stale file descriptor and recvfrom() will fail.
+    bool restartSocket() {
+        // First, check if we have a valid state to restart from
+        int port;
+        bool was_event_loop_mode;
+        OnDataCallback saved_on_data;
+        OnDisconnectCallback saved_on_disconnect;
+        
+        {
+            std::lock_guard<std::mutex> lock(m_sock_mutex);
+            if (m_bound_port < 0) {
+                nativeLog("UDP Error: restartSocket called but server was never started (no bound port)");
+                return false;
+            }
+            port = m_bound_port;
+            was_event_loop_mode = m_event_loop_mode;
+            saved_on_data = m_on_data;
+            saved_on_disconnect = m_on_disconnect;
+        }
+        
+        nativeLog("UDP: Restarting socket on port " + std::to_string(port) + " for network interface rebind");
+        
+        // Step 1: Signal the listen thread to stop
+        m_running = false;
+        
+        // Step 2: Close the socket (this will cause select/recvfrom to fail and thread to exit)
+        {
+            std::lock_guard<std::mutex> lock(m_sock_mutex);
+            if (m_sock >= 0) {
+                close(m_sock);
+                m_sock = -1;
+            }
+        }
+        
+        // Step 3: Wait for listen thread to exit (if not in event loop mode)
+        if (!was_event_loop_mode && m_listenThread.joinable()) {
+            m_listenThread.join();
+        }
+        
+        // Step 4: Create new socket (same dual-stack policy as startServer).
+        m_sock_family = AF_INET6;
+        m_sock = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (m_sock >= 0) {
+#ifdef IPV6_V6ONLY
+            int v6only = 0;
+            setsockopt(m_sock, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+#endif
+        }
+        if (m_sock < 0) {
+            m_sock_family = AF_INET;
+            m_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        }
+        if (m_sock < 0) {
+            nativeLog("UDP Error: Failed to create socket during restart: " + std::string(strerror(errno)));
+            return false;
+        }
+        
+        int opt = 1;
+        if (setsockopt(m_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+            nativeLog("UDP Error: setsockopt(SO_REUSEADDR) failed during restart: " + std::string(strerror(errno)));
+            close(m_sock);
+            m_sock = -1;
+            return false;
+        }
+#ifdef SO_REUSEPORT
+        setsockopt(m_sock, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#endif
+
+        // Increase socket buffers
+        int buf_size = 1048576; // 1MB
+        setsockopt(m_sock, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+        setsockopt(m_sock, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+        
+        if (fcntl(m_sock, F_SETFL, O_NONBLOCK) < 0) {
+            nativeLog("UDP Error: fcntl(O_NONBLOCK) failed during restart: " + std::string(strerror(errno)));
+            close(m_sock);
+            m_sock = -1;
+            return false;
+        }
+
+        if (m_sock_family == AF_INET6) {
+            sockaddr_in6 addr6{};
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_addr = in6addr_any;
+            addr6.sin6_port = htons(port);
+            if (bind(m_sock, reinterpret_cast<sockaddr*>(&addr6), sizeof(addr6)) < 0) {
+                nativeLog("UDP Error: Failed to bind IPv6 socket during restart: " + std::string(strerror(errno)));
+                close(m_sock);
+                m_sock = -1;
+                return false;
+            }
+        } else {
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_addr.s_addr = INADDR_ANY;
+            addr.sin_port = htons(port);
+            if (bind(m_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+                nativeLog("UDP Error: Failed to bind socket during restart: " + std::string(strerror(errno)));
+                close(m_sock);
+                m_sock = -1;
+                return false;
+            }
+        }
+        
+        m_bound_port = port;
+        m_on_data = saved_on_data;
+        m_on_disconnect = saved_on_disconnect;
+        
+        // Step 5: Restart listen thread (if not in event loop mode)
+        if (!was_event_loop_mode) {
+            m_running = true;
+            m_listenThread = std::thread(&UdpImpl::listenLoop, this);
+        } else {
+            m_running = true;
+        }
+        
+        nativeLog("UDP: Socket restarted successfully on port " + std::to_string(port) + " (new_fd=" + std::to_string(m_sock) + ")");
+        return true;
+    }
 
     void sendMessageToPeer(const std::string& peer_id, const std::string& message) {
         std::lock_guard<std::mutex> lock(m_sock_mutex);
@@ -147,24 +312,21 @@ public:
             nativeLog("UDP Error: sendMessageToPeer called with invalid socket (fd=" + std::to_string(m_sock) + ")");
             return;
         }
-        sockaddr_in dest_addr{};
-        dest_addr.sin_family = AF_INET;
-        size_t colon_pos = peer_id.find(':');
-        if (colon_pos == std::string::npos) {
+        std::string ip;
+        uint16_t port = 0;
+        if (!parse_network_id(peer_id, ip, port) || port == 0) {
             nativeLog("UDP Error: Invalid peer ID format for sending message.");
             return;
         }
-        std::string ip = peer_id.substr(0, colon_pos);
-        int port = std::stoi(peer_id.substr(colon_pos + 1));
-        LOG_INFO("UDP_SEND_ATTEMPT: Attempting to send to IP: " + ip + " Port: " + std::to_string(port));
+        LOG_DEBUG("UDP_SEND_ATTEMPT: Attempting to send to IP: " + ip + " Port: " + std::to_string(port));
 
-        LOG_INFO("UDP_DEBUG: Calling encrypt_message_udp");
-        std::string encrypted_msg = encrypt_message_udp(message);
-        LOG_INFO("UDP_DEBUG: Encrypted message length: " + std::to_string(encrypted_msg.length()));
+        LOG_DEBUG("UDP_DEBUG: Calling encrypt_message_udp");
+        std::string encrypted_msg = encrypt_message_for_peer(peer_id, message);
+        LOG_DEBUG("UDP_DEBUG: Encrypted message length: " + std::to_string(encrypted_msg.length()));
 
         if (UdpMessage::send(m_sock, ip, port, encrypted_msg)) {
             // Don't log raw payload here: it can be binary (e.g., Noise handshake) and will corrupt stdout/log parsing.
-            LOG_INFO("UDP_SEND_SUCCESS: Sent message to peer " + peer_id + " (IP:Port), payload_len=" + std::to_string(message.size()) + ", encrypted_len=" + std::to_string(encrypted_msg.size()));
+            LOG_DEBUG("UDP_SEND_SUCCESS: Sent message to peer " + peer_id + " (IP:Port), payload_len=" + std::to_string(message.size()) + ", encrypted_len=" + std::to_string(encrypted_msg.size()));
         } else {
             LOG_INFO("UDP_SEND_ERROR: Failed to send message to " + peer_id);
         }
@@ -212,26 +374,27 @@ public:
         if (m_sock < 0 || !m_running) return;
 
         auto& buf = m_event_loop_recv_buf;
-        sockaddr_in from_addr{};
+        sockaddr_storage from_addr{};
         socklen_t from_len = sizeof(from_addr);
-        ssize_t n = recvfrom(m_sock, buf.data(), buf.size(), 0, (sockaddr*)&from_addr, &from_len);
+        ssize_t n = recvfrom(m_sock, buf.data(), buf.size(), 0, reinterpret_cast<sockaddr*>(&from_addr), &from_len);
         
         if (n > 0) {
-            char sender_ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, &from_addr.sin_addr, sender_ip, sizeof(sender_ip));
-            int sender_port = ntohs(from_addr.sin_port);
-            std::string peer_id = std::string(sender_ip) + ":" + std::to_string(sender_port);
+            std::string sender_ip;
+            uint16_t sender_port = 0;
+            parse_network_id(sockaddr_to_network_id(reinterpret_cast<sockaddr*>(&from_addr)),
+                             sender_ip, sender_port);
+            const std::string peer_id = sockaddr_to_network_id(reinterpret_cast<sockaddr*>(&from_addr));
 
-            nativeLog("UDP_ST_DEBUG: recvfrom received " + std::to_string(n) + " bytes from " + peer_id);
+            LOG_DEBUG("UDP_ST_DEBUG: recvfrom received " + std::to_string(n) + " bytes from " + peer_id);
             
             // Check for STUN packet
             if (UdpMessage::isStunPacket(buf.data(), n)) {
-                nativeLog("UDP_ST_DEBUG: STUN packet detected from " + peer_id + ", len=" + std::to_string(n));
+                LOG_DEBUG("UDP_ST_DEBUG: STUN packet detected from " + peer_id + ", len=" + std::to_string(n));
                 if (m_stun_callback) {
                     std::vector<uint8_t> packet_data(buf.data(), buf.data() + n);
                     m_stun_callback(sender_ip, sender_port, packet_data);
                 } else {
-                    nativeLog("UDP_ST_DEBUG: STUN callback is null; dropping STUN packet from " + peer_id);
+                    LOG_DEBUG("UDP_ST_DEBUG: STUN callback is null; dropping STUN packet from " + peer_id);
                 }
                 return;
             }
@@ -242,7 +405,7 @@ public:
             }
 
             std::string encrypted_data(buf.data(), n);
-            std::string decrypted_data = decrypt_message_udp(encrypted_data);
+            std::string decrypted_data = decrypt_message_for_peer(peer_id, encrypted_data);
 
             if (decrypted_data.empty()) {
                 std::string hex_preview;
@@ -259,7 +422,7 @@ public:
             if (m_on_data) {
                 m_on_data(peer_id, decrypted_data);
             } else {
-                nativeLog("UDP_ST_DEBUG: on_data callback is null; dropping decrypted UDP message from " + peer_id + ", len=" + std::to_string(decrypted_data.size()));
+                LOG_DEBUG("UDP_ST_DEBUG: on_data callback is null; dropping decrypted UDP message from " + peer_id + ", len=" + std::to_string(decrypted_data.size()));
             }
         } else if (n < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -279,7 +442,7 @@ private:
     }
 
     void listenLoop() {
-        nativeLog("UDP_DEBUG: listenLoop started (sock_fd=" + std::to_string(m_sock) + ", bound_port=" + std::to_string(m_bound_port) + ", has_on_data=" + std::string(m_on_data ? "true" : "false") + ")");
+        LOG_DEBUG("UDP_DEBUG: listenLoop started (sock_fd=" + std::to_string(m_sock) + ", bound_port=" + std::to_string(m_bound_port) + ", has_on_data=" + std::string(m_on_data ? "true" : "false") + ")");
         std::vector<char> buf(UDP_BUFFER_SIZE);
         while (m_running) {
             int sock_fd;
@@ -305,21 +468,22 @@ private:
                 continue;
             }
 
-            sockaddr_in from_addr{};
+            sockaddr_storage from_addr{};
             socklen_t from_len = sizeof(from_addr);
-            ssize_t n = recvfrom(sock_fd, buf.data(), buf.size(), 0, (sockaddr*)&from_addr, &from_len);
+            ssize_t n = recvfrom(sock_fd, buf.data(), buf.size(), 0, reinterpret_cast<sockaddr*>(&from_addr), &from_len);
             
             if (n > 0) {
-                char sender_ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &from_addr.sin_addr, sender_ip, sizeof(sender_ip));
-                int sender_port = ntohs(from_addr.sin_port);
-                std::string peer_id = std::string(sender_ip) + ":" + std::to_string(sender_port);
+                std::string sender_ip;
+                uint16_t sender_port = 0;
+                parse_network_id(sockaddr_to_network_id(reinterpret_cast<sockaddr*>(&from_addr)),
+                                 sender_ip, sender_port);
+                const std::string peer_id = sockaddr_to_network_id(reinterpret_cast<sockaddr*>(&from_addr));
                 
-                nativeLog("UDP_DEBUG: recvfrom received " + std::to_string(n) + " bytes from " + peer_id);
+                LOG_DEBUG("UDP_DEBUG: recvfrom received " + std::to_string(n) + " bytes from " + peer_id);
 
                 // Check for STUN packet
                 if (UdpMessage::isStunPacket(buf.data(), n)) {
-                    nativeLog("UDP_DEBUG: STUN packet detected from " + peer_id + ", len=" + std::to_string(n));
+                    LOG_DEBUG("UDP_DEBUG: STUN packet detected from " + peer_id + ", len=" + std::to_string(n));
                     if (m_stun_callback) {
                         std::vector<uint8_t> packet_data(buf.data(), buf.data() + n);
                         m_stun_callback(sender_ip, sender_port, packet_data);
@@ -330,12 +494,12 @@ private:
                 // Check for discovery packets that might arrive on the wrong port
                 // Discovery format: "LITEP2P_DISCOVERY:..." (plain text)
                 if (isDiscoveryPacket(buf.data(), static_cast<size_t>(n))) {
-                    LOG_INFO("UDP_DEBUG: Discovery packet received on connection port from " + peer_id + " - ignoring");
+                    LOG_DEBUG("UDP_DEBUG: Discovery packet received on connection port from " + peer_id + " - ignoring");
                     continue;
                 }
 
                 std::string encrypted_data(buf.data(), n);
-                std::string decrypted_data = decrypt_message_udp(encrypted_data);
+                std::string decrypted_data = decrypt_message_for_peer(peer_id, encrypted_data);
 
                 if (decrypted_data.empty()) {
                     // Add hex dump of first 32 bytes for debugging
@@ -357,12 +521,12 @@ private:
 
                 {
                     // Don't log raw payload here: it can be binary (e.g., Noise handshake) and will corrupt stdout/log parsing.
-                    LOG_INFO("UDP_RECEIVE: Received message from peer " + peer_id + " (IP:Port), payload_len=" + std::to_string(decrypted_data.size()));
+                    LOG_DEBUG("UDP_RECEIVE: Received message from peer " + peer_id + " (IP:Port), payload_len=" + std::to_string(decrypted_data.size()));
                     // Acknowledge UDP connection when data is received
                     if (decrypted_data.find("ACK") != std::string::npos || 
                         decrypted_data.find("PONG") != std::string::npos ||
                         decrypted_data.find("HEARTBEAT") != std::string::npos) {
-                        nativeLog("UDP: Connection acknowledged from " + peer_id);
+                        LOG_DEBUG("UDP: Connection acknowledged from " + peer_id);
                     }
                     m_on_data(peer_id, decrypted_data);
                 }
@@ -378,6 +542,7 @@ private:
     int m_sock;
     std::mutex m_sock_mutex;
     int m_bound_port;
+    int m_sock_family = AF_INET;
     std::thread m_listenThread;
     OnDataCallback m_on_data;
     OnDisconnectCallback m_on_disconnect;
@@ -391,6 +556,7 @@ UdpConnectionManager::~UdpConnectionManager() = default;
 bool UdpConnectionManager::startServer(int port, OnDataCallback on_data, OnDisconnectCallback on_disconnect) { return m_impl->startServer(port, on_data, on_disconnect); }
 bool UdpConnectionManager::startServerEventLoop(int port, OnDataCallback on_data, OnDisconnectCallback on_disconnect) { return m_impl->startServerEventLoop(port, on_data, on_disconnect); }
 void UdpConnectionManager::stop() { m_impl->stop(); }
+bool UdpConnectionManager::restartSocket() { return m_impl->restartSocket(); }
 bool UdpConnectionManager::connectToPeer(const std::string& ip, int port) { return m_impl->connectToPeer(ip, port); }
 void UdpConnectionManager::sendMessageToPeer(const std::string& peer_id, const std::string& message) { m_impl->sendMessageToPeer(peer_id, message); }
 void UdpConnectionManager::sendRawPacket(const std::string& ip, int port, const std::vector<uint8_t>& data) { m_impl->sendRawPacket(ip, port, data); }

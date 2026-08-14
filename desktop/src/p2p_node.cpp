@@ -145,6 +145,14 @@ bool P2PNode::start(int port, const std::string& peer_id, const std::string& com
         });
 
         session_manager_->start(port, peer_callback, comms_mode, peer_id);
+        
+        // Desktop: Set network info to indicate we're on WiFi/LAN.
+        // This is critical for allowing private/LAN endpoint discovery to work.
+        // Without this, the session manager rejects 192.168.x.x endpoints
+        // because it thinks we're on cellular (where LAN IPs are unreachable).
+        session_manager_->set_network_info(true /* is_wifi */, true /* is_available */);
+        nativeLog("SM: Network info set: WiFi=true, Available=true (desktop mode)");
+        
         nativeLog("LiteP2P engine started successfully.");
         running_ = true;
         return true;

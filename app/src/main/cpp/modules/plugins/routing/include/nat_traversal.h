@@ -270,10 +270,24 @@ public:
     void unregisterPeer(const std::string& peer_id);
     // Cancels queued/in-flight hole punching for a peer. The peer may remain registered.
     void cancelHolePunching(const std::string& peer_id);
+    // Resets failure counts for all peers to allow fresh hole punch attempts after network change.
+    void resetHolePunchFailures();
     std::vector<PeerAddress> getRegisteredPeers() const;
     std::vector<PeerAddress> getNetworkPeers(const std::string& network_id) const;
     bool performHolePunching(const std::string& peer_id);
     bool performNetworkHolePunching(const std::string& peer_id, const std::string& network_id);
+
+    // ---------------------------------------------------------------------
+    // Observability: hole-punch completion notifications
+    // ---------------------------------------------------------------------
+    // Note: Hole punching is asynchronous. Observers are notified on an owned,
+    // joinable worker thread that is stopped before transport teardown.
+    using PunchResultCallback = std::function<void(const std::string& peer_id, bool success)>;
+
+    // Registers an observer and returns an id that can be used to unregister.
+    // Safe to call multiple times; ids are unique per-process.
+    int addPunchResultObserver(PunchResultCallback cb);
+    void removePunchResultObserver(int observer_id);
 
     // Best-effort cancellation hook used by SessionManager stop() to accelerate teardown
     // (e.g., abort in-flight STUN NAT detection promptly).
@@ -337,11 +351,16 @@ private:
     void startPunchThreadPool();
     void stopPunchThreadPool();
     void clearPunchQueue();
-    void enqueuePunchTask(const PeerAddress& peer);
+    void enqueuePunchTask(const PeerAddress& peer, bool explicit_request = false);
+    // Legacy on-demand dispatch remains available for compatibility, but normal
+    // operation uses the owned worker pool so tasks cannot outlive shutdown.
+    void dispatchOnDemandPunches_();
     void punchWorkerLoop();
 
     bool performHolePunchingInternal(const PeerAddress& peer);
     void markPeerPunchSuccess(const std::string& peer_id);
+
+    void notifyPunchResult_(const std::string& peer_id, bool success);
 
     void cleanupStalePeersLocked(int64_t now_ms, const Options& options_snapshot);
     void cleanupStaleMappingsLocked(int64_t now_ms);
@@ -386,6 +405,7 @@ private:
     // Cancellation and cooldown tracking for hole-punch jobs (guarded by punch_mutex_).
     std::unordered_set<std::string> punch_cancelled_peers_;
     std::unordered_map<std::string, int64_t> punch_last_failure_ms_;
+    std::unordered_map<std::string, int> punch_failure_count_;  // Track consecutive failures for progressive backoff
     std::condition_variable punch_cv_;
     bool punch_shutdown_{false};
     std::vector<std::thread> punch_workers_;
@@ -394,7 +414,10 @@ private:
     // On-demand punch mode: spawn threads only when needed, destroy after use
     bool on_demand_punch_mode_{false};
     std::atomic<int> active_on_demand_punches_{0};
-    static constexpr int MAX_ON_DEMAND_PUNCH_THREADS = 4;
+    // Increased from 4 to 10 to handle larger peer counts (20+) more efficiently
+    // during WiFi handoffs. Each batch of 4 takes ~3s, so 20 peers at 4 concurrent
+    // = 5 batches = 15+ seconds. At 10 concurrent = 2 batches = 6 seconds.
+    static constexpr int MAX_ON_DEMAND_PUNCH_THREADS = 10;
 
     std::thread heartbeat_thread_;
     std::thread maintenance_thread_;
@@ -413,6 +436,11 @@ private:
 
     std::atomic<IUdpConnectionManager*> connection_manager_{nullptr};
     std::mutex connection_mutex_;
+
+    // Hole-punch observers
+    mutable std::mutex punch_observers_mutex_;
+    std::unordered_map<int, PunchResultCallback> punch_observers_;
+    std::atomic_int next_punch_observer_id_{1};
 
     std::atomic_bool initialized_{false};
     std::atomic_bool shutdown_requested_{false};

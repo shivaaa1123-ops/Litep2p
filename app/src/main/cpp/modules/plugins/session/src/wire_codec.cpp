@@ -21,6 +21,7 @@ namespace {
             case MessageType::HANDSHAKE_NOISE:
             case MessageType::ENCRYPTED_DATA:
             case MessageType::APPLICATION_DATA:
+            case MessageType::APPLICATION_ACK:
             case MessageType::FILE_TRANSFER:
             case MessageType::PROXY_CONTROL:
             case MessageType::PROXY_STREAM_DATA:

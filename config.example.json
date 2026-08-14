@@ -53,6 +53,7 @@
         "broadcast_interval_sec": 5
     },
     "security": {
+        "transport_key": "",
         "noise_nk_protocol": {
             "enabled": true,
             "mandatory": true,
@@ -162,6 +163,11 @@
         "enabled": true,
         "url": "ws://SIGNALING_HOST:8765",
         "reconnect_interval_ms": 5000
+    },
+    "proxy": {
+        "enable_gateway": false,
+        "enable_client": true,
+        "enable_test_echo": false
     },
     "global_discovery": {
         "enabled": false,

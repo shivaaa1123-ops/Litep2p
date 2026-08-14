@@ -29,6 +29,14 @@ public:
         std::string file_path;         // optional (append JSONL)
         bool include_peer_ids = true;  // include peer_id in some metric names (best-effort)
     };
+    
+    // Per-peer connection path info for telemetry
+    struct PeerConnectionInfo {
+        std::string peer_id;
+        std::string connection_path;  // "LAN_DIRECT", "WAN_HOLE_PUNCH", "TURN_RELAY", "SIGNALING_RELAY", "UNKNOWN"
+        int64_t connected_at_ms{0};   // timestamp when connection was established
+        bool is_connected{false};
+    };
 
     static Telemetry& getInstance();
 
@@ -49,6 +57,10 @@ public:
     void inc_counter(const std::string& name, int64_t delta = 1);
     void set_gauge(const std::string& name, int64_t value);
     void observe_hist_ms(const std::string& name, int64_t ms);
+    
+    // Per-peer connection tracking API (thread-safe).
+    void set_peer_connection(const std::string& peer_id, const std::string& connection_path, bool is_connected);
+    void remove_peer_connection(const std::string& peer_id);
 
 private:
     Telemetry() = default;
@@ -87,6 +99,9 @@ private:
     std::unordered_map<std::string, Counter> m_counters;
     std::unordered_map<std::string, Gauge> m_gauges;
     std::unordered_map<std::string, Hist> m_hists;
+    
+    // Per-peer connection path tracking
+    std::unordered_map<std::string, PeerConnectionInfo> m_peer_connections;
 };
 
 

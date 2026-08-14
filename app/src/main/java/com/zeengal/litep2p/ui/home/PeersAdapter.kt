@@ -2,12 +2,16 @@ package com.zeengal.litep2p.ui.home
 
 import android.app.AlertDialog
 import android.util.Log
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import com.zeengal.litep2p.PeerInfo
@@ -19,11 +23,7 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
 
     class Holder(view: View) : RecyclerView.ViewHolder(view) {
         val id: TextView = view.findViewById(R.id.peerIdText)
-        val ip: TextView = view.findViewById(R.id.peerIpText)
-        val port: TextView = view.findViewById(R.id.peerPortText)
-        val status: TextView = view.findViewById(R.id.peerStatusText)
-        val latency: TextView = view.findViewById(R.id.peerLatencyText)
-        val networkId: TextView = view.findViewById(R.id.peerNetworkIdText)
+        val meta: TextView = view.findViewById(R.id.peerMetaText)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder {
@@ -32,19 +32,34 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
         return Holder(v)
     }
 
-    // Safely truncate peer ID for display (handles IDs shorter than 8 chars)
-    private fun truncateId(id: String): String {
-        return if (id.length > 8) "${id.take(8)}..." else id
-    }
-
     override fun onBindViewHolder(holder: Holder, position: Int) {
         val p = items[position]
-        holder.id.text = "ID: ${truncateId(p.id)}"
-        holder.ip.text = "IP: ${p.ip}"
-        holder.port.text = "Port: ${p.port}"
-        holder.status.text = "Status: ${if (p.connected) "Connected" else "Disconnected"}"
-        holder.latency.text = "Latency: ${if (p.latency >= 0) "${p.latency}ms" else "N/A"}"
-        holder.networkId.text = "Network ID: ${p.networkId}"
+        val (statusText, statusColorRes) = statusLabelAndColor(p)
+        val latency = if (p.latency >= 0) "${p.latency}ms" else "N/A"
+        
+        // Format connection type with descriptive labels
+        val connType = when (p.connectionType) {
+            "LAN" -> "🏠 LAN"              // Direct local network
+            "WAN_DIRECT" -> "🌐 Direct"    // Hole punch succeeded
+            "TURN" -> "🔄 TURN"            // Via TURN relay server
+            "SIGNALING" -> "📡 Relay"      // Via signaling relay
+            else -> ""                      // UNKNOWN or empty
+        }
+
+        // Full peer ID, compact meta to keep list dense.
+        holder.id.text = p.id
+        val metaPrefix = "${p.ip}:${p.port}  •  "
+        val metaStatus = statusText
+        val metaConnType = if (connType.isNotEmpty()) "  •  $connType" else ""
+        val metaSuffix = "  •  latency=$latency"
+        val meta = metaPrefix + metaStatus + metaConnType + metaSuffix
+
+        val ss = SpannableString(meta)
+        val start = metaPrefix.length
+        val end = start + metaStatus.length
+        val color = ContextCompat.getColor(holder.itemView.context, statusColorRes)
+        ss.setSpan(ForegroundColorSpan(color), start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        holder.meta.text = ss
 
         holder.itemView.setOnClickListener {
             val currentPosition = holder.adapterPosition
@@ -53,7 +68,7 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
                 val context = holder.itemView.context
 
                 if (!currentPeer.connected) {
-                    Toast.makeText(context, "Connecting to ${truncateId(currentPeer.id)}...", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Connecting...", Toast.LENGTH_SHORT).show()
                     // Log connection type and peer info
                     val connectionType = P2P.getConnectionType() // Assume this returns "TCP" or "UDP"
                     Log.i("LiteP2P_UI", "User requested $connectionType connection to peer ${currentPeer.id} (IP: ${currentPeer.ip}, Port: ${currentPeer.port})")
@@ -63,12 +78,12 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
                     val editText = dialogView.findViewById<EditText>(R.id.messageEditText)
 
                     AlertDialog.Builder(context)
-                        .setTitle("Send Message to ${truncateId(currentPeer.id)}")
+                        .setTitle("Send Message")
                         .setView(dialogView)
                         .setPositiveButton("Send") { dialog, _ ->
                             val message = editText.text.toString()
                             if (message.isNotEmpty()) {
-                                P2P.sendMessage(currentPeer.id, message.toByteArray())
+                                P2P.sendMessageTracked(currentPeer.id, message.toByteArray())
                             }
                             dialog.dismiss()
                         }
@@ -78,6 +93,27 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
                         .show()
                 }
             }
+        }
+    }
+
+    private fun statusLabelAndColor(p: PeerInfo): Pair<String, Int> {
+        // Always prefer READY when connected==true.
+        if (p.connected) {
+            return "ready" to R.color.peer_status_ready
+        }
+
+        val s = p.fsmState.trim()
+        if (s.isBlank()) {
+            return "disconnected" to R.color.peer_status_disconnected
+        }
+
+        return when (s.uppercase()) {
+            "DISCOVERED" -> "discovered" to R.color.peer_status_discovered
+            "CONNECTING" -> "connecting" to R.color.peer_status_connecting
+            "CONNECTED" -> "connected" to R.color.peer_status_connected
+            "HANDSHAKING" -> "handshaking" to R.color.peer_status_handshaking
+            "READY" -> "ready" to R.color.peer_status_ready
+            else -> s.lowercase() to R.color.peer_status_disconnected
         }
     }
 

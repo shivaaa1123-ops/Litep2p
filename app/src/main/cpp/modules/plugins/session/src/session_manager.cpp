@@ -3,8 +3,11 @@
 #include "../../../corep2p/transport/include/udp_connection_manager.h"
 #include "../../../corep2p/core/include/config_manager.h"
 #include "../../../corep2p/core/include/telemetry.h"
+#include "../../../corep2p/core/include/device_utils.h"
+#include "../../../corep2p/crypto/include/crypto_utils.h"
 #include "../../routing/include/upnp_controller.h"
 #include "../../discovery/include/signaling_client.h"
+#include "../../discovery/include/discovery.h"
 #include "unified_event_loop.h"
 #include <iostream>
 #include <chrono>
@@ -12,7 +15,9 @@
 #include <sstream>
 #include <thread>
 #include <algorithm>
+#include <random>
 #include <cstdlib>
+#include <cerrno>
 #include <filesystem>
 #include <sys/select.h>
 #include <unistd.h>
@@ -40,6 +45,11 @@ namespace {
 inline int64_t system_now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+
+inline int64_t steady_now_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
 inline std::string get_executable_dir_best_effort() {
@@ -137,6 +147,13 @@ void SessionManager::connectToPeer(const std::string& peer_id) {
     m_impl->connectToPeer(peer_id);
 }
 
+void SessionManager::connectToPeer(const std::string& peer_id, bool bypass_reconnect_policy) {
+    // Public API: keep behavior identical unless the caller explicitly requests bypass.
+    // Source tag helps triage logs when this path is used.
+    m_impl->connectToPeer(peer_id, bypass_reconnect_policy,
+                          bypass_reconnect_policy ? "api_bypass" : "api");
+}
+
 void SessionManager::addPeer(const std::string& peer_id, const std::string& network_id) {
     m_impl->handlePeerDiscovered(network_id, peer_id);
 }
@@ -147,6 +164,14 @@ void SessionManager::sendMessageToPeer(const std::string& peer_id, const std::st
 
 bool SessionManager::isPeerConnected(const std::string& peer_id) const {
     return m_impl->isPeerConnected(peer_id);
+}
+
+std::string SessionManager::getPeerFsmState(const std::string& peer_id) const {
+    return m_impl->getPeerFsmState(peer_id);
+}
+
+std::string SessionManager::getPeerConnectionType(const std::string& peer_id) const {
+    return m_impl->getPeerConnectionType(peer_id);
 }
 
 void SessionManager::set_battery_level(int batteryPercent, bool isCharging) {
@@ -170,12 +195,27 @@ std::string SessionManager::get_reconnect_status_json() const {
 // ============================================================================
 
 SessionManager::Impl::Impl(std::shared_ptr<ISessionDependenciesFactory> factory)
-    : m_factory(factory ? factory : std::make_shared<DefaultSessionDependenciesFactory>()),
-      m_running(false), m_use_noise_protocol(false), m_noise_nk_enabled(false),
+    : m_stopped(false),
+      m_shutting_down(false),
+      m_running(false),
+      m_factory(factory ? factory : std::make_shared<DefaultSessionDependenciesFactory>()),
       m_peer_tier_manager(nullptr),
       m_broadcast_discovery(nullptr),
-      m_stopped(false),
-      m_shutting_down(false) {
+      m_use_noise_protocol(false),
+      m_noise_nk_enabled(false) {
+
+    // Process-lifetime boot id used to detect peer restarts even when persistent static keys are reused.
+    // Must be non-zero to enable change detection.
+    {
+        std::random_device rd;
+        const uint64_t hi = static_cast<uint64_t>(rd());
+        const uint64_t lo = static_cast<uint64_t>(rd());
+        m_local_boot_id = (hi << 32) ^ lo;
+        if (m_local_boot_id == 0) {
+            m_local_boot_id = 1;
+        }
+        LOG_INFO("SM: Local boot id=" + std::to_string(m_local_boot_id));
+    }
     
     // Initialize dependent members after m_factory is initialized
     m_peer_index = m_factory->createPeerIndex();
@@ -206,6 +246,10 @@ SessionManager::Impl::Impl(std::shared_ptr<ISessionDependenciesFactory> factory)
     m_message_handler = std::make_unique<detail::MessageHandler>(this);
     m_peer_lifecycle_manager = std::make_unique<detail::PeerLifecycleManager>(this);
     m_maintenance_manager = std::make_unique<detail::MaintenanceManager>(this);
+    
+    // Initialize Rugged Recovery Manager for automatic failure recovery
+    m_recovery_manager = std::make_unique<recovery::RuggedRecoveryManager>();
+    LOG_INFO("SM: Rugged Recovery Manager created");
 
 #if ENABLE_PROXY_MODULE
     // Proxy module is compile-time optional; runtime behavior is enabled by default.
@@ -222,9 +266,62 @@ SessionManager::Impl::Impl(std::shared_ptr<ISessionDependenciesFactory> factory)
             this->connectToPeer(peer_id);
         }
     );
-    // Default: act as both gateway and client.
+
+    // SECURITY: The gateway role turns this node into a forwarding/egress point for
+    // other peers. It is OFF by default and must be explicitly opted into, because a
+    // default-on gateway lets any peer that can reach us relay traffic through this
+    // device (including toward hosts only reachable from our network position).
+    //
+    // Client role is safe by default: it only lets *this* node originate proxied
+    // streams through a gateway we chose. It never forwards traffic on behalf of others.
+    //
+    // Opt in via config.json:
+    //   "proxy": { "enable_gateway": true, "enable_client": true }
+    // or at runtime via the authenticated SET_PROXY_SETTINGS admin command.
     // NOTE: enable_test_echo must remain false for non-test deployments.
-    m_proxy_endpoint->configure(proxy::ProxySettings{true, true});
+    {
+        proxy::ProxySettings proxy_settings{};
+        proxy_settings.enable_gateway = false;  // secure default: never forward for others
+        proxy_settings.enable_client = true;
+        proxy_settings.enable_test_echo = false;
+
+        try {
+            const json cfg = ConfigManager::getInstance().getConfigSnapshot();
+            auto pit = cfg.find("proxy");
+            if (pit != cfg.end() && pit->is_object()) {
+                const json& p = *pit;
+                auto read_bool = [&p](const char* key, bool& field) {
+                    auto it = p.find(key);
+                    if (it != p.end() && it->is_boolean()) {
+                        field = it->get<bool>();
+                    }
+                };
+                read_bool("enable_gateway", proxy_settings.enable_gateway);
+                read_bool("enable_client", proxy_settings.enable_client);
+                read_bool("enable_test_echo", proxy_settings.enable_test_echo);
+            }
+        } catch (const std::exception& e) {
+            // Fail closed: a malformed proxy config must not silently enable forwarding.
+            LOG_WARN(std::string("SM: Failed to read proxy config, using secure defaults: ") + e.what());
+            proxy_settings = proxy::ProxySettings{};
+            proxy_settings.enable_client = true;
+        }
+
+        if (proxy_settings.enable_gateway) {
+            LOG_WARN("SM: Proxy GATEWAY role is ENABLED by configuration. This node will "
+                     "forward traffic on behalf of other peers. Ensure peer authorization "
+                     "and destination policy are appropriate for this deployment.");
+        }
+        if (proxy_settings.enable_test_echo) {
+            LOG_WARN("SM: Proxy test echo is ENABLED. This is a test-harness-only mode and "
+                     "must not be used in production deployments.");
+        }
+
+        m_proxy_endpoint->configure(proxy_settings);
+        LOG_INFO(std::string("SM: Proxy configured - gateway=") +
+                 (proxy_settings.enable_gateway ? "on" : "off") +
+                 " client=" + (proxy_settings.enable_client ? "on" : "off"));
+    }
 #endif
 
     m_battery_optimizer->set_optimization_level(BatteryOptimizer::OptimizationLevel::BALANCED);
@@ -519,6 +616,14 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
     m_comms_mode = comms_mode;
     m_localPeerId = peer_id;
 
+    // stop() clears NATTraversal's connection manager pointer. Re-register on every start so
+    // bound-socket STUN probing and hole punching remain functional across engine restarts.
+    ensure_nat_connection_manager_registered_();
+
+    // Wire NAT hole-punch completion (success/failure) into peer lifecycle.
+    // This prevents peers from staying CONNECTING indefinitely after punch retries are exhausted.
+    ensure_nat_punch_observer_registered_();
+
     // Optional: initialize local peer DB now that we know our local peer id and config.
     maybe_init_peer_db_();
 
@@ -630,9 +735,17 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
                 if (m_broadcast_discovery && m_broadcast_discovery->is_running()) {
                     m_broadcast_discovery->discover_peer(e->peerId,
                         [this](const DiscoveryResponse& response) {
-                            handleDiscoveryResponse(response.responder_peer_id);
+                            // IMPORTANT: Use the full response including local IP/port
+                            handleDiscoveryResponseWithEndpoint(
+                                response.responder_peer_id,
+                                response.responder_ip,
+                                response.responder_port,
+                                response.latency_ms);
                         });
                 }
+            } else if (auto* e = std::get_if<LanDiscoveryResultEvent>(&event)) {
+                LOG_INFO("SM: Event type = LanDiscoveryResultEvent for peer " + e->peerId);
+                handleLanDiscoveryResult(*e);
             } else if (auto* e = std::get_if<MessageSendCompleteEvent>(&event)) {
                 LOG_DEBUG("SM: Event type = MessageSendCompleteEvent");
                 handleMessageSendComplete(*e);
@@ -868,6 +981,43 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
     // This allows DB-first peer list population and best-effort reconnect attempts even without signaling.
     bootstrap_peers_from_db_();
     
+    // Initialize Rugged Recovery Manager with callbacks
+    if (m_recovery_manager) {
+        m_recovery_manager->initialize(
+            // Send direct callback
+            [this](const std::string& network_id, const std::string& message) {
+                send_message_to_peer(network_id, message);
+            },
+            // Send relay callback
+            [this](const std::string& peer_id, const std::string& message) {
+                if (m_signaling_client && m_signaling_client->isConnected()) {
+                    m_signaling_client->sendRelayMessage(peer_id, message);
+                }
+            },
+            // Restart socket callback
+            [this]() -> bool {
+                if (m_udpConnectionManager) {
+                    return m_udpConnectionManager->restartSocket();
+                }
+                return false;
+            },
+            // Reconnect peer callback
+            [this](const std::string& peer_id) {
+                connectToPeer(peer_id, true, "rugged_recovery");
+            },
+            // Get network ID callback
+            [this](const std::string& peer_id) -> std::string {
+                std::lock_guard<std::mutex> lock(m_peers_mutex);
+                auto it = m_peers.find(peer_id);
+                if (it != m_peers.end()) {
+                    return it->second.network_id;
+                }
+                return "";
+            }
+        );
+        LOG_INFO("SM: Rugged Recovery Manager initialized with callbacks");
+    }
+    
     // Proactively connect to signaling at startup (even if we have peers in DB).
     // This ensures we are registered and can receive CONNECT_REQUEST messages from other peers.
     // Without this, a restarting peer may try to connect via cached DB data while the remote
@@ -884,6 +1034,9 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
     if (!single_thread) {
         m_timer_thread = std::thread(&SessionManager::Impl::timerLoop, this);
     }
+    
+    // PRODUCTION-READY: Start IP change monitoring
+    start_ip_monitor();
 }
 
 void SessionManager::Impl::maybe_init_peer_db_() {
@@ -959,6 +1112,7 @@ void SessionManager::Impl::bootstrap_peers_from_db_() {
 
     const auto now = std::chrono::steady_clock::now();
     std::vector<std::string> to_connect;
+    std::vector<std::pair<std::string, std::string>> index_adds;
     int inserted = 0;
 
     {
@@ -983,7 +1137,7 @@ void SessionManager::Impl::bootstrap_peers_from_db_() {
 
                 m_peers[rec.peer_id] = p;
                 if (!p.network_id.empty()) {
-                    add_peer_to_network_index(rec.peer_id, p.network_id);
+                    index_adds.emplace_back(rec.peer_id, p.network_id);
                 }
 
                 PeerContext ctx{rec.peer_id, p.network_id};
@@ -996,6 +1150,11 @@ void SessionManager::Impl::bootstrap_peers_from_db_() {
                 to_connect.push_back(rec.peer_id);
             }
         }
+    }
+
+    // Apply network index updates outside m_peers_mutex to avoid lock inversion.
+    for (const auto& item : index_adds) {
+        add_peer_to_network_index(item.first, item.second);
     }
 
     if (inserted > 0) {
@@ -1253,6 +1412,13 @@ void SessionManager::Impl::stop() {
     log_phase_ms("join_signaling_reconnect_thread", phase);
 
     phase = std::chrono::steady_clock::now();
+    join_owned_recovery_workers_();
+    log_phase_ms("join_owned_recovery_workers", phase);
+    
+    // PRODUCTION-READY: Stop IP monitoring
+    stop_ip_monitor();
+
+    phase = std::chrono::steady_clock::now();
 
     // Stop signaling client early to avoid it delivering callbacks during teardown.
     m_signaling_client.reset();
@@ -1293,6 +1459,8 @@ void SessionManager::Impl::stop() {
     phase = std::chrono::steady_clock::now();
     
     // Stop network IO
+    // Always unregister punch observers during teardown (no-op if not registered).
+    unregister_nat_punch_observer_();
     if (m_comms_mode == "TCP") {
         LOG_INFO("SM: Stopping TCP connection manager...");
         m_tcpConnectionManager->stop();
@@ -1332,11 +1500,13 @@ void SessionManager::Impl::stop() {
         std::lock_guard<std::mutex> lock(m_peers_mutex);
         m_peers.clear();
         m_peer_contexts.clear();
-        // Clear network index
-        {
-            std::lock_guard<std::mutex> index_lock(m_network_index_mutex);
-            m_network_id_to_peer_id.clear();
-        }
+    }
+
+    // Clear network index and ephemeral mappings
+    {
+        std::lock_guard<std::mutex> index_lock(m_network_index_mutex);
+        m_network_id_to_peer_id.clear();
+        m_ephemeral_to_advertised_port_map.clear();
     }
     
     // Reset unique pointers to ensure clean state
@@ -1385,6 +1555,10 @@ void SessionManager::Impl::stop() {
 }
 
 void SessionManager::Impl::connectToPeer(const std::string& peer_id) {
+    connectToPeer(peer_id, false, "api");
+}
+
+void SessionManager::Impl::connectToPeer(const std::string& peer_id, bool bypass_reconnect_policy, const char* source) {
     if (peer_id.empty()) {
         return;
     }
@@ -1440,8 +1614,9 @@ void SessionManager::Impl::connectToPeer(const std::string& peer_id) {
         return;
     }
 
-    LOG_INFO("SM: connectToPeer requested for peer: " + peer_id);
-    pushEvent(ConnectToPeerEvent{peer_id});
+    LOG_INFO("SM: connectToPeer requested for peer: " + peer_id +
+             (bypass_reconnect_policy ? " (bypass_policy=true)" : ""));
+    pushEvent(ConnectToPeerEvent{peer_id, bypass_reconnect_policy, source ? std::string(source) : std::string{}});
 }
 
 void SessionManager::Impl::sendMessageToPeer(const std::string& peer_id, const std::string& message) {
@@ -1495,9 +1670,19 @@ void SessionManager::Impl::initializeNoiseHandshake(const std::string& peer_id) 
         // creating the session AND generating the first handshake message.
         std::lock_guard<std::mutex> lock(m_secure_session_mutex);
         auto session = m_secure_session_manager->get_or_create_session(peer_id, NoiseNKSession::Role::INITIATOR);
+        // Get current epoch for this peer
+        uint64_t current_epoch = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_peers_mutex);
+            auto ctx_it = m_peer_contexts.find(peer_id);
+            if (ctx_it != m_peer_contexts.end()) {
+                current_epoch = ctx_it->second.connect_epoch;
+            }
+        }
+        
         if (!session) {
             LOG_WARN("SM: Failed to create secure session for initiator " + peer_id);
-            pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_FAILED});
+            pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_FAILED, current_epoch});
             return;
         }
 
@@ -1509,7 +1694,16 @@ void SessionManager::Impl::initializeNoiseHandshake(const std::string& peer_id) 
             session = m_secure_session_manager->get_or_create_session(peer_id, NoiseNKSession::Role::INITIATOR);
             if (!session) {
                 LOG_WARN("SM: Failed to recreate secure session for initiator " + peer_id);
-                pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_FAILED});
+                // Get current epoch
+                uint64_t current_epoch = 0;
+                {
+                    std::lock_guard<std::mutex> lock(m_peers_mutex);
+                    auto ctx_it = m_peer_contexts.find(peer_id);
+                    if (ctx_it != m_peer_contexts.end()) {
+                        current_epoch = ctx_it->second.connect_epoch;
+                    }
+                }
+                pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_FAILED, current_epoch});
                 return;
             }
         }
@@ -1539,8 +1733,32 @@ std::string SessionManager::Impl::processNoiseHandshakeMessage(const std::string
         return "";
     }
 
+    // Check if this is a relay reconnect (peer lost direct path and is reconnecting via signaling)
+    // Also check the cooldown to prevent infinite handshake loops
+    bool is_relay_reconnect = false;
+    bool within_cooldown = false;
+    constexpr auto HANDSHAKE_COOLDOWN = std::chrono::seconds(5);  // Don't reset session if handshake completed within 5s
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        auto ctx_it = m_peer_contexts.find(peer_id);
+        if (ctx_it != m_peer_contexts.end()) {
+            is_relay_reconnect = ctx_it->second.is_relay_reconnect;
+            ctx_it->second.is_relay_reconnect = false;  // Clear flag after reading
+            
+            // Check if handshake completed recently - if so, don't allow reset to prevent loops
+            auto now = std::chrono::steady_clock::now();
+            auto time_since_handshake = now - ctx_it->second.last_handshake_completed;
+            if (ctx_it->second.last_handshake_completed != std::chrono::steady_clock::time_point{} &&
+                time_since_handshake < HANDSHAKE_COOLDOWN) {
+                within_cooldown = true;
+            }
+        }
+    }
+
     std::string response;
     bool handshake_ready = false;
+    std::vector<uint8_t> pending_send_key;
+    std::vector<uint8_t> pending_recv_key;
     {
         // IMPORTANT: SecureSession/Noise state is not thread-safe. Hold the mutex while
         // checking readiness and processing the handshake message.
@@ -1550,10 +1768,24 @@ std::string SessionManager::Impl::processNoiseHandshakeMessage(const std::string
         // IMPORTANT: If a session is already READY, do not reset it just because a handshake
         // message arrived. During connect/handshake races, the peer may resend handshake frames,
         // and resetting here can create an endless loop where neither side can finish.
-        // Restart/re-key scenarios are handled via CONTROL_CONNECT (and related) restart detection.
+        // EXCEPTION: If this is a relay reconnect (peer lost direct path e.g. WiFi toggle),
+        // allow resetting the session so the peer can re-establish connection.
+        // HOWEVER: If handshake completed very recently (within cooldown), do NOT reset -
+        // this prevents infinite handshake loops when both sides relay-reconnect simultaneously.
         if (session && session->is_ready()) {
-            LOG_INFO("SM: Received handshake message for READY session with " + peer_id + " - ignoring");
-            return "";
+            if (is_relay_reconnect && !within_cooldown) {
+                LOG_INFO("SM: Relay reconnect from " + peer_id + " - resetting READY session to allow re-handshake");
+                m_secure_session_manager->remove_session(peer_id);
+                session = nullptr;
+                // FSM will receive HANDSHAKE_SUCCESS after re-handshake completes.
+                // The FSM now accepts HANDSHAKE_SUCCESS in READY state (idempotent).
+            } else if (is_relay_reconnect && within_cooldown) {
+                LOG_INFO("SM: Relay reconnect from " + peer_id + " within cooldown - ignoring to prevent handshake loop");
+                return "";
+            } else {
+                LOG_INFO("SM: Received handshake message for READY session with " + peer_id + " - ignoring");
+                return "";
+            }
         }
 
         // Detect and resolve simultaneous handshake initiation (glare)
@@ -1602,6 +1834,13 @@ std::string SessionManager::Impl::processNoiseHandshakeMessage(const std::string
             return "";
         }
         handshake_ready = session->is_ready();
+        // Derive per-session transport keys, but DO NOT register them yet.
+        // The handshake response (msg2) must still travel with the shared
+        // network key because the peer only derives its own keys after
+        // receiving it. Registration happens after the response is sent.
+        if (handshake_ready && session) {
+            session->get_transport_keys(pending_send_key, pending_recv_key);
+        }
     }
 
     LOG_INFO("SM: Returned from session->process_handshake for " + peer_id + ", response size=" + std::to_string(response.size()));
@@ -1611,13 +1850,47 @@ std::string SessionManager::Impl::processNoiseHandshakeMessage(const std::string
         sendNoiseHandshakeMessage(peer_id, response);
     }
 
+    // Register per-session transport keys once the peer can decrypt them.
+    // (After the response above has gone out with the shared network key.)
+    if (handshake_ready && pending_send_key.size() == 32 && pending_recv_key.size() == 32) {
+        set_peer_transport_keys(peer_id, pending_send_key.data(), pending_recv_key.data());
+        // Also register under the active network_id so transports
+        // (which only know ip:port) can find the key on receive.
+        std::string net_id;
+        {
+            std::lock_guard<std::mutex> lock(m_peers_mutex);
+            auto pit = m_peers.find(peer_id);
+            if (pit != m_peers.end() && !pit->second.network_id.empty()) {
+                net_id = pit->second.network_id;
+            }
+        }
+        if (!net_id.empty()) {
+            set_peer_transport_keys(net_id, pending_send_key.data(), pending_recv_key.data());
+        }
+        LOG_INFO("SM: Registered per-session transport keys for peer " + peer_id);
+    }
+
+    // Get current epoch for this peer and update handshake completion timestamp
+    uint64_t current_epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        auto ctx_it = m_peer_contexts.find(peer_id);
+        if (ctx_it != m_peer_contexts.end()) {
+            current_epoch = ctx_it->second.connect_epoch;
+            if (handshake_ready) {
+                // Record when handshake completed - used for cooldown to prevent loops
+                ctx_it->second.last_handshake_completed = std::chrono::steady_clock::now();
+            }
+        }
+    }
+    
     if (handshake_ready) {
         LOG_INFO("SM: Noise handshake completed with peer " + peer_id);
-        pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_SUCCESS});
+        pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_SUCCESS, current_epoch});
         flushQueuedMessages(peer_id);
     } else if (response.empty()) {
         LOG_WARN("SM: Noise handshake with peer " + peer_id + " did not progress - marking as failed");
-        pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_FAILED});
+        pushEvent(FSMEvent{peer_id, PeerEvent::HANDSHAKE_FAILED, current_epoch});
     }
 
     return response;
@@ -1701,6 +1974,132 @@ void SessionManager::Impl::sendNoiseHandshakeMessage(const std::string& peer_id,
 
     const std::string encoded = wire::encode_message(MessageType::HANDSHAKE_NOISE, handshake_payload);
     send_message_to_peer(network_id, encoded);
+    
+    // SIGNALING RELAY FALLBACK: Also relay handshake via signaling for AP isolation scenarios
+    // This ensures handshakes can complete even when direct UDP is blocked
+    // AP isolation commonly blocks device-to-device traffic on WiFi networks
+    if (m_signaling_client && m_signaling_registered.load(std::memory_order_acquire)) {
+        // Base64 encode the handshake payload for signaling transport
+        auto base64_encode = [](const std::string& data) -> std::string {
+            static const char* base64_chars = 
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string result;
+            result.reserve(((data.size() + 2) / 3) * 4);
+            
+            unsigned int val = 0;
+            int valb = -6;
+            for (unsigned char c : data) {
+                val = (val << 8) + c;
+                valb += 8;
+                while (valb >= 0) {
+                    result.push_back(base64_chars[(val >> valb) & 0x3F]);
+                    valb -= 6;
+                }
+            }
+            if (valb > -6) result.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+            while (result.size() % 4) result.push_back('=');
+            return result;
+        };
+        
+        std::string encoded_payload = base64_encode(handshake_payload);
+        std::string relay_msg = "HANDSHAKE_RELAY|" + encoded_payload;
+        
+        try {
+            m_signaling_client->sendSignal(peer_id, relay_msg);
+            LOG_INFO("SM: Sent HANDSHAKE_RELAY to " + peer_id + " via signaling (AP isolation fallback)");
+            Telemetry::getInstance().inc_counter("handshake_relay_sent_total");
+        } catch (const std::exception& e) {
+            LOG_WARN("SM: Failed to relay handshake via signaling to " + peer_id + ": " + e.what());
+        } catch (...) {
+            LOG_WARN("SM: Failed to relay handshake via signaling to " + peer_id);
+        }
+    }
+}
+
+void SessionManager::Impl::proactiveHandshakeRelay(const std::string& peer_id) {
+    // PROACTIVE RELAY ESCALATION: Re-send the handshake via signaling relay when the
+    // peer is stuck in HANDSHAKING state for too long. This handles cases where:
+    // - UDP handshake packets are being dropped
+    // - LAN connectivity hasn't fully established after WiFi re-enable
+    // - AP isolation blocks direct device-to-device traffic
+    
+    if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) {
+        return;
+    }
+    
+    // Check if peer is still in HANDSHAKING state
+    PeerState current_state = PeerState::UNKNOWN;
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        auto ctx_it = m_peer_contexts.find(peer_id);
+        if (ctx_it == m_peer_contexts.end()) {
+            return;
+        }
+        current_state = ctx_it->second.state;
+    }
+    
+    if (current_state != PeerState::HANDSHAKING) {
+        return;
+    }
+    
+    // Get session and re-generate handshake message
+    std::string handshake_payload;
+    {
+        std::lock_guard<std::mutex> lock(m_secure_session_mutex);
+        auto session = m_secure_session_manager->get_session(peer_id);
+        if (!session) {
+            return;
+        }
+        
+        if (session->is_ready()) {
+            // Session already completed - handshake succeeded via another path
+            return;
+        }
+        
+        // For initiator sessions, start_handshake() returns the cached first message
+        // if already initiated, so this is safe to call again
+        handshake_payload = session->start_handshake();
+    }
+    
+    if (handshake_payload.empty()) {
+        // We're not the initiator or session is in unexpected state
+        return;
+    }
+    
+    // Base64 encode and send via relay
+    auto base64_encode = [](const std::string& data) -> std::string {
+        static const char* base64_chars = 
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string result;
+        result.reserve(((data.size() + 2) / 3) * 4);
+        
+        unsigned int val = 0;
+        int valb = -6;
+        for (unsigned char c : data) {
+            val = (val << 8) + c;
+            valb += 8;
+            while (valb >= 0) {
+                result.push_back(base64_chars[(val >> valb) & 0x3F]);
+                valb -= 6;
+            }
+        }
+        if (valb > -6) result.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
+        while (result.size() % 4) result.push_back('=');
+        return result;
+    };
+    
+    std::string encoded_payload = base64_encode(handshake_payload);
+    std::string relay_msg = "HANDSHAKE_RELAY|" + encoded_payload;
+    
+    try {
+        m_signaling_client->sendSignal(peer_id, relay_msg);
+        LOG_INFO("SM: Proactive HANDSHAKE_RELAY sent to " + peer_id + " (escalation after UDP timeout)");
+        Telemetry::getInstance().inc_counter("handshake_relay_escalation_total");
+    } catch (const std::exception& e) {
+        LOG_WARN("SM: Failed to send proactive relay to " + peer_id + ": " + e.what());
+    } catch (...) {
+        LOG_WARN("SM: Failed to send proactive relay to " + peer_id);
+    }
 }
 #endif
 
@@ -1720,6 +2119,77 @@ void SessionManager::Impl::handleDiscoveryResponse(const std::string& discovered
     m_peer_lifecycle_manager->handleConnectToPeer(ConnectToPeerEvent{discovered_peer_id});
 }
 
+void SessionManager::Impl::handleDiscoveryResponseWithEndpoint(
+        const std::string& discovered_peer_id,
+        const std::string& responder_ip,
+        int responder_port,
+        int latency_ms) {
+    // Shutdown guard - early return if shutting down
+    if (m_shutting_down.load(std::memory_order_acquire)) {
+        return;
+    }
+    
+    // Validate peer_id to reject phantom/malformed entries like "TIMEOUT"
+    if (discovered_peer_id.empty() || discovered_peer_id.length() < 3 || discovered_peer_id.length() > 128) {
+        LOG_WARN("SM: Rejecting discovery response with invalid peer_id length: '" + discovered_peer_id + "'");
+        Telemetry::getInstance().inc_counter("phantom_discovery_rejected_total");
+        return;
+    }
+    
+    // Reject common error strings that can appear due to parsing bugs
+    static const std::vector<std::string> invalid_peer_ids = {
+        "TIMEOUT", "timeout", "ERROR", "error", "NULL", "null",
+        "undefined", "UNDEFINED", "none", "NONE", "unknown", "UNKNOWN"
+    };
+    for (const auto& invalid : invalid_peer_ids) {
+        if (discovered_peer_id == invalid) {
+            LOG_WARN("SM: Rejecting discovery response with phantom peer_id: '" + discovered_peer_id + "'");
+            Telemetry::getInstance().inc_counter("phantom_discovery_rejected_total");
+            return;
+        }
+    }
+    
+    // Validate endpoint - reject malformed responses (e.g., ":204338992" with empty IP)
+    if (responder_ip.empty() || responder_port <= 0 || responder_port > 65535) {
+        LOG_WARN("SM: Rejecting discovery response with invalid endpoint for " + discovered_peer_id +
+                 ": ip='" + responder_ip + "' port=" + std::to_string(responder_port));
+        Telemetry::getInstance().inc_counter("invalid_discovery_endpoint_rejected_total");
+        return;
+    }
+    
+    LOG_INFO("SM: Discovery response with endpoint for " + discovered_peer_id + 
+             " at " + responder_ip + ":" + std::to_string(responder_port) +
+             " (latency=" + std::to_string(latency_ms) + "ms)");
+    
+    {
+        std::lock_guard<std::mutex> lock(m_scheduledEventsMutex);
+        m_peers_being_discovered.erase(discovered_peer_id);
+    }
+    
+    // If we have valid endpoint info, create a LAN discovery result event
+    // This will properly update the peer with the local IP
+    if (!responder_ip.empty() && responder_port > 0) {
+        LanDiscoveryResultEvent lan_event;
+        lan_event.peerId = discovered_peer_id;
+        lan_event.lanIp = responder_ip;
+        lan_event.lanPort = responder_port;
+        lan_event.latencyMs = latency_ms;
+        lan_event.hopCount = 1;
+        
+        // Process LAN discovery to update peer endpoint
+        handleLanDiscoveryResult(lan_event);
+    }
+    
+    // Always trigger connect attempt
+    m_peer_lifecycle_manager->handleConnectToPeer(
+        ConnectToPeerEvent{discovered_peer_id, false, "lan_discovery"});
+}
+
+void SessionManager::Impl::handleLanDiscoveryResult(const LanDiscoveryResultEvent& event) {
+    // Delegate to peer lifecycle manager for proper endpoint handling
+    m_peer_lifecycle_manager->handleLanDiscoveryResult(event);
+}
+
 void SessionManager::Impl::initializeTierSystemCallbacks() {
     if (!m_failsafe) return;
     
@@ -1734,7 +2204,7 @@ void SessionManager::Impl::initializeTierSystemCallbacks() {
         } catch (...) {}
     });
     
-    m_failsafe->set_health_callback([this](bool is_healthy) {
+    m_failsafe->set_health_callback([](bool is_healthy) {
         if (!is_healthy) {
             LOG_WARN("SM: Tier system degraded");
         }
@@ -1754,7 +2224,18 @@ void SessionManager::Impl::notifyPeerUpdate() {
                 peer_list.push_back(kv.second);
             }
         }
-        m_peer_update_cb(peer_list);
+        
+        // Do not create an unowned callback thread: UI/JNI teardown can otherwise
+        // race a callback after SessionManager has stopped. The peer lock was
+        // released above, so delivery cannot deadlock the peer store.
+        auto cb = m_peer_update_cb;
+        try {
+            cb(peer_list);
+        } catch (const std::exception& e) {
+            LOG_WARN("SM: Peer update callback failed: " + std::string(e.what()));
+        } catch (...) {
+            LOG_WARN("SM: Peer update callback failed with an unknown exception");
+        }
     }
 }
 
@@ -1773,28 +2254,38 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
         LOG_WARN("SM: Handling FSM event for " + event.peerId + " (len=" + std::to_string(event.peerId.length()) + ") local: " + m_localPeerId + " (len=" + std::to_string(m_localPeerId.length()) + ")");
     }
     
-    PeerContext* ctx = nullptr;
-
+    PeerState prev_state = PeerState::UNKNOWN;
+    PeerState new_state = PeerState::UNKNOWN;
+    std::chrono::steady_clock::time_point prev_enter{};
+    FSMResult result{PeerState::UNKNOWN};
     {
         NATIVELOGW("SM_NATIVE: handleFSMEvent - acquiring peers_mutex");
         std::lock_guard<std::mutex> lock(m_peers_mutex);
         auto it = m_peer_contexts.find(event.peerId);
-        if (it != m_peer_contexts.end()) {
-            ctx = &it->second;
+        if (it == m_peer_contexts.end()) {
+            NATIVELOGW("SM_NATIVE: handleFSMEvent - ctx not found");
+            return;
         }
+        PeerContext& ctx = it->second;
+
+        // Do not let a pointer into m_peer_contexts escape this critical section:
+        // concurrent removal/insertion can rehash the map and invalidate it.
+        if (event.connect_epoch > 0 && ctx.connect_epoch > 0 &&
+            event.connect_epoch != ctx.connect_epoch) {
+            LOG_INFO("SM: Ignoring stale FSM event for " + event.peerId +
+                     " (event_epoch=" + std::to_string(event.connect_epoch) +
+                     ", current_epoch=" + std::to_string(ctx.connect_epoch) + ")");
+            return;
+        }
+
+        prev_state = ctx.state;
+        prev_enter = ctx.last_state_change;
+        NATIVELOGW(("SM_NATIVE: handleFSMEvent - calling fsm.handle_event. Current State: " + std::to_string(static_cast<int>(ctx.state)) + ", Event: " + std::to_string(static_cast<int>(event.fsmEvent))).c_str());
+        result = m_peer_fsm.handle_event(ctx, event.fsmEvent);
+        new_state = ctx.state;
         NATIVELOGW("SM_NATIVE: handleFSMEvent - releasing peers_mutex");
     }
-
-    if (!ctx) {
-        NATIVELOGW("SM_NATIVE: handleFSMEvent - ctx not found");
-        return;
-    }
-
-    const PeerState prev_state = ctx->state;
-    const auto prev_enter = ctx->last_state_change;
-    NATIVELOGW(("SM_NATIVE: handleFSMEvent - calling fsm.handle_event. Current State: " + std::to_string(static_cast<int>(ctx->state)) + ", Event: " + std::to_string(static_cast<int>(event.fsmEvent))).c_str());
-    FSMResult result = m_peer_fsm.handle_event(*ctx, event.fsmEvent);
-    const PeerState new_state = ctx->state;
+    const bool fsm_state_changed = (prev_state != new_state);
 
     // ---------------- Telemetry: FSM events + state durations ----------------
     {
@@ -1834,14 +2325,65 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
         if (it != m_peers.end()) {
             Peer& peer = it->second;
 
-            const bool is_ready_for_messages = m_use_noise_protocol ? (ctx->state == PeerState::READY)
-                                                                    : (ctx->state == PeerState::CONNECTED || ctx->state == PeerState::READY);
-            const bool is_hard_disconnected = (ctx->state == PeerState::DISCONNECTED || ctx->state == PeerState::FAILED || ctx->state == PeerState::DEGRADED);
+            const bool is_ready_for_messages = m_use_noise_protocol ? (new_state == PeerState::READY)
+                                                                    : (new_state == PeerState::CONNECTED || new_state == PeerState::READY);
+            const bool is_hard_disconnected = (new_state == PeerState::DISCONNECTED || new_state == PeerState::FAILED || new_state == PeerState::DEGRADED);
 
             if (is_ready_for_messages) {
                 if (!peer.connected) {
                     peer.connected = true;
-                    LOG_INFO("SM: Peer " + event.peerId + " is now CONNECTED (FSM state=" + std::to_string(static_cast<int>(ctx->state)) + ")");
+                    
+                    // Determine and set the connection path based on how we connected
+                    // Check if the peer context has is_relay_reconnect set (signaling relay)
+                    auto ctx_it = m_peer_contexts.find(event.peerId);
+                    if (ctx_it != m_peer_contexts.end() && ctx_it->second.is_relay_reconnect) {
+                        peer.active_connection_path = ConnectionPath::SIGNALING_RELAY;
+                    } else {
+                        // Determine based on the endpoint type being used
+                        const std::string& current_ip = peer.ip;
+                        bool is_private_ip = false;
+                        if (!current_ip.empty()) {
+                            is_private_ip = (current_ip.rfind("10.", 0) == 0 ||
+                                            current_ip.rfind("192.168.", 0) == 0 ||
+                                            current_ip.rfind("127.", 0) == 0 ||
+                                            current_ip.rfind("169.254.", 0) == 0);
+                            // Check 172.16-31.x range
+                            if (!is_private_ip && current_ip.rfind("172.", 0) == 0 && current_ip.size() > 4) {
+                                size_t dot_pos = current_ip.find('.', 4);
+                                if (dot_pos != std::string::npos) {
+                                    int second_octet = std::stoi(current_ip.substr(4, dot_pos - 4));
+                                    is_private_ip = (second_octet >= 16 && second_octet <= 31);
+                                }
+                            }
+                        }
+                        
+                        if (is_private_ip) {
+                            peer.active_connection_path = ConnectionPath::LAN_DIRECT;
+                        } else {
+                            // Check if we're using a RELAY endpoint candidate
+                            bool using_relay = false;
+                            for (const auto& candidate : peer.endpoint_candidates) {
+                                if (candidate.type == EndpointType::RELAY &&
+                                    candidate.ip == peer.ip) {
+                                    using_relay = true;
+                                    break;
+                                }
+                            }
+                            peer.active_connection_path = using_relay ? ConnectionPath::WAN_TURN_RELAY 
+                                                                      : ConnectionPath::WAN_HOLE_PUNCH;
+                        }
+                    }
+                    
+                    LOG_INFO("SM: Peer " + event.peerId + " is now CONNECTED (FSM state=" + 
+                             std::to_string(static_cast<int>(new_state)) + ", path=" + 
+                             connectionPathToString(peer.active_connection_path) + ")");
+                    
+                    // Report connection path to telemetry
+                    Telemetry::getInstance().set_peer_connection(
+                        event.peerId, 
+                        connectionPathToString(peer.active_connection_path), 
+                        true);
+                    
                     peer_status_changed = true;
                     should_persist_connected_state = true;
                     new_connected_state = true;
@@ -1849,7 +2391,12 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
             } else if (is_hard_disconnected) {
                 if (peer.connected) {
                     peer.connected = false;
-                    LOG_INFO("SM: Peer " + event.peerId + " is now DISCONNECTED (FSM state=" + std::to_string(static_cast<int>(ctx->state)) + ")");
+                    peer.active_connection_path = ConnectionPath::UNKNOWN;  // Reset on disconnect
+                    LOG_INFO("SM: Peer " + event.peerId + " is now DISCONNECTED (FSM state=" + std::to_string(static_cast<int>(new_state)) + ")");
+                    
+                    // Report disconnection to telemetry
+                    Telemetry::getInstance().set_peer_connection(event.peerId, "UNKNOWN", false);
+                    
                     peer_status_changed = true;
                     should_persist_connected_state = true;
                     new_connected_state = false;
@@ -1859,7 +2406,12 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
                 // be treated as connected; keep current peer.connected value unless we need to drop it.
                 if (m_use_noise_protocol && peer.connected) {
                     peer.connected = false;
-                    LOG_INFO("SM: Peer " + event.peerId + " leaving READY; now not connected for messaging (FSM state=" + std::to_string(static_cast<int>(ctx->state)) + ")");
+                    peer.active_connection_path = ConnectionPath::UNKNOWN;  // Reset on leaving READY
+                    LOG_INFO("SM: Peer " + event.peerId + " leaving READY; now not connected for messaging (FSM state=" + std::to_string(static_cast<int>(new_state)) + ")");
+                    
+                    // Report state change to telemetry
+                    Telemetry::getInstance().set_peer_connection(event.peerId, "UNKNOWN", false);
+                    
                     peer_status_changed = true;
                     should_persist_connected_state = true;
                     new_connected_state = false;
@@ -1868,7 +2420,7 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
         }
     }
     
-    if (peer_status_changed) {
+    if (peer_status_changed || fsm_state_changed) {
         notifyPeerUpdate();
     }
 
@@ -1903,13 +2455,16 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
             policy.on_connection_success(event.peerId, policy_method, rtt_ms);
         }
 
-        // Failures / disconnects: schedule backoff.
+        // Failures / disconnects: schedule backoff with reason-aware classification
         if (event.fsmEvent == PeerEvent::CONNECT_FAILED) {
-            policy.on_connection_failure(event.peerId, policy_method);
+            policy.on_connection_failure(event.peerId, policy_method, 
+                ConnectionFailureReason::TIMEOUT_CONNECT, 0.0f);
         } else if (event.fsmEvent == PeerEvent::HANDSHAKE_FAILED) {
-            policy.on_connection_failure(event.peerId, "HANDSHAKE");
+            policy.on_connection_failure(event.peerId, "HANDSHAKE", 
+                ConnectionFailureReason::TIMEOUT_HANDSHAKE, 0.0f);
         } else if (event.fsmEvent == PeerEvent::DISCONNECT_DETECTED) {
-            policy.on_connection_failure(event.peerId, "DISCONNECT");
+            policy.on_connection_failure(event.peerId, "DISCONNECT", 
+                ConnectionFailureReason::NO_ROUTE, 0.0f);
         }
     }
 
@@ -1988,6 +2543,7 @@ void SessionManager::Impl::handleFSMEvent(const FSMEvent& event) {
                 break;
 
             case PeerAction::CLEANUP_RESOURCES:
+                clear_peer_transport_keys(event.peerId);
 #if HAVE_NOISE_PROTOCOL
                 {
                     std::lock_guard<std::mutex> ssl(m_secure_session_mutex);
@@ -2040,6 +2596,7 @@ void SessionManager::Impl::timerLoop() {
 
 void SessionManager::Impl::handleSendMessageWithRetry(const std::string& peer_id, const std::string& network_id, 
                                    const std::string& message, const std::string& message_id) {
+    (void)message_id;
     LOG_INFO("SM: handleSendMessageWithRetry called - peer_id=" + peer_id + ", network_id=" + network_id + ", msg_len=" + std::to_string(message.length()));
 
     Telemetry::getInstance().inc_counter("tx_messages_total");
@@ -2077,7 +2634,8 @@ void SessionManager::Impl::set_battery_level(int percent, bool is_charging) {
 void SessionManager::Impl::set_network_info(bool is_wifi, bool is_available) {
     PeerReconnectPolicy& policy = PeerReconnectPolicy::getInstance();
     policy.set_network_type(is_wifi, is_available);
-    LOG_DEBUG("SM: Network - WiFi: " + (is_wifi ? std::string("true") : std::string("false")));
+    LOG_INFO("SM: Network info update - WiFi: " + std::string(is_wifi ? "true" : "false") + 
+             ", Available: " + std::string(is_available ? "true" : "false"));
 
     const bool was_available = m_network_available.exchange(is_available, std::memory_order_acq_rel);
     const bool was_wifi = m_is_wifi.exchange(is_wifi, std::memory_order_acq_rel);
@@ -2087,41 +2645,304 @@ void SessionManager::Impl::set_network_info(bool is_wifi, bool is_available) {
     // but it *does* invalidate our NAT mapping + signaling-advertised network_id.
     const bool network_restored = (!was_available && is_available);
     const bool network_type_changed = (was_available && is_available && was_wifi != is_wifi);
+    const bool switched_to_wifi = network_type_changed && is_wifi;
     if (network_restored || network_type_changed) {
+        m_last_network_change_ms.store(steady_now_ms(), std::memory_order_release);
         Telemetry::getInstance().inc_counter("network_change_total");
         if (network_restored) Telemetry::getInstance().inc_counter("network_change_restored_total");
         if (network_type_changed) Telemetry::getInstance().inc_counter("network_change_type_total");
         LOG_INFO(std::string("SM: Network change detected (") +
                  (network_restored ? "restored" : "type_changed") +
-                 ", wifi=" + (is_wifi ? "true" : "false") + "). Refreshing NAT/signaling.");
+                 ", wifi=" + (is_wifi ? "true" : "false") + "). Triggering rugged recovery.");
+
+        // RUGGED RECOVERY: Delegate to the recovery manager for coordinated recovery
+        // This handles socket restart, session invalidation, and parallel reconnects
+        if (m_recovery_manager) {
+            std::lock_guard<std::mutex> worker_lock(m_owned_recovery_workers_mutex);
+            if (!m_shutting_down.load(std::memory_order_acquire)) {
+                if (m_network_recovery_thread.joinable() &&
+                    !m_network_recovery_in_progress.load(std::memory_order_acquire)) {
+                    m_network_recovery_thread.join();
+                }
+                bool expected = false;
+                if (m_network_recovery_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                    m_network_recovery_thread = std::thread([this, is_wifi, is_available]() {
+                        struct Guard {
+                            std::atomic<bool>& flag;
+                            ~Guard() { flag.store(false, std::memory_order_release); }
+                        } guard{m_network_recovery_in_progress};
+                        if (!m_shutting_down.load(std::memory_order_acquire) && m_recovery_manager) {
+                            m_recovery_manager->handle_network_change(is_wifi, is_available);
+                        }
+                    });
+                }
+            }
+        }
+
+        // CRITICAL FIX: Restart UDP socket on network interface change.
+        // On Android, when switching between WiFi and LTE, the old socket may remain
+        // associated with the old network interface. This causes packets to be routed
+        // through the wrong interface or dropped entirely. Restarting the socket forces
+        // the kernel to bind to the new active interface.
+        if (m_udpConnectionManager) {
+            LOG_INFO("SM: Restarting UDP socket after network interface change");
+            if (m_udpConnectionManager->restartSocket()) {
+                LOG_INFO("SM: UDP socket restarted successfully");
+                Telemetry::getInstance().inc_counter("network_change_socket_restart_success_total");
+            } else {
+                LOG_WARN("SM: Failed to restart UDP socket after network change");
+                Telemetry::getInstance().inc_counter("network_change_socket_restart_failed_total");
+            }
+        }
+
+        // Network transitions often invalidate NAT mappings and temporarily break handshakes.
+        // Clear per-peer cooldown/backoff so recovery isn't blocked by stale suppression.
+        policy.reset_all_peer_stats();
+        Telemetry::getInstance().inc_counter("reconnect_policy_reset_total");
+
+        // CRITICAL FIX: Invalidate ALL connected peer sessions on network type change.
+        // When WiFi<->LTE transitions occur, the UDP "sessions" become stale - the peer
+        // may still be listening on the same IP:port, but our source IP has changed and
+        // they won't recognize our packets. We must force re-handshake on all peers.
+        // This also clears any Noise sessions that are bound to the old network path.
+        {
+            std::vector<std::string> peers_to_invalidate;
+            {
+                std::lock_guard<std::mutex> lock(m_peers_mutex);
+            for (auto& kv : m_peers) {
+                Peer& peer = kv.second;
+                if (peer.connected) {
+                    peers_to_invalidate.push_back(peer.id);
+                    // Mark as disconnected so next connect attempt does full handshake
+                    peer.connected = false;
+                }
+            }
+            }
+            
+            // Clear Noise sessions for these peers so we re-handshake
+            if (!peers_to_invalidate.empty()) {
+                LOG_INFO("SM: Network change - invalidating " + std::to_string(peers_to_invalidate.size()) + 
+                         " peer sessions for re-handshake");
+                Telemetry::getInstance().inc_counter("network_change_session_invalidation_total");
+                
+                for (const auto& peer_id : peers_to_invalidate) {
+                    // Clear any existing Noise session
+#if HAVE_NOISE_PROTOCOL
+                    if (m_secure_session_manager) {
+                        std::lock_guard<std::mutex> noise_lock(m_secure_session_mutex);
+                        m_secure_session_manager->remove_session(peer_id);
+                    }
+#endif
+                    // Transition FSM state to DISCONNECTED
+                    bool needs_disconnect_event = false;
+                    {
+                        std::lock_guard<std::mutex> lock(m_peers_mutex);
+                        auto ctx_it = m_peer_contexts.find(peer_id);
+                        needs_disconnect_event = ctx_it != m_peer_contexts.end() &&
+                            (ctx_it->second.state == PeerState::READY || ctx_it->second.state == PeerState::CONNECTED);
+                    }
+                    if (needs_disconnect_event) {
+                        pushEvent(FSMEvent{peer_id, PeerEvent::DISCONNECT_DETECTED});
+                    }
+                }
+            }
+        }
+
+        // LAN IP OPTIMIZATION: When switching TO WiFi, broadcast updated LAN IP to ALL known
+        // peers (even connected ones). This allows peers on the same LAN to discover each other
+        // directly and bypass AP Isolation by exchanging LAN IPs via signaling.
+        if (switched_to_wifi && m_signaling_enabled) {
+            LOG_INFO("SM: Switched to WiFi - broadcasting updated LAN IP to all peers");
+            schedule_lan_ip_broadcast_(std::chrono::milliseconds(300));
+        }
+
+        // SELF-HEALING OPTIMIZATION: Trigger immediate reconnect for all disconnected peers.
+        // This bypasses all backoff timers to allow the fastest possible recovery after
+        // WiFi<->LTE transitions. The maintenance manager will pick these up on the next
+        // timer tick and attempt reconnection.
+        policy.trigger_immediate_reconnect_all();
+        Telemetry::getInstance().inc_counter("immediate_reconnect_trigger_total");
+        
+        // PRODUCTION-READY: Immediately start reconnect attempts for disconnected peers
+        // Don't wait for maintenance tick - start reconnecting NOW
+        {
+            std::vector<std::string> disconnected_peers;
+            {
+                std::lock_guard<std::mutex> lock(m_peers_mutex);
+            for (const auto& kv : m_peers) {
+                const Peer& peer = kv.second;
+                if (!peer.connected) {
+                    auto ctx_it = m_peer_contexts.find(peer.id);
+                    if (ctx_it != m_peer_contexts.end()) {
+                        PeerState state = ctx_it->second.state;
+                        if (state == PeerState::DISCONNECTED || 
+                            state == PeerState::DEGRADED || 
+                            state == PeerState::FAILED) {
+                            disconnected_peers.push_back(peer.id);
+                        }
+                    }
+                }
+            }
+            }
+            
+            // connectToPeer only queues an event; calling it directly avoids
+            // detached workers and preserves a single shutdown ownership model.
+            constexpr size_t max_parallel = 5;
+            for (size_t i = 0; i < std::min(max_parallel, disconnected_peers.size()); i++) {
+                const std::string& peer_id = disconnected_peers[i];
+                LOG_INFO("SM: Immediately reconnecting peer " + peer_id + " after network change");
+                connectToPeer(peer_id, true, "network_change_immediate");
+            }
+            
+            // Queue remaining peers for maintenance manager to handle
+            for (size_t i = max_parallel; i < disconnected_peers.size(); i++) {
+                const std::string& peer_id = disconnected_peers[i];
+                policy.track_peer(peer_id);
+            }
+        }
+
+        // Self-heal: make sure NATTraversal is still wired up to our UDP transport before
+        // refreshing the external address (otherwise STUN can return an unusable ephemeral port).
+        ensure_nat_connection_manager_registered_();
+
+        // Reset hole punch failure counters so peers can get fresh attempts after network change.
+        // This is critical because the NAT type may change (e.g., from Symmetric to Full Cone)
+        // after switching networks, making hole punching viable again.
+        NATTraversal::getInstance().resetHolePunchFailures();
 
         // Refresh external address and publish updated network_id to signaling (if registered).
         refresh_external_address_async(true);
 
         if (m_signaling_enabled) {
+            // Network transitions can leave the signaling TCP socket "connected" but unusable
+            // (stale route, stalled receive loop, captive portal, etc.). Force a full reconnect so
+            // REGISTER_ACK timing is bounded and recovery is deterministic.
+            m_force_signaling_reconnect_requested.store(true, std::memory_order_release);
+
             // Treat a network change as a recovery opportunity: ask signaling for a fresh peer list
             // and keep a best-effort persistent connection so future flaps can self-heal.
             m_signaling_bootstrap_requested.store(true, std::memory_order_release);
             m_signaling_persistent_after_db_exhausted.store(true, std::memory_order_release);
 
-            constexpr auto kPeerListCooldown = std::chrono::seconds(5);
-            const auto now_local = std::chrono::steady_clock::now();
-            const bool allow_list = (m_last_signaling_peer_list_request == std::chrono::steady_clock::time_point{} ||
-                                     (now_local - m_last_signaling_peer_list_request) >= kPeerListCooldown);
-            if (allow_list) {
-                m_last_signaling_peer_list_request = now_local;
-                if (m_signaling_client && m_signaling_client->isConnected() &&
-                    m_signaling_registered.load(std::memory_order_acquire)) {
-                    m_signaling_client->sendListPeers();
-                } else {
-                    ensure_signaling_connected_async(true);
-                }
-            } else {
-                // Even if we throttle LIST_PEERS, still ensure we reconnect signaling.
-                ensure_signaling_connected_async(true);
-            }
+            // IMPORTANT:
+            // Always run the signaling recovery path on network change. Sending LIST_PEERS on an
+            // existing socket can look successful while the TCP route is stale (Android handoffs).
+            // ensure_signaling_connected_async(true) will either force a full reconnect or at
+            // least re-register, bounding recovery.
+            ensure_signaling_connected_async(true);
         }
     }
+}
+
+// Broadcast updated LAN IP to all known peers via signaling.
+// This is called when switching to WiFi to enable LAN discovery optimization.
+void SessionManager::Impl::broadcastLanIpUpdate() {
+    if (!m_signaling_enabled) return;
+    
+    // Get our current LAN IP
+    Discovery* discovery = getGlobalDiscoveryInstance();
+    if (!discovery) {
+        LOG_WARN("SM: broadcastLanIpUpdate: No discovery instance");
+        return;
+    }
+    
+    std::string lan_ip = discovery->getLocalLanIP();
+    if (lan_ip.empty()) {
+        LOG_INFO("SM: broadcastLanIpUpdate: No LAN IP available");
+        return;
+    }
+    
+    LOG_INFO("SM: broadcastLanIpUpdate: Broadcasting LAN IP " + lan_ip + " to all peers");
+    
+    // Collect all known peer IDs
+    std::vector<std::string> peer_ids;
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        for (const auto& kv : m_peers) {
+            peer_ids.push_back(kv.first);
+        }
+    }
+    
+    if (peer_ids.empty()) {
+        LOG_INFO("SM: broadcastLanIpUpdate: No known peers to broadcast to");
+        return;
+    }
+    
+    // Build the LAN_IP_UPDATE message
+    // Format: "LAN_IP_UPDATE|<lan_ip>|<connection_port>"
+    std::string payload = "LAN_IP_UPDATE|" + lan_ip + "|" + std::to_string(m_listen_port);
+    
+    // Check signaling is ready
+    if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) {
+        LOG_WARN("SM: broadcastLanIpUpdate: Signaling not ready");
+        return;
+    }
+    
+    // Send to each peer via signaling
+    for (const auto& peer_id : peer_ids) {
+        try {
+            m_signaling_client->sendSignal(peer_id, payload);
+            LOG_INFO("SM: Sent LAN_IP_UPDATE to " + peer_id + " (LAN=" + lan_ip + ":" + std::to_string(m_listen_port) + ")");
+        } catch (const std::exception& e) {
+            LOG_WARN("SM: Failed to send LAN_IP_UPDATE to " + peer_id + ": " + std::string(e.what()));
+        }
+    }
+    
+    Telemetry::getInstance().inc_counter("lan_ip_update_broadcast_total");
+}
+
+void SessionManager::Impl::join_owned_recovery_workers_() {
+    // stop() is the only caller. Joining before members are reset establishes a
+    // clear lifetime barrier for all recovery lambdas that capture this.
+    m_timer_cv.notify_all();
+    std::lock_guard<std::mutex> worker_lock(m_owned_recovery_workers_mutex);
+    if (m_lan_broadcast_thread.joinable()) {
+        m_lan_broadcast_thread.join();
+    }
+    if (m_network_recovery_thread.joinable()) {
+        m_network_recovery_thread.join();
+    }
+}
+
+void SessionManager::Impl::schedule_lan_ip_broadcast_(std::chrono::milliseconds delay) {
+    std::lock_guard<std::mutex> worker_lock(m_owned_recovery_workers_mutex);
+    if (m_shutting_down.load(std::memory_order_acquire) || !m_running.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (m_lan_broadcast_thread.joinable() &&
+        !m_lan_broadcast_in_progress.load(std::memory_order_acquire)) {
+        m_lan_broadcast_thread.join();
+    }
+
+    bool expected = false;
+    if (!m_lan_broadcast_in_progress.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return; // A previous network transition already scheduled the broadcast.
+    }
+
+    m_lan_broadcast_thread = std::thread([this, delay]() {
+        struct Guard {
+            std::atomic<bool>& flag;
+            ~Guard() { flag.store(false, std::memory_order_release); }
+        } guard{m_lan_broadcast_in_progress};
+
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            {
+                std::unique_lock<std::mutex> lock(m_timer_mutex);
+                if (m_timer_cv.wait_for(lock, delay, [this] {
+                        return m_shutting_down.load(std::memory_order_acquire) ||
+                               !m_running.load(std::memory_order_acquire);
+                    })) {
+                    return;
+                }
+            }
+            if (m_signaling_registered.load(std::memory_order_acquire) && m_signaling_client) {
+                broadcastLanIpUpdate();
+                return;
+            }
+            LOG_INFO("SM: Waiting for signaling to be ready before LAN IP broadcast (attempt " +
+                     std::to_string(attempt + 1) + "/10)");
+        }
+    });
 }
 
 std::string SessionManager::Impl::get_reconnect_status_json() const {
@@ -2151,6 +2972,10 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
             return;
         }
 
+        // Phase 1 (P0.4): Track signaling freshness so MaintenanceManager can detect
+        // stalled-but-connected sockets and force a re-register.
+        m_last_signaling_rx_ms.store(steady_now_ms(), std::memory_order_release);
+
         auto make_placeholder_network_id = [](std::string peer_id) {
             // Must NOT contain ':' unless it's truly ip:port; otherwise connect logic will try to parse it.
             std::replace(peer_id.begin(), peer_id.end(), ':', '_');
@@ -2174,6 +2999,10 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
             m_signaling_registered.store(true, std::memory_order_release);
             LOG_INFO("SM: m_signaling_registered stored as true");
 
+            // Network transitions can request a forced full reconnect. Once we are registered again,
+            // clear that request so we don't churn the signaling socket.
+            m_force_signaling_reconnect_requested.store(false, std::memory_order_release);
+
             // If we already discovered an external address, publish it now.
             std::string pending;
             {
@@ -2195,18 +3024,31 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
             }
 
             if (m_signaling_client) {
-                if (m_signaling_bootstrap_requested.load(std::memory_order_acquire) || no_known_peers) {
-                    constexpr auto kPeerListCooldown = std::chrono::seconds(30);
-                    const auto now_local = std::chrono::steady_clock::now();
-                    if (m_last_signaling_peer_list_request == std::chrono::steady_clock::time_point{} ||
-                        (now_local - m_last_signaling_peer_list_request) >= kPeerListCooldown) {
-                        m_last_signaling_peer_list_request = now_local;
-                        LOG_INFO(std::string("SM: Requesting signaling PEER_LIST after REGISTER_ACK (") +
-                                 (m_signaling_bootstrap_requested.load(std::memory_order_acquire) ? "bootstrap" : "no_known_peers") +
-                                 ")");
-                        m_signaling_client->sendListPeers();
-                    }
+                // ALWAYS request peer list after REGISTER_ACK to ensure we discover peers that joined
+                // before us. This is critical when a peer connects to signaling late (e.g., desktop-19
+                // joining after Android already registered). Without this, the late-joining peer never
+                // learns about existing peers via signaling and can only discover them through LAN.
+                const bool bootstrapping = m_signaling_bootstrap_requested.load(std::memory_order_acquire);
+                const auto kPeerListCooldown = bootstrapping ? std::chrono::seconds(5)
+                                                             : std::chrono::seconds(10);
+                const auto now_local = std::chrono::steady_clock::now();
+                if (m_last_signaling_peer_list_request == std::chrono::steady_clock::time_point{} ||
+                    (now_local - m_last_signaling_peer_list_request) >= kPeerListCooldown) {
+                    m_last_signaling_peer_list_request = now_local;
+                    const char* reason = bootstrapping ? "bootstrap" : 
+                                         (no_known_peers ? "no_known_peers" : "late_join_sync");
+                    LOG_INFO(std::string("SM: Requesting signaling PEER_LIST after REGISTER_ACK (") +
+                             reason + ")");
+                    m_signaling_client->sendListPeers();
                 }
+            }
+            
+            // INITIAL LAN IP BROADCAST: When we register with signaling while already on WiFi,
+            // broadcast our LAN IP to all peers. This is essential for LAN-first connections.
+            // Without this, peers only learn our WAN IP from PEER_JOINED and never get our LAN IP.
+            if (m_is_wifi.load(std::memory_order_acquire)) {
+                LOG_INFO("SM: On WiFi at REGISTER_ACK - scheduling initial LAN IP broadcast");
+                schedule_lan_ip_broadcast_(std::chrono::milliseconds(500));
             }
             return;
         }
@@ -2216,7 +3058,34 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
                 return;
             }
 
-            std::string first_connectable_peer;
+            const bool bootstrapping = m_signaling_bootstrap_requested.load(std::memory_order_acquire);
+
+            auto is_connectable_ipv4_endpoint = [](const std::string& nid) {
+                if (nid.empty()) return false;
+                if (nid.rfind("signaling-", 0) == 0) return false;
+                const size_t first = nid.find(':');
+                if (first == std::string::npos) return false;
+                // Reject IPv6 literals (they contain multiple ':' and require bracket syntax).
+                if (nid.find(':', first + 1) != std::string::npos) return false;
+                return true;
+            };
+
+            // When bootstrapping via signaling (common when peer DB is disabled/unavailable),
+            // connect to all connectable peers, but avoid spamming CONNECT attempts for peers
+            // that are already connected.
+            std::unordered_set<std::string> already_connected;
+            if (bootstrapping) {
+                std::lock_guard<std::mutex> lock(m_peers_mutex);
+                for (const auto& kv : m_peers) {
+                    if (kv.second.connected) {
+                        already_connected.insert(kv.first);
+                    }
+                }
+            }
+
+            std::vector<std::string> bootstrap_connect_peers;
+            std::unordered_set<std::string> bootstrap_connect_seen;
+
             for (const auto& p : data["peers"]) {
                 if (!p.is_object()) {
                     continue;
@@ -2231,19 +3100,18 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
                 }
                 handlePeerDiscovered(network_id, pid);
 
-                if (first_connectable_peer.empty()) {
-                    // Only attempt direct connects when we have a real ip:port endpoint.
-                    if (pid != m_localPeerId &&
-                        network_id.find(':') != std::string::npos && network_id.rfind("signaling-", 0) != 0) {
-                        first_connectable_peer = pid;
+                if (bootstrapping && pid != m_localPeerId && is_connectable_ipv4_endpoint(network_id)) {
+                    if (already_connected.find(pid) == already_connected.end() &&
+                        bootstrap_connect_seen.insert(pid).second) {
+                        bootstrap_connect_peers.push_back(pid);
                     }
                 }
             }
 
-            // If we are bootstrapping (DB empty/exhausted), connect to the first connectable peer.
-            if (!first_connectable_peer.empty() &&
-                m_signaling_bootstrap_requested.load(std::memory_order_acquire)) {
-                connectToPeer(first_connectable_peer);
+            if (bootstrapping) {
+                for (const auto& pid : bootstrap_connect_peers) {
+                    connectToPeer(pid);
+                }
             }
             return;
         }
@@ -2314,7 +3182,52 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
             if (network_id.empty()) {
                 network_id = make_placeholder_network_id(pid);
             }
+            
+            // CRITICAL: Get old network_id BEFORE calling handlePeerDiscovered, which updates it.
+            // We need to compare old vs new to detect endpoint changes for immediate reconnect.
+            std::string old_network_id_for_change_detection;
+            bool was_connected_for_change_detection = false;
+            {
+                std::lock_guard<std::mutex> lock(m_peers_mutex);
+                auto it = m_peers.find(pid);
+                if (it != m_peers.end()) {
+                    old_network_id_for_change_detection = it->second.network_id;
+                    was_connected_for_change_detection = it->second.connected;
+                }
+            }
+            
             handlePeerDiscovered(network_id, pid);
+
+            // P0.3: Update NAT registration when peer endpoint changes.
+            // This ensures hole-punching targets the updated endpoint.
+            {
+                const size_t colon_pos = network_id.find(':');
+                // Only update for valid IPv4 endpoints (single colon, not signaling-placeholder).
+                if (colon_pos != std::string::npos &&
+                    network_id.find(':', colon_pos + 1) == std::string::npos &&
+                    network_id.rfind("signaling-", 0) != 0) {
+                    const std::string ip = network_id.substr(0, colon_pos);
+                    const std::string port_str = network_id.substr(colon_pos + 1);
+
+                    // Safe parse (avoid exceptions on malformed signaling payloads).
+                    char* end = nullptr;
+                    errno = 0;
+                    const long port_long = std::strtol(port_str.c_str(), &end, 10);
+                    const bool parsed_ok = (errno == 0 && end && *end == '\0');
+
+                    if (parsed_ok && port_long > 0 && port_long <= 65535) {
+                        const int port = static_cast<int>(port_long);
+                        PeerAddress pa;
+                        pa.peer_id = pid;
+                        pa.network_id = "wan";
+                        pa.external_ip = ip;
+                        pa.external_port = static_cast<uint16_t>(port);
+                        pa.discovered_at_ms = system_now_ms();
+                        NATTraversal::getInstance().registerPeer(pa);
+                        LOG_INFO("SM: PEER_UPDATED: Updated NAT registration for " + pid + " -> " + ip + ":" + std::to_string(port));
+                    }
+                }
+            }
 
             auto is_connectable_ipv4_endpoint = [](const std::string& nid) {
                 if (nid.empty()) return false;
@@ -2326,7 +3239,75 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
                 return true;
             };
 
-            if (m_signaling_bootstrap_requested.load(std::memory_order_acquire)) {
+            // Log the decision path for debugging endpoint change detection
+            const bool bootstrap_mode = m_signaling_bootstrap_requested.load(std::memory_order_acquire);
+            LOG_INFO("SM: PEER_UPDATED endpoint check: peer=" + pid + 
+                     " old_nid=" + old_network_id_for_change_detection +
+                     " new_nid=" + network_id +
+                     " was_connected=" + std::to_string(was_connected_for_change_detection) +
+                     " bootstrap=" + std::to_string(bootstrap_mode));
+            
+            // CRITICAL FIX: ALWAYS check for endpoint changes, REGARDLESS of bootstrap mode.
+            // When a connected peer's endpoint changes (e.g., Android switches from WiFi to LTE),
+            // we must force an immediate disconnect and reconnect instead of waiting for heartbeat
+            // timeout (which can take 20-30 seconds). This dramatically improves WiFi handoff recovery.
+            if (pid != m_localPeerId && 
+                was_connected_for_change_detection && 
+                !old_network_id_for_change_detection.empty() && 
+                old_network_id_for_change_detection != network_id &&
+                is_connectable_ipv4_endpoint(network_id)) {
+                
+                LOG_INFO("SM: PEER_UPDATED: Peer " + pid + " endpoint changed from " + 
+                         old_network_id_for_change_detection + " to " + network_id + " - forcing immediate reconnect");
+                
+                // Get current epoch for FSM event
+                uint64_t current_epoch = 0;
+                {
+                    std::lock_guard<std::mutex> lock(m_peers_mutex);
+                    auto ctx_it = m_peer_contexts.find(pid);
+                    if (ctx_it != m_peer_contexts.end()) {
+                        current_epoch = ctx_it->second.connect_epoch;
+                    }
+                }
+                
+                // Force disconnect to invalidate stale session
+                pushEvent(FSMEvent{pid, PeerEvent::DISCONNECT_DETECTED, current_epoch});
+                
+                // Update peer's network_id to new endpoint
+                {
+                    std::lock_guard<std::mutex> lock(m_peers_mutex);
+                    auto it = m_peers.find(pid);
+                    if (it != m_peers.end()) {
+                        it->second.connected = false;
+                        it->second.network_id = network_id;
+                        // Parse IP:port
+                        const size_t cpos = network_id.find(':');
+                        if (cpos != std::string::npos) {
+                            it->second.ip = network_id.substr(0, cpos);
+                            it->second.port = static_cast<uint16_t>(std::strtol(
+                                network_id.substr(cpos + 1).c_str(), nullptr, 10));
+                        }
+                    }
+                }
+                
+                // Clear any stale Noise session
+#if HAVE_NOISE_PROTOCOL
+                if (m_secure_session_manager) {
+                    std::lock_guard<std::mutex> noise_lock(m_secure_session_mutex);
+                    m_secure_session_manager->remove_session(pid);
+                }
+#endif
+                
+                // Reset reconnect policy for this peer (clear backoff)
+                PeerReconnectPolicy::getInstance().reset_peer_stats(pid);
+                
+                // Immediately attempt to connect to new endpoint
+                connectToPeer(pid, true, "endpoint_change_reconnect");
+                return;  // Don't fall through to bootstrap/reconnect logic
+            }
+            
+            // Standard bootstrap/reconnect logic (only if not already handled above)
+            if (bootstrap_mode) {
                 if (network_id.find(':') != std::string::npos && network_id.rfind("signaling-", 0) != 0) {
                     if (pid != m_localPeerId &&
                         m_signaling_bootstrap_requested.load(std::memory_order_acquire)) {
@@ -2335,18 +3316,8 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
                 }
             } else if (pid != m_localPeerId && is_connectable_ipv4_endpoint(network_id)) {
                 // Not bootstrapping: reconnect only for peers we already knew about.
-                // This ensures WAN endpoint updates are acted on after interface changes.
-                bool known_peer = false;
-                bool currently_connected = false;
-                {
-                    std::lock_guard<std::mutex> lock(m_peers_mutex);
-                    auto it = m_peers.find(pid);
-                    if (it != m_peers.end()) {
-                        known_peer = true;
-                        currently_connected = it->second.connected;
-                    }
-                }
-                if (known_peer && !currently_connected) {
+                const bool known_peer = !old_network_id_for_change_detection.empty() || was_connected_for_change_detection;
+                if (known_peer && !was_connected_for_change_detection) {
                     connectToPeer(pid);
                 }
             }
@@ -2375,30 +3346,227 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
             }
 
             // Payload format (string, must be JSON-string-safe):
-            //   CONNECT_REQUEST|<network_id>|<comms_mode>
+            //   CONNECT_REQUEST|<network_id>|<comms_mode>[|<lan_ip>|<lan_port>]
             // Example:
             //   CONNECT_REQUEST|110.235.237.26:30001|UDP
+            //   CONNECT_REQUEST|110.235.237.26:30001|UDP|192.168.1.100|30001
             if (payload.rfind("CONNECT_REQUEST|", 0) == 0) {
                 std::string rest = payload.substr(std::strlen("CONNECT_REQUEST|"));
                 std::string their_network_id;
                 std::string their_mode;
-                const size_t sep = rest.find('|');
-                if (sep != std::string::npos) {
-                    their_network_id = rest.substr(0, sep);
-                    their_mode = rest.substr(sep + 1);
-                } else {
-                    their_network_id = rest;
+                std::string their_lan_ip;
+                int their_lan_port = 0;
+                
+                // Parse: network_id|mode[|lan_ip|lan_port]
+                std::vector<std::string> parts;
+                size_t start = 0;
+                size_t end = 0;
+                while ((end = rest.find('|', start)) != std::string::npos) {
+                    parts.push_back(rest.substr(start, end - start));
+                    start = end + 1;
+                }
+                parts.push_back(rest.substr(start));  // Last part
+                
+                if (parts.size() >= 1) their_network_id = parts[0];
+                if (parts.size() >= 2) their_mode = parts[1];
+                if (parts.size() >= 3) their_lan_ip = parts[2];
+                if (parts.size() >= 4) {
+                    try {
+                        their_lan_port = std::stoi(parts[3]);
+                    } catch (...) {
+                        their_lan_port = 0;
+                    }
                 }
 
                 if (!their_network_id.empty()) {
                     LOG_INFO("SM: Received CONNECT_REQUEST from " + source_peer_id + " endpoint=" + their_network_id +
-                             (their_mode.empty() ? std::string("") : (" mode=" + their_mode)));
+                             (their_mode.empty() ? std::string("") : (" mode=" + their_mode)) +
+                             (!their_lan_ip.empty() ? (" lan=" + their_lan_ip + ":" + std::to_string(their_lan_port)) : ""));
 
                     // Ensure we have a peer entry with the provided endpoint.
                     handlePeerDiscovered(their_network_id, source_peer_id);
 
+                    // If they provided a LAN IP and we're on WiFi, also try to discover/connect via LAN
+                    // This is useful when AP isolation blocks broadcasts but we can reach them directly
+                    if (!their_lan_ip.empty() && their_lan_port > 0 && m_is_wifi.load(std::memory_order_acquire)) {
+                        // Check if their LAN IP is in our subnet (simple heuristic)
+                        std::string our_lan_ip;
+                        Discovery* discovery = getGlobalDiscoveryInstance();
+                        if (discovery) {
+                            our_lan_ip = discovery->getLocalLanIP();
+                        }
+                        
+                        // If both are in private IP space, try direct probe and handlePeerDiscovered
+                        if (!our_lan_ip.empty()) {
+                            std::string lan_network_id = their_lan_ip + ":" + std::to_string(their_lan_port);
+                            LOG_INFO("SM: Peer " + source_peer_id + " advertised LAN endpoint: " + lan_network_id);
+                            
+                            // Send direct discovery probe to bypass AP isolation
+                            if (discovery) {
+                                discovery->sendDirectProbe(their_lan_ip, their_lan_port);
+                            }
+                            
+                            // Also register this as a LAN endpoint candidate
+                            handlePeerDiscovered(lan_network_id, source_peer_id);
+                        }
+                    }
+
                     // Best-effort: initiate reciprocal connect to help NAT traversal.
-                    connectToPeer(source_peer_id);
+                    connectToPeer(source_peer_id, true, "signaling_connect_request");
+                }
+                return;
+            }
+
+            // Handle LAN_IP_UPDATE: Peer is broadcasting their new LAN IP after WiFi handoff
+            // Format: "LAN_IP_UPDATE|<lan_ip>|<lan_port>"
+            if (payload.rfind("LAN_IP_UPDATE|", 0) == 0) {
+                std::string rest = payload.substr(std::strlen("LAN_IP_UPDATE|"));
+                // Parse: <lan_ip>|<lan_port>
+                auto pipe_pos = rest.find('|');
+                if (pipe_pos != std::string::npos) {
+                    std::string their_lan_ip = rest.substr(0, pipe_pos);
+                    int their_lan_port = 0;
+                    try {
+                        their_lan_port = std::stoi(rest.substr(pipe_pos + 1));
+                    } catch (...) {}
+                    
+                    if (!their_lan_ip.empty() && their_lan_port > 0) {
+                        // Debounce: Only process LAN_IP_UPDATE from each peer once per 5 seconds
+                        // This prevents ping-pong loops where both sides keep sending updates
+                        bool should_process = false;
+                        {
+                            std::lock_guard<std::mutex> lock(m_lan_ip_update_mutex);
+                            auto now = std::chrono::steady_clock::now();
+                            std::string key = "recv_" + source_peer_id;
+                            auto it = m_last_lan_ip_update_sent.find(key);
+                            if (it == m_last_lan_ip_update_sent.end() ||
+                                std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count() >= 5) {
+                                should_process = true;
+                                m_last_lan_ip_update_sent[key] = now;
+                            }
+                        }
+                        
+                        if (!should_process) {
+                            LOG_DEBUG("SM: Ignoring duplicate LAN_IP_UPDATE from " + source_peer_id + " (debounced)");
+                            return;
+                        }
+                        
+                        LOG_INFO("SM: Received LAN_IP_UPDATE from " + source_peer_id + 
+                                 " lan=" + their_lan_ip + ":" + std::to_string(their_lan_port));
+                        
+                        // If we're on WiFi, try to discover/connect via LAN
+                        if (m_is_wifi.load(std::memory_order_acquire)) {
+                            std::string our_lan_ip;
+                            Discovery* discovery = getGlobalDiscoveryInstance();
+                            if (discovery) {
+                                our_lan_ip = discovery->getLocalLanIP();
+                            }
+                            
+                            if (!our_lan_ip.empty()) {
+                                std::string lan_network_id = their_lan_ip + ":" + std::to_string(their_lan_port);
+                                LOG_INFO("SM: Peer " + source_peer_id + " now reachable on LAN: " + lan_network_id);
+                                
+                                // Send direct discovery probe to bypass AP isolation
+                                if (discovery) {
+                                    discovery->sendDirectProbe(their_lan_ip, their_lan_port);
+                                }
+                                
+                                // Also register this as a LAN endpoint candidate
+                                handlePeerDiscovered(lan_network_id, source_peer_id);
+                                
+                                // Send reciprocal LAN_IP_UPDATE so both sides know each other's LAN IPs
+                                // But use debouncing to prevent ping-pong loops (both sides responding forever)
+                                // Only send if we haven't sent one to this peer in the last 5 seconds
+                                if (m_signaling_client && !our_lan_ip.empty()) {
+                                    bool should_send = false;
+                                    {
+                                        std::lock_guard<std::mutex> lock(m_lan_ip_update_mutex);
+                                        auto now = std::chrono::steady_clock::now();
+                                        auto it = m_last_lan_ip_update_sent.find(source_peer_id);
+                                        if (it == m_last_lan_ip_update_sent.end() ||
+                                            std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count() >= 5) {
+                                            should_send = true;
+                                            m_last_lan_ip_update_sent[source_peer_id] = now;
+                                        }
+                                    }
+                                    
+                                    if (should_send) {
+                                        std::string our_update = "LAN_IP_UPDATE|" + our_lan_ip + "|" + std::to_string(m_listen_port);
+                                        try {
+                                            m_signaling_client->sendSignal(source_peer_id, our_update);
+                                            LOG_INFO("SM: Sent reciprocal LAN_IP_UPDATE to " + source_peer_id + 
+                                                     " (LAN=" + our_lan_ip + ":" + std::to_string(m_listen_port) + ")");
+                                        } catch (...) {}
+                                    } else {
+                                        LOG_DEBUG("SM: Skipping reciprocal LAN_IP_UPDATE to " + source_peer_id + " (debounced)");
+                                    }
+                                }
+                                
+                                Telemetry::getInstance().inc_counter("lan_ip_update_received_total");
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Handle HANDSHAKE_RELAY: Relay handshake messages through signaling for AP isolation scenarios
+            // Format: "HANDSHAKE_RELAY|<base64_handshake_payload>"
+            // This allows handshakes to complete even when direct UDP is blocked by AP isolation
+            if (payload.rfind("HANDSHAKE_RELAY|", 0) == 0) {
+                std::string rest = payload.substr(std::strlen("HANDSHAKE_RELAY|"));
+                if (!rest.empty()) {
+                    LOG_INFO("SM: Received HANDSHAKE_RELAY from " + source_peer_id + 
+                             " payload_len=" + std::to_string(rest.length()));
+                    
+                    // Decode Base64 payload
+                    // Simple Base64 decode inline
+                    auto base64_decode = [](const std::string& encoded) -> std::string {
+                        static const std::string base64_chars =
+                            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                        std::string decoded;
+                        std::vector<int> T(256, -1);
+                        for (int i = 0; i < 64; i++) T[base64_chars[i]] = i;
+                        
+                        int val = 0, valb = -8;
+                        for (unsigned char c : encoded) {
+                            if (T[c] == -1) continue;
+                            val = (val << 6) + T[c];
+                            valb += 6;
+                            if (valb >= 0) {
+                                decoded.push_back(char((val >> valb) & 0xFF));
+                                valb -= 8;
+                            }
+                        }
+                        return decoded;
+                    };
+                    
+                    std::string handshake_payload = base64_decode(rest);
+                    if (!handshake_payload.empty()) {
+                        LOG_INFO("SM: Processing relayed handshake from " + source_peer_id + 
+                                 " decoded_len=" + std::to_string(handshake_payload.size()));
+                        
+                        // Set pending handshake message and trigger FSM event
+                        // Mark as relay reconnect to allow resetting READY sessions
+                        uint64_t current_epoch = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(m_peers_mutex);
+                            auto ctx_it = m_peer_contexts.find(source_peer_id);
+                            if (ctx_it != m_peer_contexts.end()) {
+                                ctx_it->second.pending_handshake_message = handshake_payload;
+                                ctx_it->second.is_relay_reconnect = true;  // Allow session reset
+                                current_epoch = ctx_it->second.connect_epoch;
+                            } else {
+                                // Create context if needed
+                                auto& ctx = m_peer_contexts[source_peer_id];
+                                ctx.pending_handshake_message = handshake_payload;
+                                ctx.is_relay_reconnect = true;  // Allow session reset
+                            }
+                        }
+                        
+                        pushEvent(FSMEvent{source_peer_id, PeerEvent::HANDSHAKE_MESSAGE_RECEIVED, current_epoch});
+                        Telemetry::getInstance().inc_counter("handshake_relay_received_total");
+                    }
                 }
                 return;
             }
@@ -2429,9 +3597,21 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
         m_signaling_reconnect_thread.join();
     }
 
+    bool force_reconnect = force && m_force_signaling_reconnect_requested.load(std::memory_order_acquire);
+    if (force_reconnect) {
+        const int64_t change_ms = m_last_network_change_ms.load(std::memory_order_acquire);
+        const int64_t last_forced_ms = m_last_forced_signaling_reconnect_change_ms.load(std::memory_order_acquire);
+        if (change_ms > 0 && last_forced_ms == change_ms) {
+            // We already initiated a forced reconnect for this network change; don't churn.
+            force_reconnect = false;
+        } else if (change_ms > 0) {
+            m_last_forced_signaling_reconnect_change_ms.store(change_ms, std::memory_order_release);
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(m_signaling_lifecycle_mutex);
-        if (m_signaling_client && m_signaling_client->isConnected()) {
+        if (!force_reconnect && m_signaling_client && m_signaling_client->isConnected()) {
             // We can be TCP-connected but not registered (e.g., server restart, late start, or a
             // previous reconnect swap). In that state we will never receive PEER_LIST/updates.
             const bool registered = m_signaling_registered.load(std::memory_order_acquire);
@@ -2440,7 +3620,19 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
                  m_signaling_bootstrap_requested.load(std::memory_order_acquire) ||
                  m_signaling_persistent_after_db_exhausted.load(std::memory_order_acquire));
 
-            if (want_register) {
+            // IMPORTANT:
+            // On network transitions (especially in single-thread/event-loop mode), the signaling TCP
+            // socket can become "stalled" without producing readable EOF/HUP events immediately.
+            // In that case `isConnected()` may still be true and `registered` may still be true,
+            // but we will never receive peer updates again.
+            //
+            // When `force==true`, proactively re-register even if we *think* we're registered.
+            // This acts as a cheap keepalive and refreshes server-side state. If the socket is
+            // actually dead, the send will fail and SignalingClient will mark itself disconnected,
+            // allowing the reconnect path to run on the next call.
+            const bool force_reregister = force && registered;
+
+            if (want_register || force_reregister) {
                 const std::string local_peer_id = m_localPeerId;
                 if (!local_peer_id.empty()) {
                     std::string local_network_id;
@@ -2448,6 +3640,9 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
                         std::lock_guard<std::mutex> lock2(m_signaling_update_mutex);
                         local_network_id = m_pending_signaling_network_id;
                     }
+                    LOG_INFO(std::string("SM: Signaling: sending REGISTER") +
+                             (want_register ? " (want_register)" : " (force_reregister)") +
+                             (local_network_id.empty() ? "" : (" network_id=" + local_network_id)));
                     if (!local_network_id.empty()) {
                         m_signaling_client->sendRegister(local_peer_id, local_network_id);
                     } else {
@@ -2459,9 +3654,30 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
         }
     }
 
+    if (force_reconnect) {
+        const int64_t now_ms = steady_now_ms();
+        const int64_t last_change_ms = m_last_network_change_ms.load(std::memory_order_acquire);
+        const int64_t age_ms = (last_change_ms > 0) ? (now_ms - last_change_ms) : -1;
+        LOG_WARN(std::string("SM: Signaling: forcing full reconnect") +
+                 (age_ms >= 0 ? (" (network_change_age_ms=" + std::to_string(age_ms) + ")") : ""));
+    }
+
     const auto now = std::chrono::steady_clock::now();
+    // Throttle reconnect attempts to avoid hot loops, but be more aggressive right after
+    // a network change. During WiFi<->cell handoffs it's common to see transient ENETUNREACH;
+    // we want multiple retries inside the 8s recovery SLA window.
+    auto min_gap = std::chrono::milliseconds(
+        std::max(250, ConfigManager::getInstance().getSignalingReconnectIntervalMs())
+    );
+    const int64_t change_ms_for_retry = m_last_network_change_ms.load(std::memory_order_acquire);
+    const int64_t age_ms_for_retry = (change_ms_for_retry > 0) ? (steady_now_ms() - change_ms_for_retry) : -1;
+    const bool in_post_handoff_grace = (age_ms_for_retry >= 0 && age_ms_for_retry < 15000);
+    if (in_post_handoff_grace) {
+        // Fast-retry window after a network transition.
+        min_gap = std::min(min_gap, std::chrono::milliseconds(1000));
+    }
     if (!force && m_last_signaling_reconnect_attempt != std::chrono::steady_clock::time_point{} &&
-        (now - m_last_signaling_reconnect_attempt) < std::chrono::seconds(5)) {
+        (now - m_last_signaling_reconnect_attempt) < min_gap) {
         return;
     }
 
@@ -2471,6 +3687,8 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
     }
     m_last_signaling_reconnect_attempt = now;
 
+    const uint64_t attempt_seq = m_signaling_reconnect_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+
     const std::string url = m_signaling_url;
     const std::string local_peer_id = m_localPeerId;
     if (url.empty() || local_peer_id.empty()) {
@@ -2478,13 +3696,26 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
         return;
     }
 
+    // When reconnecting around a network transition, the first TCP connect often fails transiently
+    // with ENETUNREACH while the new interface finishes coming up. Instead of waiting for a later
+    // timer tick, retry inside the reconnect thread for a bounded window so REGISTER_ACK recovery
+    // is deterministic under the strict 8s SLA.
+    //
+    // NOTE: The caller may not always pass `force=true` even when a network change has requested
+    // a forced reconnect. Use the request flag as an additional signal to enable fast-retry.
+    const bool want_fast_retry =
+        force ||
+        in_post_handoff_grace ||
+        m_force_signaling_reconnect_requested.load(std::memory_order_acquire);
+    const int64_t fast_retry_deadline_ms = want_fast_retry ? (steady_now_ms() + 8000) : 0;
+
     // If the previous thread is still joinable, we cannot overwrite it.
     if (m_signaling_reconnect_thread.joinable()) {
         m_signaling_reconnect_in_progress.store(false, std::memory_order_release);
         return;
     }
 
-    m_signaling_reconnect_thread = std::thread([this, url, local_peer_id]() {
+    m_signaling_reconnect_thread = std::thread([this, url, local_peer_id, attempt_seq, fast_retry_deadline_ms]() {
         struct Guard {
             std::atomic<bool>& flag;
             ~Guard() { flag.store(false, std::memory_order_release); }
@@ -2496,22 +3727,60 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
         }
 
         try {
-            auto new_client = std::make_unique<SignalingClient>();
-            setup_signaling_callbacks(*new_client);
-
-            LOG_INFO("SM: Signaling reconnect attempt to: " + url);
+            std::unique_ptr<SignalingClient> new_client;
             int new_fd = -1;
-            if (is_single_thread_mode()) {
-                new_fd = new_client->connectEventLoop(url);
-                if (new_fd < 0) {
+            int retry = 0;
+            auto backoff = std::chrono::milliseconds(250);
+
+            while (true) {
+                // Make sure we don't keep trying while tearing down.
+                if (m_shutting_down.load(std::memory_order_acquire) || !m_running.load(std::memory_order_acquire)) {
+                    return;
+                }
+
+                new_client = std::make_unique<SignalingClient>();
+                setup_signaling_callbacks(*new_client);
+
+                LOG_INFO("SM: Signaling reconnect attempt #" + std::to_string(attempt_seq) +
+                         (retry > 0 ? (" retry=" + std::to_string(retry)) : std::string("")) +
+                         " to: " + url);
+
+                if (is_single_thread_mode()) {
+                    new_fd = new_client->connectEventLoop(url);
+                    if (new_fd >= 0) {
+                        break;
+                    }
                     LOG_WARN("SM: Signaling reconnect failed (event-loop mode)");
-                    return;
-                }
-            } else {
-                if (!new_client->connect(url)) {
+                } else {
+                    if (new_client->connect(url)) {
+                        break;
+                    }
                     LOG_WARN("SM: Signaling reconnect failed");
-                    return;
                 }
+
+                // If we're in fast-retry mode, keep trying for a bounded window.
+                if (fast_retry_deadline_ms > 0 && steady_now_ms() < fast_retry_deadline_ms) {
+                    std::this_thread::sleep_for(backoff);
+                    backoff = std::min(backoff * 2, std::chrono::milliseconds(1000));
+                    retry++;
+                    continue;
+                }
+
+                // Give up for now; a later timer tick may try again.
+                m_last_forced_signaling_reconnect_change_ms.store(0, std::memory_order_release);
+                return;
+            }
+
+            // If a network change requested a forced signaling reconnect, treat a successful socket
+            // connect as satisfying that request. Waiting for REGISTER_ACK to clear the flag can
+            // cause a second forced reconnect (churn) if another forced tick fires while the
+            // first REGISTER is still in flight.
+            if (m_force_signaling_reconnect_requested.load(std::memory_order_acquire)) {
+                const int64_t change_ms = m_last_network_change_ms.load(std::memory_order_acquire);
+                if (change_ms > 0) {
+                    m_last_forced_signaling_reconnect_change_ms.store(change_ms, std::memory_order_release);
+                }
+                m_force_signaling_reconnect_requested.store(false, std::memory_order_release);
             }
 
             // Re-check shutdown after a potentially slow connect.
@@ -2560,6 +3829,8 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
                 local_network_id = m_pending_signaling_network_id;
             }
             if (m_signaling_client) {
+                LOG_INFO(std::string("SM: Signaling: sending REGISTER after reconnect #") + std::to_string(attempt_seq) +
+                         (local_network_id.empty() ? "" : (" network_id=" + local_network_id)));
                 if (!local_network_id.empty()) {
                     m_signaling_client->sendRegister(local_peer_id, local_network_id);
                 } else {
@@ -2618,9 +3889,47 @@ void SessionManager::Impl::refresh_external_address_async(bool force) {
             return;
         }
 
+        // Ensure NATTraversal still has a transport manager bound (stop() clears it).
+        ensure_nat_connection_manager_registered_();
+
         NATTraversal& nat = NATTraversal::getInstance();
         nat.initialize(static_cast<uint16_t>(port));
-        NATInfo info = nat.detectNATType();
+        
+        // Retry STUN up to 3 times with increasing delays.
+        // During WiFi→mobile data transitions, the new network interface may not be ready
+        // immediately, causing "Network is unreachable" or DNS resolution failures.
+        NATInfo info;
+        constexpr int max_stun_retries = 3;
+        constexpr int initial_retry_delay_ms = 1000;  // 1s, 2s, 4s
+        
+        for (int attempt = 0; attempt < max_stun_retries; ++attempt) {
+            if (m_shutting_down.load(std::memory_order_acquire)) {
+                return;
+            }
+            
+            if (attempt > 0) {
+                // Wait before retry with exponential backoff
+                const int delay_ms = initial_retry_delay_ms * (1 << (attempt - 1));
+                LOG_INFO("SM: STUN retry attempt " + std::to_string(attempt + 1) + 
+                         "/" + std::to_string(max_stun_retries) + " after " + 
+                         std::to_string(delay_ms) + "ms delay");
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                
+                if (m_shutting_down.load(std::memory_order_acquire)) {
+                    return;
+                }
+            }
+            
+            info = nat.detectNATType();
+            
+            // Success - break out of retry loop
+            if (!info.external_ip.empty() && info.external_port != 0) {
+                break;
+            }
+            
+            LOG_INFO("SM: STUN attempt " + std::to_string(attempt + 1) + 
+                     " failed (nat_type=" + std::to_string(static_cast<int>(info.nat_type)) + ")");
+        }
 
         if (m_shutting_down.load(std::memory_order_acquire)) {
             return;
@@ -2631,6 +3940,19 @@ void SessionManager::Impl::refresh_external_address_async(bool force) {
             // IPv6-only carrier networks (IPv4-only transport) or when STUN cannot resolve.
             LOG_INFO("SM: NAT refresh produced no IPv4 external endpoint (nat_type=" +
                      std::to_string(static_cast<int>(info.nat_type)) + ") - not updating signaling network_id");
+
+            // Critical: avoid continuing to advertise a stale network_id after a network change.
+            // Stale endpoints can collide with other peers (same public IP:port) and cause
+            // reconnect failures or misdirected connect attempts.
+            {
+                std::lock_guard<std::mutex> lock(m_signaling_update_mutex);
+                m_pending_signaling_network_id.clear();
+            }
+            if (m_signaling_registered.load(std::memory_order_acquire) && m_signaling_client) {
+                // Empty string is interpreted by SignalingClient as "clear" (network_id: null).
+                m_signaling_client->sendUpdateNetworkId(std::string{});
+                LOG_INFO("SM: Cleared signaling network_id (UPDATE null) due to NAT refresh failure");
+            }
             return;
         }
 
@@ -2644,6 +3966,148 @@ void SessionManager::Impl::refresh_external_address_async(bool force) {
             m_signaling_client->sendUpdateNetworkId(network_id);
         }
     });
+}
+
+void SessionManager::Impl::ensure_nat_connection_manager_registered_() {
+    if (m_comms_mode == "TCP") {
+        return;
+    }
+    if (!m_udpConnectionManager) {
+        return;
+    }
+    // Idempotent: NATTraversal swaps callbacks only when the pointer changes.
+    NATTraversal::getInstance().setConnectionManager(m_udpConnectionManager.get());
+}
+
+void SessionManager::Impl::ensure_nat_punch_observer_registered_() {
+    if (m_comms_mode == "TCP") {
+        return;
+    }
+    if (m_nat_punch_observer_id >= 0) {
+        return;
+    }
+
+    NATTraversal& nat = NATTraversal::getInstance();
+    m_nat_punch_observer_id = nat.addPunchResultObserver(
+        [this](const std::string& peer_id, bool success) {
+            this->handle_nat_punch_result_(peer_id, success);
+        }
+    );
+}
+
+void SessionManager::Impl::unregister_nat_punch_observer_() {
+    if (m_nat_punch_observer_id < 0) {
+        return;
+    }
+    NATTraversal::getInstance().removePunchResultObserver(m_nat_punch_observer_id);
+    m_nat_punch_observer_id = -1;
+}
+
+void SessionManager::Impl::handle_nat_punch_result_(const std::string& peer_id, bool success) {
+    if (peer_id.empty()) {
+        return;
+    }
+    if (m_shutting_down.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!m_running.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (peer_id == m_localPeerId) {
+        return;
+    }
+
+    if (success) {
+        // NAT hole punch succeeded! The hole is now open.
+        // If peer is still CONNECTING and not yet connected, resend CONTROL_CONNECT.
+        // The original CONTROL_CONNECT was likely dropped before the hole was punched.
+        
+        bool should_resend = false;
+        std::string network_id;
+        {
+            std::lock_guard<std::mutex> lock(m_peers_mutex);
+            auto ctx_it = m_peer_contexts.find(peer_id);
+            if (ctx_it == m_peer_contexts.end()) {
+                return;
+            }
+            const PeerState st = ctx_it->second.state;
+            
+            auto p_it = m_peers.find(peer_id);
+            const bool connected_flag = (p_it != m_peers.end()) ? p_it->second.connected : false;
+            
+            // Only resend if peer is CONNECTING and not yet marked connected
+            if ((st == PeerState::CONNECTING || st == PeerState::DEGRADED) && !connected_flag) {
+                should_resend = true;
+                if (p_it != m_peers.end()) {
+                    network_id = p_it->second.network_id;
+                }
+            }
+        }
+        
+        if (should_resend && !network_id.empty()) {
+            LOG_INFO("SM: NAT hole punch succeeded for " + peer_id + " - resending CONTROL_CONNECT");
+            
+            std::string payload = m_localPeerId;
+#if HAVE_NOISE_PROTOCOL
+            if (m_use_noise_protocol && m_noise_key_store) {
+                auto pk = m_noise_key_store->get_local_static_public_key();
+                std::string pk_hex;
+                const char* hex_chars = "0123456789abcdef";
+                for (uint8_t b : pk) {
+                    pk_hex.push_back(hex_chars[b >> 4]);
+                    pk_hex.push_back(hex_chars[b & 0x0F]);
+                }
+                payload += "|" + pk_hex + "|" + std::to_string(m_local_boot_id);
+            }
+#endif
+            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, payload);
+            send_message_to_peer(network_id, connect_msg);
+        }
+        return;
+    }
+
+    // Handle failure case
+    bool should_fail = false;
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        auto ctx_it = m_peer_contexts.find(peer_id);
+        if (ctx_it == m_peer_contexts.end()) {
+            return;
+        }
+        const PeerState st = ctx_it->second.state;
+
+        auto p_it = m_peers.find(peer_id);
+        const bool connected_flag = (p_it != m_peers.end()) ? p_it->second.connected : false;
+
+        // Only force a failure transition if the peer is still CONNECTING.
+        // This avoids races where CONNECT_SUCCESS arrives after a punch failure.
+        if (st == PeerState::CONNECTING && !connected_flag) {
+            should_fail = true;
+        }
+    }
+
+    if (should_fail) {
+        LOG_WARN("SM: NAT hole punching exhausted retries for CONNECTING peer " + peer_id + "; generating CONNECT_FAILED");
+        
+        // Get current epoch for this peer
+        uint64_t current_epoch = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_peers_mutex);
+            auto ctx_it = m_peer_contexts.find(peer_id);
+            if (ctx_it != m_peer_contexts.end()) {
+                current_epoch = ctx_it->second.connect_epoch;
+            }
+        }
+        
+        // Report failure with reason
+        PeerReconnectPolicy& policy = PeerReconnectPolicy::getInstance();
+        std::string policy_method = m_comms_mode;
+        if (policy_method == "QUIC") policy_method = "UDP";
+        policy.on_connection_failure(peer_id, policy_method, 
+            ConnectionFailureReason::NAT_TRAVERSAL_FAIL, 0.0f);
+        
+        pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_FAILED, current_epoch});
+    }
 }
 
 void SessionManager::Impl::handlePeerDiscovered(const std::string& network_id, const std::string& peer_id) {
@@ -2668,66 +4132,74 @@ void SessionManager::Impl::onData(const std::string& network_id, const std::stri
         NATIVELOGW("SM_NATIVE: It IS CONNECT_ACK");
         LOG_INFO("SM: Received CONNECT_ACK for network_id=" + network_id);
         
-        // Find the peer by network_id and generate FSM events
-        std::lock_guard<std::mutex> lock(m_peers_mutex);
-        Peer* peer = find_peer_by_network_id(network_id);
+        std::string peer_id;
+        bool create_ephemeral_mapping = false;
+        std::string mapping_advertised_network_id;
         
-        // If not found by full network_id, try to match by IP address only
-        // This handles incoming connections which use ephemeral ports
-        // BUT: Only do this if we have a clear match (exactly 1 peer with that IP)
-        if (!peer) {
-            // Extract IP from network_id (format: "IP:PORT")
-            size_t colon_pos = network_id.find(':');
-            if (colon_pos != std::string::npos) {
-                std::string incoming_ip = network_id.substr(0, colon_pos);
-                LOG_INFO("SM: CONNECT_ACK: Peer not found by full network_id, checking for IP match: " + incoming_ip);
-                
-                // Search for peers with matching IP - but only use if exactly ONE match
-                Peer* ip_match = nullptr;
-                int match_count = 0;
-                for (auto& kv : m_peers) {
-                    Peer& candidate = kv.second;
-                    size_t peer_colon_pos = candidate.network_id.find(':');
-                    if (peer_colon_pos != std::string::npos) {
-                        std::string peer_ip = candidate.network_id.substr(0, peer_colon_pos);
-                        if (peer_ip == incoming_ip) {
-                            ip_match = &candidate;
-                            match_count++;
+        {
+            // Lock order enforced: peers -> network index
+            PeersThenNetworkIndexLock guard(*this);
+            Peer* peer = find_peer_by_network_id_locked_(network_id);
+
+            // If not found by full network_id, try to match by IP address only.
+            // This handles incoming connections which use ephemeral ports.
+            // BUT: Only do this if we have a clear match (exactly 1 peer with that IP).
+            if (!peer) {
+                // Extract IP from network_id (format: "IP:PORT")
+                size_t colon_pos = network_id.find(':');
+                if (colon_pos != std::string::npos) {
+                    std::string incoming_ip = network_id.substr(0, colon_pos);
+                    LOG_INFO("SM: CONNECT_ACK: Peer not found by full network_id, checking for IP match: " + incoming_ip);
+
+                    Peer* ip_match = nullptr;
+                    int match_count = 0;
+                    for (auto& kv : m_peers) {
+                        Peer& candidate = kv.second;
+                        size_t peer_colon_pos = candidate.network_id.find(':');
+                        if (peer_colon_pos != std::string::npos) {
+                            std::string peer_ip = candidate.network_id.substr(0, peer_colon_pos);
+                            if (peer_ip == incoming_ip) {
+                                ip_match = &candidate;
+                                match_count++;
+                            }
                         }
                     }
-                }
-                
-                // Only use IP match if exactly 1 peer found (avoid ambiguity on localhost)
-                if (match_count == 1 && ip_match) {
-                    peer = ip_match;
-                    LOG_INFO("SM: CONNECT_ACK: Matched peer by IP (unique): " + peer->id + " (incoming: " + network_id + ", stored: " + peer->network_id + ")");
-                    
-                    // Store the mapping from ephemeral port to advertised port for future lookups
-                    {
-                        std::lock_guard<std::mutex> index_lock(m_network_index_mutex);
-                        m_ephemeral_to_advertised_port_map[network_id] = peer->network_id;
+
+                    if (match_count == 1 && ip_match) {
+                        peer = ip_match;
+                        LOG_INFO("SM: CONNECT_ACK: Matched peer by IP (unique): " + peer->id + " (incoming: " + network_id + ", stored: " + peer->network_id + ")");
+                        create_ephemeral_mapping = true;
+                        mapping_advertised_network_id = peer->network_id;
+                    } else if (match_count > 1) {
+                        LOG_WARN("SM: CONNECT_ACK: Ambiguous IP match (found " + std::to_string(match_count) + " peers with IP " + incoming_ip + "). Cannot identify peer. Waiting for CONTROL_CONNECT.");
                     }
-                    LOG_INFO("SM: CONNECT_ACK: Created ephemeral port mapping: " + network_id + " -> " + peer->network_id);
-                } else if (match_count > 1) {
-                    LOG_WARN("SM: CONNECT_ACK: Ambiguous IP match (found " + std::to_string(match_count) + " peers with IP " + incoming_ip + "). Cannot identify peer. Waiting for CONTROL_CONNECT.");
                 }
             }
-        }
-        
-        if (peer) {
-            // Update last_seen
-            peer->last_seen = std::chrono::steady_clock::now();
 
-            LOG_INFO("SM: Received CONNECT_ACK from peer: " + peer->id);
+            if (peer) {
+                peer_id = peer->id;
+                peer->last_seen = std::chrono::steady_clock::now();
+                if (create_ephemeral_mapping && !mapping_advertised_network_id.empty()) {
+                    upsert_ephemeral_mapping_locked_(network_id, mapping_advertised_network_id);
+                    LOG_INFO("SM: CONNECT_ACK: Created ephemeral port mapping: " + network_id + " -> " + mapping_advertised_network_id);
+                }
+            } else {
+                LOG_WARN("SM: Received CONNECT_ACK for unknown network_id: " + network_id + ". Searching all peers:");
+                for (const auto& kv : m_peers) {
+                    LOG_WARN("  - Peer: " + kv.second.id + ", stored_network_id: " + kv.second.network_id);
+                }
+            }
+        } // locks released
+
+        if (!peer_id.empty()) {
+            LOG_INFO("SM: Received CONNECT_ACK from peer: " + peer_id);
             
             // First, send CONNECT_REQUESTED to transition from DISCOVERED to CONNECTING
-            // This ensures the peer is in the correct state before we send CONNECT_SUCCESS
-            pushEvent(FSMEvent{peer->id, PeerEvent::CONNECT_REQUESTED});
-            
+            pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_REQUESTED});
             // Then send CONNECT_SUCCESS to transition from CONNECTING to CONNECTED
-            pushEvent(FSMEvent{peer->id, PeerEvent::CONNECT_SUCCESS});
+            pushEvent(FSMEvent{peer_id, PeerEvent::CONNECT_SUCCESS});
             
-            LOG_INFO("SM: Queued FSM events for peer: " + peer->id + " (CONNECT_REQUESTED -> CONNECT_SUCCESS)");
+            LOG_INFO("SM: Queued FSM events for peer: " + peer_id + " (CONNECT_REQUESTED -> CONNECT_SUCCESS)");
 
 #if HAVE_NOISE_PROTOCOL
             if (m_use_noise_protocol && m_noise_key_store) {
@@ -2741,25 +4213,20 @@ void SessionManager::Impl::onData(const std::string& network_id, const std::stri
                     pk_hex.push_back(hex_chars[b & 0x0F]);
                 }
                 
-                std::string payload = m_localPeerId + "|" + pk_hex;
+                std::string payload = m_localPeerId + "|" + pk_hex + "|" + std::to_string(m_local_boot_id);
                 std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, payload);
                 send_message_to_peer(network_id, connect_msg);
-                LOG_INFO("SM: Sent CONTROL_CONNECT with public key to " + peer->id);
+                LOG_INFO("SM: Sent CONTROL_CONNECT with public key to " + peer_id);
             } else {
                 std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, m_localPeerId);
                 send_message_to_peer(network_id, connect_msg);
-                LOG_INFO("SM: Sent CONTROL_CONNECT to " + peer->id);
+                LOG_INFO("SM: Sent CONTROL_CONNECT to " + peer_id);
             }
 #else
             std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, m_localPeerId);
             send_message_to_peer(network_id, connect_msg);
-            LOG_INFO("SM: Sent CONTROL_CONNECT to " + peer->id);
+            LOG_INFO("SM: Sent CONTROL_CONNECT to " + peer_id);
 #endif
-        } else {
-            LOG_WARN("SM: Received CONNECT_ACK for unknown network_id: " + network_id + ". Searching all peers:");
-            for (const auto& kv : m_peers) {
-                LOG_WARN("  - Peer: " + kv.second.id + ", stored_network_id: " + kv.second.network_id);
-            }
         }
         return;  // Don't treat CONNECT_ACK as data
     }
@@ -2768,8 +4235,9 @@ void SessionManager::Impl::onData(const std::string& network_id, const std::stri
     // LOG_INFO("SM: Pushing DataReceivedEvent for network_id=" + network_id + ", data length=" + std::to_string(data.length()));
     
     // Update last_seen for general data
-    // Note: We must NOT hold m_peers_mutex when calling find_peer_by_network_id
-    // as it acquires m_network_index_mutex internally
+    // Note: If both the peer store and the network index are needed, follow the
+    // documented lock order (m_peers_mutex -> m_network_index_mutex). Avoid
+    // holding m_network_index_mutex while acquiring m_peers_mutex.
     std::string peer_id;
     {
         NATIVELOGW("SM_NATIVE: onData - acquiring network_index_mutex");
@@ -2814,14 +4282,29 @@ void SessionManager::Impl::onDisconnect(const std::string& network_id) {
 }
 
 void SessionManager::Impl::pushEvent(SessionEvent event) {
-    // Don't add new events when stopping
+    // Don't add new events when stopping - LOG this to help diagnose event loss
     if (m_shutting_down.load(std::memory_order_acquire)) {
+        // Extract event type for logging
+        std::string eventType = "Unknown";
+        std::visit([&eventType](auto&& arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, FSMEvent>) {
+                eventType = "FSMEvent";
+            } else if constexpr (std::is_same_v<T, TimerTickEvent>) {
+                eventType = "TimerTickEvent";
+            } else {
+                eventType = "OtherEvent";
+            }
+        }, event);
+        LOG_WARN("SM: DROPPING event (" + eventType + ") - shutting down");
         return;
     }
 
     if (m_event_manager) {
         m_event_manager->pushEvent(std::move(event));
     } else {
+        // WARN: Using legacy queue - events may not be processed!
+        LOG_WARN("SM: Using legacy queue (m_event_manager is null) - this may cause event loss!");
         std::lock_guard<std::mutex> lock(m_eventMutex);
         m_eventQueue.push(std::move(event));
         m_eventCv.notify_one();
@@ -2834,6 +4317,73 @@ bool SessionManager::Impl::isPeerConnected(const std::string& peer_id) const {
     return peer && peer->connected;
 }
 
+std::string SessionManager::Impl::getPeerFsmState(const std::string& peer_id) const {
+    std::lock_guard<std::mutex> lock(m_peers_mutex);
+    auto it = m_peer_contexts.find(peer_id);
+    if (it == m_peer_contexts.end()) {
+        return "UNKNOWN";
+    }
+    return state_to_string(it->second.state);
+}
+
+std::string SessionManager::Impl::getPeerConnectionType(const std::string& peer_id) const {
+    std::lock_guard<std::mutex> lock(m_peers_mutex);
+    const Peer* peer = find_peer_by_id(peer_id);
+    if (!peer || !peer->connected) {
+        return "UNKNOWN";
+    }
+    
+    // First, check if we have explicitly tracked the connection path
+    if (peer->active_connection_path != ConnectionPath::UNKNOWN) {
+        return connectionPathToString(peer->active_connection_path);
+    }
+    
+    // Fallback: Infer connection type from the endpoint being used
+    const std::string& current_network_id = peer->network_id;
+    if (current_network_id.empty()) {
+        return "UNKNOWN";
+    }
+    
+    // Parse the current ip:port
+    size_t colon_pos = current_network_id.rfind(':');
+    if (colon_pos == std::string::npos) {
+        return "UNKNOWN";
+    }
+    std::string current_ip = current_network_id.substr(0, colon_pos);
+    
+    // Find the matching endpoint candidate to determine the type
+    for (const auto& candidate : peer->endpoint_candidates) {
+        if (candidate.ip == current_ip) {
+            switch (candidate.type) {
+                case EndpointType::LAN:   return "LAN";
+                case EndpointType::WAN:   return "WAN_DIRECT";  // Assume direct if WAN candidate matched
+                case EndpointType::RELAY: return "TURN";
+            }
+        }
+    }
+    
+    // Fallback: Detect LAN based on private IP pattern
+    if (current_ip.rfind("10.", 0) == 0 ||
+        current_ip.rfind("192.168.", 0) == 0 ||
+        current_ip.rfind("127.", 0) == 0 ||
+        current_ip.rfind("169.254.", 0) == 0) {
+        return "LAN";
+    }
+    // Check 172.16.0.0 - 172.31.255.255 range
+    if (current_ip.rfind("172.", 0) == 0 && current_ip.size() > 4) {
+        size_t dot_pos = current_ip.find('.', 4);
+        if (dot_pos != std::string::npos) {
+            int second_octet = std::stoi(current_ip.substr(4, dot_pos - 4));
+            if (second_octet >= 16 && second_octet <= 31) {
+                return "LAN";
+            }
+        }
+    }
+    
+    // Public IP - assume direct hole punch since we reached here without relay candidate
+    return "WAN_DIRECT";
+}
+
 void SessionManager::Impl::send_message_to_peer(const std::string& network_id, const std::string& message) {
     // Check if we have an ephemeral port mapping for this network_id
     // If the message is to an advertised port but the connection is on ephemeral, we need to send to ephemeral
@@ -2841,6 +4391,11 @@ void SessionManager::Impl::send_message_to_peer(const std::string& network_id, c
     
     {
         std::lock_guard<std::mutex> lock(m_network_index_mutex);
+        // Debug: Log the ephemeral mapping table
+        LOG_INFO("SM: send_message_to_peer: Looking for ephemeral mapping for network_id=" + network_id + ", map_size=" + std::to_string(m_ephemeral_to_advertised_port_map.size()));
+        for (const auto& m : m_ephemeral_to_advertised_port_map) {
+            LOG_INFO("SM: Ephemeral map entry: " + m.first + " -> " + m.second);
+        }
         // Check if we have any ephemeral ports mapping TO this network_id
         // This means the peer connected to us on an ephemeral port, and we stored it mapping to our advertised port
         for (const auto& mapping : m_ephemeral_to_advertised_port_map) {
@@ -2848,9 +4403,12 @@ void SessionManager::Impl::send_message_to_peer(const std::string& network_id, c
                 // Found: ephemeral port maps to this advertised port
                 // Use the ephemeral port for sending
                 actual_network_id = mapping.first;
-                LOG_DEBUG("SM: Translating advertised port " + network_id + " to ephemeral port " + actual_network_id + " for sending");
+                LOG_INFO("SM: *** TRANSLATING *** advertised " + network_id + " -> ephemeral " + actual_network_id);
                 break;
             }
+        }
+        if (actual_network_id == network_id) {
+            LOG_INFO("SM: No ephemeral translation found, sending directly to " + network_id);
         }
     }
     
@@ -2871,59 +4429,99 @@ const Peer* SessionManager::Impl::find_peer_by_id(const std::string& peer_id) co
     return (it != m_peers.end()) ? &it->second : nullptr;
 }
 
-Peer* SessionManager::Impl::find_peer_by_network_id(const std::string& network_id) {
-    NATIVELOGW("SM_NATIVE: find_peer_by_network_id - about to acquire m_network_index_mutex");
-    std::lock_guard<std::mutex> lock(m_network_index_mutex);
-    NATIVELOGW("SM_NATIVE: find_peer_by_network_id - m_network_index_mutex acquired");
+std::string SessionManager::Impl::peer_id_by_network_id_locked_(const std::string& network_id) const {
     auto it = m_network_id_to_peer_id.find(network_id);
     if (it != m_network_id_to_peer_id.end()) {
-        NATIVELOGW("SM_NATIVE: find_peer_by_network_id - found in index, calling find_peer_by_id");
-        return find_peer_by_id(it->second);
+        return it->second;
     }
-    
+
     // Check ephemeral port mapping if direct lookup failed
     auto eph_it = m_ephemeral_to_advertised_port_map.find(network_id);
     if (eph_it != m_ephemeral_to_advertised_port_map.end()) {
         auto mapped_it = m_network_id_to_peer_id.find(eph_it->second);
         if (mapped_it != m_network_id_to_peer_id.end()) {
             LOG_DEBUG("SM: Found peer via ephemeral port mapping: " + network_id + " -> " + eph_it->second);
-            NATIVELOGW("SM_NATIVE: find_peer_by_network_id - found via ephemeral mapping");
-            return find_peer_by_id(mapped_it->second);
+            return mapped_it->second;
         }
     }
-    
-    NATIVELOGW("SM_NATIVE: find_peer_by_network_id - not found");
-    return nullptr;
+
+    return {};
 }
 
-const Peer* SessionManager::Impl::find_peer_by_network_id(const std::string& network_id) const {
-    std::lock_guard<std::mutex> lock(m_network_index_mutex);
-    auto it = m_network_id_to_peer_id.find(network_id);
-    if (it != m_network_id_to_peer_id.end()) {
-        return find_peer_by_id(it->second);
+Peer* SessionManager::Impl::find_peer_by_network_id_locked_(const std::string& network_id) {
+    const std::string peer_id = peer_id_by_network_id_locked_(network_id);
+    if (peer_id.empty()) {
+        return nullptr;
     }
-    
-    // Check ephemeral port mapping if direct lookup failed
-    auto eph_it = m_ephemeral_to_advertised_port_map.find(network_id);
-    if (eph_it != m_ephemeral_to_advertised_port_map.end()) {
-        auto mapped_it = m_network_id_to_peer_id.find(eph_it->second);
-        if (mapped_it != m_network_id_to_peer_id.end()) {
-            LOG_DEBUG("SM: Found peer via ephemeral port mapping: " + network_id + " -> " + eph_it->second);
-            return find_peer_by_id(mapped_it->second);
-        }
+    return find_peer_by_id(peer_id);
+}
+
+const Peer* SessionManager::Impl::find_peer_by_network_id_locked_(const std::string& network_id) const {
+    const std::string peer_id = peer_id_by_network_id_locked_(network_id);
+    if (peer_id.empty()) {
+        return nullptr;
     }
-    
-    return nullptr;
+    return find_peer_by_id(peer_id);
 }
 
 void SessionManager::Impl::add_peer_to_network_index(const std::string& peer_id, const std::string& network_id) {
+    if (network_id.empty()) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(m_network_index_mutex);
-    m_network_id_to_peer_id[network_id] = peer_id;
+    add_peer_to_network_index_locked_(peer_id, network_id);
 }
 
 void SessionManager::Impl::remove_peer_from_network_index(const std::string& network_id) {
     std::lock_guard<std::mutex> lock(m_network_index_mutex);
+    remove_peer_from_network_index_locked_(network_id);
+}
+
+void SessionManager::Impl::add_peer_to_network_index_locked_(const std::string& peer_id, const std::string& network_id) {
+    if (network_id.empty()) {
+        return;
+    }
+
+    auto it = m_network_id_to_peer_id.find(network_id);
+    if (it != m_network_id_to_peer_id.end() && it->second != peer_id) {
+        // Network endpoints are not guaranteed to be globally unique:
+        // - A peer may advertise a stale/incorrect WAN port (e.g., local listen port)
+        // - Routers with UPnP/NAT-PMP can briefly re-map a public port, causing temporary duplication
+        // Overwriting here can break existing live sessions by misattributing inbound packets.
+        LOG_WARN("SM: Network_id collision for " + network_id + " (existing_peer=" + it->second + ", new_peer=" + peer_id + ") - keeping existing mapping");
+        return;
+    }
+    m_network_id_to_peer_id[network_id] = peer_id;
+}
+
+void SessionManager::Impl::remove_peer_from_network_index_locked_(const std::string& network_id) {
     m_network_id_to_peer_id.erase(network_id);
+}
+
+void SessionManager::Impl::prune_ephemeral_mappings_for_advertised_locked_(const std::string& advertised_network_id) {
+    if (advertised_network_id.empty()) {
+        return;
+    }
+    for (auto it = m_ephemeral_to_advertised_port_map.begin(); it != m_ephemeral_to_advertised_port_map.end();) {
+        if (it->second == advertised_network_id) {
+            it = m_ephemeral_to_advertised_port_map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void SessionManager::Impl::upsert_ephemeral_mapping_locked_(const std::string& ephemeral_network_id,
+                                                           const std::string& advertised_network_id) {
+    if (ephemeral_network_id.empty() || advertised_network_id.empty()) {
+        LOG_WARN("SM: upsert_ephemeral_mapping: empty input - ephemeral=" + ephemeral_network_id + ", advertised=" + advertised_network_id);
+        return;
+    }
+    LOG_INFO("SM: *** CREATING EPHEMERAL MAPPING *** " + ephemeral_network_id + " -> " + advertised_network_id);
+    // Keep only the newest ephemeral mapping for this advertised network_id.
+    prune_ephemeral_mappings_for_advertised_locked_(advertised_network_id);
+    m_ephemeral_to_advertised_port_map[ephemeral_network_id] = advertised_network_id;
+    LOG_INFO("SM: Ephemeral map now has " + std::to_string(m_ephemeral_to_advertised_port_map.size()) + " entries");
 }
 
 void SessionManager::Impl::handlePeerLeftFromSignaling(const std::string& peer_id) {
@@ -2968,8 +4566,18 @@ void SessionManager::Impl::handlePeerLeftFromSignaling(const std::string& peer_i
     // Stop any ongoing NAT traversal work for this peer (common after abrupt app kills).
     NATTraversal::getInstance().unregisterPeer(peer_id);
 
+    // Get current epoch for this peer
+    uint64_t current_epoch = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        auto ctx_it = m_peer_contexts.find(peer_id);
+        if (ctx_it != m_peer_contexts.end()) {
+            current_epoch = ctx_it->second.connect_epoch;
+        }
+    }
+
     // Drive FSM cleanup for Noise/session state. (If the peer/context doesn't exist, this is a no-op.)
-    pushEvent(FSMEvent{peer_id, PeerEvent::DISCONNECT_DETECTED});
+    pushEvent(FSMEvent{peer_id, PeerEvent::DISCONNECT_DETECTED, current_epoch});
 
     notifyPeerUpdate();
 }
@@ -3135,4 +4743,83 @@ PeerIndex* SessionManager::Impl::get_peer_index() {
 
 FileTransferManager* SessionManager::Impl::get_file_transfer_manager() {
     return m_file_transfer_manager.get();
+}
+
+// PRODUCTION-READY: IP change detection and monitoring
+void SessionManager::Impl::start_ip_monitor() {
+    if (m_ip_monitor_running.load(std::memory_order_acquire)) {
+        return;  // Already running
+    }
+    
+    // Get initial IP (IPv6-preferred when the host has IPv6 connectivity).
+    m_last_known_primary_ip = get_primary_ip_address();
+    LOG_INFO("SM: IP monitor started, initial IP: " + (m_last_known_primary_ip.empty() ? "<none>" : m_last_known_primary_ip));
+    
+    m_ip_monitor_running.store(true, std::memory_order_release);
+    m_ip_monitor_thread = std::thread(&SessionManager::Impl::ip_monitor_loop, this);
+}
+
+void SessionManager::Impl::stop_ip_monitor() {
+    if (!m_ip_monitor_running.load(std::memory_order_acquire)) {
+        return;  // Not running
+    }
+    
+    m_ip_monitor_running.store(false, std::memory_order_release);
+    m_ip_monitor_wait_cv.notify_all();
+    if (m_ip_monitor_thread.joinable()) {
+        m_ip_monitor_thread.join();
+    }
+    LOG_INFO("SM: IP monitor stopped");
+}
+
+void SessionManager::Impl::ip_monitor_loop() {
+    // Monitor IP changes every 5 seconds
+    constexpr int check_interval_sec = 5;
+    
+    while (m_ip_monitor_running.load(std::memory_order_acquire) && 
+           !m_shutting_down.load(std::memory_order_acquire)) {
+        {
+            std::unique_lock<std::mutex> lock(m_ip_monitor_wait_mutex);
+            if (m_ip_monitor_wait_cv.wait_for(lock, std::chrono::seconds(check_interval_sec), [this] {
+                    return !m_ip_monitor_running.load(std::memory_order_acquire) ||
+                           m_shutting_down.load(std::memory_order_acquire);
+                })) {
+                break;
+            }
+        }
+        
+        if (m_shutting_down.load(std::memory_order_acquire)) {
+            break;
+        }
+        
+        std::string current_ip = get_primary_ip_address();
+        
+        // Check if IP changed
+        if (!current_ip.empty() && current_ip != m_last_known_primary_ip && !m_last_known_primary_ip.empty()) {
+            LOG_INFO("SM: IP address changed detected: " + m_last_known_primary_ip + " -> " + current_ip);
+            m_last_known_primary_ip = current_ip;
+            
+            // Trigger network change handling (treat as network type change to refresh everything)
+            // This will trigger NAT refresh, signaling refresh, and immediate reconnect
+            bool was_wifi = m_is_wifi.load(std::memory_order_acquire);
+            bool was_available = m_network_available.load(std::memory_order_acquire);
+            
+            // IP change on same interface - treat as network change
+            set_network_info(was_wifi, was_available);
+            
+            Telemetry::getInstance().inc_counter("ip_change_detected_total");
+        } else if (current_ip.empty() && !m_last_known_primary_ip.empty()) {
+            // IP disappeared (network down)
+            LOG_WARN("SM: IP address disappeared (network may be down)");
+            m_last_known_primary_ip.clear();
+        } else if (!current_ip.empty() && m_last_known_primary_ip.empty()) {
+            // IP appeared (network restored)
+            LOG_INFO("SM: IP address appeared: " + current_ip);
+            m_last_known_primary_ip = current_ip;
+            
+            // Trigger network restore
+            bool was_wifi = m_is_wifi.load(std::memory_order_acquire);
+            set_network_info(was_wifi, true);
+        }
+    }
 }

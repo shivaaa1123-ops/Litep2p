@@ -1,5 +1,6 @@
 #include "nat_stun.h"
 #include "logger.h"
+#include "crypto_utils.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -15,15 +16,10 @@
 // ============================================================================
 
 STUNMessage::STUNMessage() : type_(STUNMessageType::BindingRequest) {
-    // Generate random transaction ID (12 bytes)
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 255);
-    
+    // Generate random transaction ID (12 bytes) using a CSPRNG so that
+    // transaction IDs are unpredictable (RFC 5389 requirement).
     transaction_id_.resize(12);
-    for (int i = 0; i < 12; i++) {
-        transaction_id_[i] = dis(gen);
-    }
+    random_bytes(transaction_id_.data(), transaction_id_.size());
 }
 
 void STUNMessage::addAttribute(STUNAttributeType type, const std::vector<uint8_t>& value) {

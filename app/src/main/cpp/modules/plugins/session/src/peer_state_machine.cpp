@@ -85,6 +85,16 @@ FSMResult PeerStateMachine::compute_transition(
             return FSMResult(PeerState::CONNECTED);
         }
 
+        // HANDSHAKE_RELAY fast-path: If handshake message arrives while DISCOVERED,
+        // skip connect phase entirely and jump directly to handshaking.
+        // This handles signaling-relayed handshakes arriving before explicit connect.
+        if (event == PeerEvent::HANDSHAKE_MESSAGE_RECEIVED) {
+            return FSMResult(
+                PeerState::HANDSHAKING,
+                { PeerAction::PROCESS_HANDSHAKE_MESSAGE }
+            );
+        }
+
         if (event == PeerEvent::DISCONNECT_DETECTED)
             return FSMResult(PeerState::DISCONNECTED);
 
@@ -105,8 +115,22 @@ FSMResult PeerStateMachine::compute_transition(
             return FSMResult(PeerState::CONNECTED);
         }
 
+        // HANDSHAKE_RELAY fast-path: If handshake message arrives while CONNECTING,
+        // treat it as implicit connect success and immediately start handshaking.
+        // This handles AP isolation scenarios where signaling relays handshakes
+        // before direct UDP connectivity is confirmed.
+        if (event == PeerEvent::HANDSHAKE_MESSAGE_RECEIVED) {
+            peer.connect_retry_count = 0;  // Reset since we have implicit connectivity
+            return FSMResult(
+                PeerState::HANDSHAKING,
+                { PeerAction::PROCESS_HANDSHAKE_MESSAGE }
+            );
+        }
+
         if (event == PeerEvent::CONNECT_FAILED) {
-            if (++peer.connect_retry_count >= MAX_HANDSHAKE_RETRIES) {
+            // SELF-HEALING: Use dedicated MAX_CONNECT_RETRIES instead of MAX_HANDSHAKE_RETRIES
+            // to allow independent tuning of connect vs handshake retry limits.
+            if (++peer.connect_retry_count >= MAX_CONNECT_RETRIES) {
                 return FSMResult(
                     PeerState::FAILED,
                     { PeerAction::CLEANUP_RESOURCES }
@@ -151,6 +175,17 @@ FSMResult PeerStateMachine::compute_transition(
                 PeerState::HANDSHAKING,
                 { PeerAction::PROCESS_HANDSHAKE_MESSAGE }
             );
+
+        // RACE FIX: Handshake can complete while FSM is still in CONNECTED state
+        // (before HANDSHAKE_REQUIRED transitions to HANDSHAKING). This handles the
+        // case where the handshake completes quickly or via relay before FSM catches up.
+        if (event == PeerEvent::HANDSHAKE_SUCCESS) {
+            peer.handshake_retry_count = 0;
+            return FSMResult(
+                PeerState::READY,
+                { PeerAction::FLUSH_QUEUED_MESSAGES }
+            );
+        }
 
         if (event == PeerEvent::DISCONNECT_DETECTED)
             return FSMResult(
@@ -227,6 +262,14 @@ FSMResult PeerStateMachine::compute_transition(
         if (event == PeerEvent::CONNECT_SUCCESS)
             return FSMResult(PeerState::READY);
 
+        // Idempotency: relay reconnect may complete a re-handshake while FSM is still READY.
+        // Stay in READY and flush any pending messages.
+        if (event == PeerEvent::HANDSHAKE_SUCCESS)
+            return FSMResult(
+                PeerState::READY,
+                { PeerAction::FLUSH_QUEUED_MESSAGES }
+            );
+
         // Allow re-key / restart recovery: a peer may re-initiate Noise handshake even if we
         // still consider the session READY (e.g., remote restart or transport reconnect races).
         if (event == PeerEvent::HANDSHAKE_REQUIRED)
@@ -270,6 +313,22 @@ FSMResult PeerStateMachine::compute_transition(
             );
         }
 
+        // Recovery: allow a late transport connect to bring the peer back to CONNECTED.
+        if (event == PeerEvent::CONNECT_SUCCESS) {
+            peer.connect_retry_count = 0;
+            return FSMResult(PeerState::CONNECTED);
+        }
+
+        // HANDSHAKE_RELAY recovery: If handshake message arrives while DEGRADED,
+        // treat it as implicit connectivity restored and immediately start handshaking.
+        if (event == PeerEvent::HANDSHAKE_MESSAGE_RECEIVED) {
+            peer.connect_retry_count = 0;
+            return FSMResult(
+                PeerState::HANDSHAKING,
+                { PeerAction::PROCESS_HANDSHAKE_MESSAGE }
+            );
+        }
+
         if (event == PeerEvent::CONNECT_REQUESTED)
             return FSMResult(PeerState::CONNECTING);
 
@@ -287,6 +346,16 @@ FSMResult PeerStateMachine::compute_transition(
                 PeerState::DISCONNECTED,
                 { PeerAction::CLEANUP_RESOURCES }
             );
+
+        // RECOVERY_REQUESTED: Rugged recovery system detected degradation, force reconnect
+        if (event == PeerEvent::RECOVERY_REQUESTED) {
+            peer.connect_retry_count = 0;
+            peer.handshake_retry_count = 0;
+            return FSMResult(
+                PeerState::CONNECTING,
+                { PeerAction::TRIGGER_RECOVERY }
+            );
+        }
         break;
 
     // ------------------------------------------------------
@@ -316,6 +385,16 @@ FSMResult PeerStateMachine::compute_transition(
 
         if (event == PeerEvent::SHUTDOWN)
             return FSMResult(PeerState::FAILED);
+
+        // RECOVERY_REQUESTED: Rugged recovery system requests reconnection attempt
+        if (event == PeerEvent::RECOVERY_REQUESTED) {
+            peer.connect_retry_count = 0;
+            peer.handshake_retry_count = 0;
+            return FSMResult(
+                PeerState::CONNECTING,
+                { PeerAction::TRIGGER_RECOVERY }
+            );
+        }
         break;
 
     // ------------------------------------------------------
@@ -357,7 +436,28 @@ FSMResult PeerStateMachine::compute_transition(
                 PeerState::DISCONNECTED,
                 { PeerAction::CLEANUP_RESOURCES }
             );
+            
+        // RUGGED RECOVERY: Allow immediate recovery from FAILED state
+        if (event == PeerEvent::RECOVERY_REQUESTED) {
+            peer.connect_retry_count = 0;
+            peer.handshake_retry_count = 0;
+            return FSMResult(
+                PeerState::CONNECTING,
+                { PeerAction::TRIGGER_RECOVERY }
+            );
+        }
         break;
+    }
+
+    // RUGGED RECOVERY: Handle RECOVERY_REQUESTED in any state
+    // This allows forcing a full reconnect from any state (e.g., after network change)
+    if (event == PeerEvent::RECOVERY_REQUESTED) {
+        peer.connect_retry_count = 0;
+        peer.handshake_retry_count = 0;
+        return FSMResult(
+            PeerState::CONNECTING,
+            { PeerAction::CLEANUP_RESOURCES, PeerAction::TRIGGER_RECOVERY }
+        );
     }
 
     LOG_WARN(
@@ -403,6 +503,7 @@ const char* PeerStateMachine::event_to_string(PeerEvent event) {
         case PeerEvent::LATENCY_UPDATE: return "LATENCY_UPDATE";
         case PeerEvent::RETRY_EXHAUSTED: return "RETRY_EXHAUSTED";
         case PeerEvent::SHUTDOWN: return "SHUTDOWN";
+        case PeerEvent::RECOVERY_REQUESTED: return "RECOVERY_REQUESTED";
         default: return "UNKNOWN";
     }
 }

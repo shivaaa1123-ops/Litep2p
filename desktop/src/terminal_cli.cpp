@@ -723,6 +723,7 @@ void TerminalCLI::calculate_layout() {
 
     const int min_cmd = 3;
     const int min_logs = 3;
+    const int output_shrink_rows = 2; // user preference: give 2 rows from OUTPUT to PEERS/MESSAGES
 
     // Compute a stable base allocation first (this defines the LOGS height).
     // We'll then grow OUTPUT by borrowing space from the peers/messages area,
@@ -737,11 +738,17 @@ void TerminalCLI::calculate_layout() {
     logs_panel_height = std::max(min_logs, base_logs_h - 4);
 
     // Try to grow OUTPUT as much as possible (up to 16) while keeping peers/messages >= 4.
-    // This makes the growth obvious even on medium terminals.
+    // Then shrink OUTPUT slightly to give more room to the peers/messages row.
     cmd_output_height = remaining - logs_panel_height - 4;
     cmd_output_height = std::max(8, cmd_output_height);
     cmd_output_height = std::min(16, cmd_output_height);
     cmd_output_height = std::max(min_cmd, cmd_output_height);
+
+    // Transfer up to 2 rows from OUTPUT to PEERS/MESSAGES (but never below min_cmd).
+    {
+        const int transferable = std::min(output_shrink_rows, cmd_output_height - min_cmd);
+        cmd_output_height -= std::max(0, transferable);
+    }
 
     // Ensure peers/messages panel remains usable.
     peers_panel_height = remaining - logs_panel_height - cmd_output_height;
@@ -749,6 +756,11 @@ void TerminalCLI::calculate_layout() {
         // First, shrink OUTPUT down (but keep at least 3).
         cmd_output_height = std::max(min_cmd, remaining - logs_panel_height - 4);
         cmd_output_height = std::min(16, cmd_output_height);
+        // Re-apply the OUTPUT shrink preference after clamping.
+        {
+            const int transferable = std::min(output_shrink_rows, cmd_output_height - min_cmd);
+            cmd_output_height -= std::max(0, transferable);
+        }
         peers_panel_height = remaining - logs_panel_height - cmd_output_height;
     }
     peers_panel_height = std::max(4, peers_panel_height);

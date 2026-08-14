@@ -235,16 +235,26 @@ public:
         const auto targets = get_ipv4_broadcast_targets(static_cast<uint16_t>(DISCOVERY_PORT));
 
         bool any_sent = false;
+        int sent_count = 0;
         for (const auto& dst : targets) {
+            char addr_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &dst.sin_addr, addr_str, sizeof(addr_str));
+            
             const ssize_t sent = sendto(m_sock, msg.c_str(), msg.length(), 0,
                                         reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
             if (sent >= 0) {
                 any_sent = true;
+                sent_count++;
+                nativeLog("Discovery: Sent broadcast to " + std::string(addr_str) + ":" + std::to_string(ntohs(dst.sin_port)) + " (" + std::to_string(sent) + " bytes)");
+            } else {
+                nativeLog("Discovery Warning: Failed to send broadcast to " + std::string(addr_str) + ":" + std::to_string(ntohs(dst.sin_port)) + " (errno=" + std::to_string(errno) + ")");
             }
         }
 
         if (!any_sent) {
             nativeLog("Discovery Warning: Failed to send broadcast on all interfaces");
+        } else {
+            nativeLog("Discovery: Broadcast sent to " + std::to_string(sent_count) + " target(s), msg_len=" + std::to_string(msg.length()));
         }
     }
     
@@ -302,6 +312,82 @@ public:
         return m_sock;
     }
 
+    void sendDirectProbe(const std::string& ip, int port) override {
+        if (m_sock < 0 || !m_running) {
+            nativeLog("Discovery: sendDirectProbe skipped - not running");
+            return;
+        }
+        
+        // Send discovery message directly to the specified IP:port on the discovery port
+        // This bypasses AP isolation that may block broadcasts
+        std::string msg = std::string(DISCOVERY_MESSAGE_PREFIX) + ":" + m_peer_id + ":" + std::to_string(m_connection_port);
+        
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(static_cast<uint16_t>(DISCOVERY_PORT));  // Send to discovery port
+        
+        if (inet_pton(AF_INET, ip.c_str(), &dst.sin_addr) <= 0) {
+            nativeLog("Discovery: sendDirectProbe - invalid IP: " + ip);
+            return;
+        }
+        
+        const ssize_t sent = sendto(m_sock, msg.c_str(), msg.length(), 0,
+                                    reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+        
+        if (sent >= 0) {
+            nativeLog("Discovery: Sent direct probe to " + ip + ":" + std::to_string(DISCOVERY_PORT) + " (" + std::to_string(sent) + " bytes)");
+        } else {
+            nativeLog("Discovery: Failed to send direct probe to " + ip + " errno=" + std::to_string(errno));
+        }
+    }
+
+    std::string getLocalLanIP() const override {
+        // Find the first private (LAN) IP address on a non-loopback interface
+        struct ifaddrs* ifaddr = nullptr;
+        std::string result;
+        
+        if (getifaddrs(&ifaddr) != 0 || !ifaddr) {
+            return result;
+        }
+        
+        for (struct ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr) continue;
+            if ((ifa->ifa_flags & IFF_UP) == 0) continue;
+            if ((ifa->ifa_flags & IFF_LOOPBACK) != 0) continue;
+            if (ifa->ifa_addr->sa_family != AF_INET) continue;
+            
+            auto* addr = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+            char ip_str[INET_ADDRSTRLEN];
+            if (inet_ntop(AF_INET, &addr->sin_addr, ip_str, sizeof(ip_str)) == nullptr) continue;
+            
+            std::string ip(ip_str);
+            
+            // Check if this is a private IP (RFC1918)
+            bool is_private = false;
+            if (ip.rfind("10.", 0) == 0 || ip.rfind("192.168.", 0) == 0) {
+                is_private = true;
+            } else if (ip.rfind("172.", 0) == 0) {
+                auto dot = ip.find('.', 4);
+                if (dot != std::string::npos) {
+                    try {
+                        int second = std::stoi(ip.substr(4, dot - 4));
+                        if (second >= 16 && second <= 31) {
+                            is_private = true;
+                        }
+                    } catch (...) {}
+                }
+            }
+            
+            if (is_private) {
+                result = ip;
+                break;  // Return first private IP found
+            }
+        }
+        freeifaddrs(ifaddr);
+        
+        return result;
+    }
+
     void enableCentralDiscovery(bool enable) {
         m_use_central_discovery = enable;
     }
@@ -314,17 +400,29 @@ private:
             std::string msg = std::string(DISCOVERY_MESSAGE_PREFIX) + ":" + m_peer_id + ":" + std::to_string(m_connection_port);
             const auto targets = get_ipv4_broadcast_targets(static_cast<uint16_t>(DISCOVERY_PORT));
 
+            nativeLog("Discovery broadcastLoop: Sending to " + std::to_string(targets.size()) + " broadcast targets");
+
             bool any_sent = false;
+            int success_count = 0;
             for (const auto& dst : targets) {
+                char target_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &dst.sin_addr, target_ip, sizeof(target_ip));
+                
                 const ssize_t sent = sendto(m_sock, msg.c_str(), msg.length(), 0,
                                             reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
                 if (sent >= 0) {
                     any_sent = true;
+                    success_count++;
+                    nativeLog("Discovery broadcastLoop: Sent to " + std::string(target_ip) + ":" + std::to_string(ntohs(dst.sin_port)));
+                } else {
+                    nativeLog("Discovery broadcastLoop: FAILED to send to " + std::string(target_ip) + " errno=" + std::to_string(errno));
                 }
             }
 
             if (!any_sent) {
                 nativeLog("Discovery Warning: Failed to send broadcast on all interfaces (threaded)");
+            } else {
+                nativeLog("Discovery broadcastLoop: Sent " + std::to_string(success_count) + "/" + std::to_string(targets.size()) + " broadcasts OK");
             }
             
             std::unique_lock<std::mutex> lock(m_mutex);
@@ -333,6 +431,7 @@ private:
     }
 
     void listenLoop() {
+        nativeLog("Discovery listenLoop: Started listening on UDP port " + std::to_string(DISCOVERY_PORT));
         char buf[DISCOVERY_MSG_MAX];
         while (m_running) {
             sockaddr_in from_addr{};
@@ -341,10 +440,12 @@ private:
             if (n > 0) {
                 buf[n] = 0;
                 std::string msg(buf);
+                
+                char sender_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &from_addr.sin_addr, sender_ip, sizeof(sender_ip));
+                nativeLog("Discovery listenLoop: Received " + std::to_string(n) + " bytes from " + std::string(sender_ip) + " msg=" + msg.substr(0, 50));
+                
                 if (msg.rfind(DISCOVERY_MESSAGE_PREFIX, 0) == 0) {
-                    char sender_ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &from_addr.sin_addr, sender_ip, sizeof(sender_ip));
-                    
                     // Parse message format: "DISCOVER:<peer_id>:<connection_port>"
                     std::string msg_without_prefix = msg.substr(strlen(DISCOVERY_MESSAGE_PREFIX) + 1);
                     size_t colon_pos = msg_without_prefix.find(':');
@@ -366,11 +467,13 @@ private:
 
                     // Avoid self-discovery (we hear our own broadcast on some networks).
                     if (!m_peer_id.empty() && peer_id == m_peer_id) {
+                        nativeLog("Discovery listenLoop: Ignoring self-discovery for peer_id=" + peer_id);
                         continue;
                     }
 
                     // Drop duplicates that can occur when peers broadcast to multiple targets.
                     if (is_recent_duplicate(sender_ip, connection_port, peer_id)) {
+                        nativeLog("Discovery listenLoop: Ignoring duplicate from " + std::string(sender_ip));
                         continue;
                     }
                     
@@ -379,12 +482,17 @@ private:
                         std::string network_id = std::string(sender_ip) + ":" + std::to_string(connection_port);
                         nativeLog("Discovery: Found peer " + peer_id + " at " + network_id);
                         m_callback(network_id, peer_id);
+                    } else {
+                        nativeLog("Discovery listenLoop: No callback registered!");
                     }
+                } else {
+                    nativeLog("Discovery listenLoop: Ignoring non-discovery message: " + msg.substr(0, 30));
                 }
             } else if (!m_running) {
                 break;
             }
         }
+        nativeLog("Discovery listenLoop: Stopped");
     }
 
     bool is_recent_duplicate(const char* sender_ip, int connection_port, const std::string& peer_id) {

@@ -154,6 +154,21 @@ public:
                              OnDiscoveryComplete on_complete = nullptr);
     
     /**
+     * Initiate a discovery request for a peer with a known LAN IP hint
+     * This will send a direct probe to the hint IP in addition to waiting for broadcasts
+     * Useful when AP isolation blocks broadcasts but we know the peer's LAN IP
+     * @param target_peer_id Peer to find
+     * @param hint_ip Known LAN IP of the peer (will send direct probe)
+     * @param hint_port Known port of the peer
+     * @param on_complete Callback when peer is found
+     * @return request_id or empty string on failure
+     */
+    std::string discover_peer_with_hint(const std::string& target_peer_id,
+                                        const std::string& hint_ip,
+                                        int hint_port,
+                                        OnDiscoveryComplete on_complete = nullptr);
+    
+    /**
      * Cancel a pending discovery request
      * @param request_id Request to cancel
      * @return true on success
@@ -228,6 +243,19 @@ public:
      * @return true on success
      */
     bool process_discovery_response(const DiscoveryResponse& response);
+    
+    /**
+     * Notify that a peer was discovered via LAN broadcast
+     * This will find any pending discoveries for this peer and trigger their callbacks.
+     * Used to connect the Discovery UDP broadcast system with BroadcastDiscoveryManager.
+     * @param peer_id The discovered peer's ID
+     * @param ip The discovered peer's IP address
+     * @param port The discovered peer's port
+     * @return true if a pending discovery was found and triggered
+     */
+    bool notify_peer_discovered(const std::string& peer_id, 
+                               const std::string& ip, 
+                               int port);
     
     /**
      * Create discovery response (for responding to broadcast)

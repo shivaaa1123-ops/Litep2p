@@ -1,5 +1,7 @@
 #include "../include/signaling_client.h"
 #include "../../../corep2p/core/include/logger.h"
+#include "../../../corep2p/crypto/include/crypto_utils.h"
+#include <nlohmann/json.hpp>
 
 #include <sys/socket.h>
 #include <sys/select.h>
@@ -445,25 +447,62 @@ bool SignalingClient::performHandshake(const std::string& host, int port, const 
         return false;
     }
 
-    // Read response (may arrive in multiple TCP chunks)
+    // Read response (may arrive in multiple TCP chunks).
+    // IMPORTANT: Bound the handshake time. On mobile network transitions, it's possible to
+    // successfully connect() but then stall forever waiting for bytes (route/captive portal).
+    constexpr int kHandshakeOverallTimeoutMs = 3000;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHandshakeOverallTimeoutMs);
+
     std::string response;
     response.reserve(2048);
-    for (;;) {
-        char buffer[1024];
-        const int n = recv(m_socket, buffer, sizeof(buffer) - 1, 0);
-        if (n <= 0) {
-            if (n < 0) {
-                LOG_ERROR("Signaling: Handshake recv failed: " + errno_string(errno));
-            }
+    while (response.find("\r\n\r\n") == std::string::npos) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            LOG_ERROR("Signaling: Handshake timed out waiting for response headers");
             return false;
         }
+
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        timeval tv;
+        tv.tv_sec = static_cast<int>(remaining.count() / 1000);
+        tv.tv_usec = static_cast<int>((remaining.count() % 1000) * 1000);
+
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(m_socket, &read_fds);
+
+        const int ready = ::select(m_socket + 1, &read_fds, nullptr, nullptr, &tv);
+        if (ready == 0) {
+            LOG_ERROR("Signaling: Handshake timed out waiting for socket readable");
+            return false;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            LOG_ERROR("Signaling: Handshake select() failed: " + errno_string(errno));
+            return false;
+        }
+
+        char buffer[1024];
+        const int n = ::recv(m_socket, buffer, sizeof(buffer) - 1, 0);
+        if (n == 0) {
+            LOG_ERROR("Signaling: Handshake recv EOF");
+            return false;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            LOG_ERROR("Signaling: Handshake recv failed: " + errno_string(errno));
+            return false;
+        }
+
         buffer[n] = '\0';
         response.append(buffer);
-
-        // HTTP headers end with CRLF CRLF
-        if (response.find("\r\n\r\n") != std::string::npos) {
-            break;
-        }
 
         // Safety: avoid unbounded growth if the server is misbehaving.
         if (response.size() > 64 * 1024) {
@@ -484,24 +523,44 @@ bool SignalingClient::performHandshake(const std::string& host, int port, const 
 }
 
 void SignalingClient::sendRegister(const std::string& peer_id) {
-    // {"type": "REGISTER", "peer_id": "..."}
-    std::string json = "{\"type\": \"REGISTER\", \"peer_id\": \"" + peer_id + "\"}";
-    sendFrame(json);
+    // Build with nlohmann::json so identifiers are properly escaped (no JSON
+    // injection via crafted peer ids).
+    const nlohmann::json payload = {
+        {"type", "REGISTER"},
+        {"peer_id", peer_id},
+    };
+    sendFrame(payload.dump());
 }
 
 void SignalingClient::sendRegister(const std::string& peer_id, const std::string& network_id) {
-    // {"type": "REGISTER", "peer_id": "...", "network_id": "..."}
-    // Note: network_id should be escaped if it contains quotes.
-    std::string json = "{\"type\": \"REGISTER\", \"peer_id\": \"" + peer_id +
-                      "\", \"network_id\": \"" + network_id + "\"}";
-    sendFrame(json);
+    const nlohmann::json payload = {
+        {"type", "REGISTER"},
+        {"peer_id", peer_id},
+        {"network_id", network_id},
+    };
+    sendFrame(payload.dump());
 }
 
 void SignalingClient::sendSignal(const std::string& target_peer_id, const std::string& payload) {
-    // {"type": "SIGNAL", "target_peer_id": "...", "payload": "..."}
-    // Note: Payload should be escaped if it contains quotes, but for now assuming simple base64 or safe string
-    std::string json = "{\"type\": \"SIGNAL\", \"target_peer_id\": \"" + target_peer_id + "\", \"payload\": \"" + payload + "\"}";
-    sendFrame(json);
+    const nlohmann::json msg = {
+        {"type", "SIGNAL"},
+        {"target_peer_id", target_peer_id},
+        {"payload", payload},
+    };
+    sendFrame(msg.dump());
+}
+
+void SignalingClient::sendRelayMessage(const std::string& target_peer_id, const std::string& message) {
+    // RELAY_DATA message type: used to relay application data through signaling when UDP fails
+    // Base64 encode the message to handle binary/special characters safely
+    std::vector<uint8_t> bytes(message.begin(), message.end());
+    std::string encoded = base64Encode(bytes);
+    const nlohmann::json msg = {
+        {"type", "RELAY_DATA"},
+        {"target_peer_id", target_peer_id},
+        {"data", encoded},
+    };
+    sendFrame(msg.dump());
 }
 
 void SignalingClient::sendListPeers() {
@@ -510,10 +569,18 @@ void SignalingClient::sendListPeers() {
 }
 
 void SignalingClient::sendUpdateNetworkId(const std::string& network_id) {
-    // {"type": "UPDATE", "network_id": "..."}
-    // Note: network_id should be escaped if it contains quotes.
-    std::string json = "{\"type\": \"UPDATE\", \"network_id\": \"" + network_id + "\"}";
-    sendFrame(json);
+    // Special case: empty network_id means "clear" (send JSON null). This is used on
+    // network transitions when we cannot determine a valid IPv4 external endpoint and
+    // must avoid advertising a stale, potentially colliding network_id.
+    if (network_id.empty()) {
+        sendFrame("{\"type\": \"UPDATE\", \"network_id\": null}");
+        return;
+    }
+    const nlohmann::json payload = {
+        {"type", "UPDATE"},
+        {"network_id", network_id},
+    };
+    sendFrame(payload.dump());
 }
 
 bool SignalingClient::sendFrame(const std::string& data, uint8_t opcode) {
@@ -816,12 +883,7 @@ bool SignalingClient::isConnected() const {
 
 std::string SignalingClient::generateWebSocketKey() {
     std::vector<uint8_t> nonce(16);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dis(0, 255);
-    for (auto& b : nonce) {
-        b = static_cast<uint8_t>(dis(gen));
-    }
+    random_bytes(nonce.data(), nonce.size());
     return base64Encode(nonce);
 }
 

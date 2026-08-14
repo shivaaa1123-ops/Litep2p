@@ -12,6 +12,12 @@ object LiteP2PLogger {
     // This method will be called from the C++ code
     @JvmStatic
     fun addLog(message: String) {
+        // Telemetry is displayed in the Telemetry tab only (not in Logs).
+        // Still capture it if it arrives on the log stream (best-effort fallback).
+        if (TelemetryStore.maybeCaptureFromLog(message)) {
+            return
+        }
+
         // We'll keep the last 100 messages
         if (logHistory.size > 100) {
             logHistory.removeAt(logHistory.size - 1)

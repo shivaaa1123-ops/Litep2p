@@ -103,6 +103,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.ktx)
     implementation(libs.androidx.navigation.fragment.ktx)
     implementation(libs.androidx.navigation.ui.ktx)
+    implementation(libs.androidx.viewpager2)
 
     // Use libsodium from Maven Central
     implementation("com.goterl:lazysodium-java:5.1.4")

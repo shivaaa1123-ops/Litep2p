@@ -24,6 +24,13 @@ public:
     
     // Get socket fd for event loop registration
     virtual int getSocketFd() const = 0;
+    
+    // Send a direct discovery probe to a specific IP:port (bypasses broadcast)
+    // This is useful when AP isolation blocks broadcasts but we know the peer's LAN IP
+    virtual void sendDirectProbe(const std::string& ip, int port) = 0;
+    
+    // Get the local LAN IP address (first private IP found on a non-loopback interface)
+    virtual std::string getLocalLanIP() const = 0;
 };
 
 Discovery* getGlobalDiscoveryInstance();

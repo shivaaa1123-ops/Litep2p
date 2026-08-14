@@ -26,6 +26,10 @@ public:
     void sendRegister(const std::string& peer_id);
     void sendRegister(const std::string& peer_id, const std::string& network_id);
     void sendSignal(const std::string& target_peer_id, const std::string& payload);
+    
+    // Relay a message through the signaling server to a peer
+    // Used when direct UDP path is failing (NAT/firewall issues)
+    void sendRelayMessage(const std::string& target_peer_id, const std::string& message);
 
     void sendListPeers();
     void sendUpdateNetworkId(const std::string& network_id);

@@ -53,6 +53,17 @@ enum class ReconnectMode {
     POWER_SAVER
 };
 
+// Connection failure reasons for intelligent retry strategy
+enum class ConnectionFailureReason {
+    TIMEOUT_CONNECT,        // Connection attempt timed out
+    TIMEOUT_HANDSHAKE,      // Handshake timed out
+    DECRYPT_FAIL,           // Decryption failure (wrong keys, restart)
+    NAT_TRAVERSAL_FAIL,     // NAT hole punching failed
+    NO_ROUTE,               // Network unreachable
+    NETWORK_DOWN,           // No network connectivity
+    UNKNOWN                 // Unknown/unspecified failure
+};
+
 struct PeerConnectionStats {
     std::string peer_id;
     
@@ -136,6 +147,14 @@ public:
                               float packet_loss_rate = 0.0f);
     
     /**
+     * Connection failed with reason - schedule retry with intelligent strategy
+     */
+    void on_connection_failure(const std::string& peer_id,
+                              const std::string& attempted_method,
+                              ConnectionFailureReason reason,
+                              float packet_loss_rate = 0.0f);
+    
+    /**
      * Check if should attempt reconnection now
      * Call periodically from main loop
      */
@@ -185,6 +204,27 @@ public:
      * Reset statistics for a peer
      */
     void reset_peer_stats(const std::string& peer_id);
+
+    /**
+     * Reset cooldown/backoff for all tracked peers.
+     * Intended for network transitions (WiFi<->cellular) where NAT mappings and routes
+     * change abruptly and historical backoff can incorrectly suppress recovery.
+     */
+    void reset_all_peer_stats();
+
+    /**
+     * SELF-HEALING: Trigger immediate reconnect for all disconnected peers.
+     * This bypasses all backoff and circuit breaker cooldowns to force an
+     * immediate reconnection attempt. Use after network transitions where
+     * new routes/NAT mappings are available.
+     */
+    void trigger_immediate_reconnect_all();
+
+    /**
+     * SELF-HEALING: Trigger immediate reconnect for a specific peer.
+     * Bypasses backoff and circuit breaker for the given peer.
+     */
+    void trigger_immediate_reconnect(const std::string& peer_id);
     
     /**
      * Get current network condition

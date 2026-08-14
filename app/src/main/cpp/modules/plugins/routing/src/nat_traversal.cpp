@@ -212,6 +212,7 @@ bool NATTraversal::initialize(uint16_t local_port) {
 		punch_reschedule_latest_.clear();
 		punch_cancelled_peers_.clear();
 		punch_last_failure_ms_.clear();
+		punch_failure_count_.clear();  // Reset progressive backoff counters
 	}
 
 	ensureConfigurationLoaded();
@@ -228,18 +229,16 @@ bool NATTraversal::initialize(uint16_t local_port) {
 
 	heartbeat_payload_ = makeHeartbeatPayload();
 
-	// In single-thread mode, skip background threads (NAT detection is done synchronously)
-	// Use on-demand punch mode instead of permanent thread pool
+	// NAT detection remains synchronous in single-thread mode, but punch jobs must
+	// always have owned joinable workers. Detached workers can outlive shutdown and
+	// dereference the singleton while its transport callback is being removed.
 	if (!is_single_thread_mode()) {
 		startHeartbeatThread();
 		startMaintenanceThread();
-		// Use on-demand punch threads instead of permanent pool
-		on_demand_punch_mode_ = true;
-		nativeLog("NAT: Using on-demand punch threads (max " + std::to_string(MAX_ON_DEMAND_PUNCH_THREADS) + ")");
-	} else {
-		on_demand_punch_mode_ = true;  // Single-thread mode also uses on-demand
-		nativeLog("NAT: Single-thread mode - skipping background threads, on-demand punch enabled");
 	}
+	on_demand_punch_mode_ = false;
+	startPunchThreadPool();
+	nativeLog("NAT: Using owned joinable punch worker pool");
 
 	initialized_ = true;
 
@@ -278,18 +277,6 @@ void NATTraversal::shutdown() {
 	stopPunchThreadPool();
 	clearPunchQueue();
 	
-	// Wait for any on-demand punch threads to complete
-	if (on_demand_punch_mode_) {
-		int wait_count = 0;
-		while (active_on_demand_punches_.load() > 0 && wait_count < 50) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			wait_count++;
-		}
-		if (active_on_demand_punches_.load() > 0) {
-			nativeLog("NAT: Warning - " + std::to_string(active_on_demand_punches_.load()) + " on-demand punch threads still active at shutdown");
-		}
-	}
-
 	if (engine_thread_.joinable()) {
 		engine_thread_.join();
 	}
@@ -302,6 +289,11 @@ void NATTraversal::shutdown() {
 	{
 		std::lock_guard<std::mutex> lock(mapping_mutex_);
 		mappings_by_id_.clear();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(punch_observers_mutex_);
+		punch_observers_.clear();
 	}
 
 	if (auto* manager = connection_manager_.exchange(nullptr)) {
@@ -517,6 +509,45 @@ void NATTraversal::setUpnpController(std::shared_ptr<IUpnpController> controller
 	upnp_controller_ = std::move(controller);
 }
 
+int NATTraversal::addPunchResultObserver(PunchResultCallback cb) {
+	if (!cb) {
+		return -1;
+	}
+	const int id = next_punch_observer_id_.fetch_add(1);
+	{
+		std::lock_guard<std::mutex> lock(punch_observers_mutex_);
+		punch_observers_[id] = std::move(cb);
+	}
+	return id;
+}
+
+void NATTraversal::removePunchResultObserver(int observer_id) {
+	if (observer_id <= 0) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(punch_observers_mutex_);
+	punch_observers_.erase(observer_id);
+}
+
+void NATTraversal::notifyPunchResult_(const std::string& peer_id, bool success) {
+	std::vector<PunchResultCallback> callbacks;
+	{
+		std::lock_guard<std::mutex> lock(punch_observers_mutex_);
+		callbacks.reserve(punch_observers_.size());
+		for (const auto& kv : punch_observers_) {
+			callbacks.push_back(kv.second);
+		}
+	}
+
+	for (auto& cb : callbacks) {
+		try {
+			cb(peer_id, success);
+		} catch (...) {
+			// Observers must not be able to crash NATTraversal worker threads.
+		}
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Peer management
 // -----------------------------------------------------------------------------
@@ -581,6 +612,16 @@ void NATTraversal::cancelHolePunching(const std::string& peer_id) {
 	pending_cv_.notify_all();
 }
 
+void NATTraversal::resetHolePunchFailures() {
+	std::lock_guard<std::mutex> lock(punch_mutex_);
+	size_t cleared = punch_failure_count_.size() + punch_last_failure_ms_.size();
+	punch_failure_count_.clear();
+	punch_last_failure_ms_.clear();
+	// Also clear cancelled set so peers can retry after network change
+	punch_cancelled_peers_.clear();
+	nativeLog("NAT: Reset hole punch failures (" + std::to_string(cleared) + " entries cleared) for fresh attempts after network change");
+}
+
 void NATTraversal::unregisterPeer(const std::string& peer_id) {
 	if (peer_id.empty()) {
 		return;
@@ -631,7 +672,9 @@ bool NATTraversal::performHolePunching(const std::string& peer_id) {
 		nativeLog("NAT: performHolePunching - peer not found: " + peer_id);
 		return false;
 	}
-	enqueuePunchTask(it->second);
+	// Explicit request: do not silently drop it while local NAT detection is
+	// still pending (Unknown NAT + no external IP). The peer endpoint is known.
+	enqueuePunchTask(it->second, true);
 	return true;
 }
 
@@ -642,11 +685,11 @@ bool NATTraversal::performNetworkHolePunching(const std::string& peer_id, const 
 		nativeLog("NAT: performNetworkHolePunching - peer/network mismatch for " + peer_id);
 		return false;
 	}
-	enqueuePunchTask(it->second);
+	enqueuePunchTask(it->second, true);
 	return true;
 }
 
-void NATTraversal::enqueuePunchTask(const PeerAddress& peer) {
+void NATTraversal::enqueuePunchTask(const PeerAddress& peer, bool explicit_request) {
 	Options options_snapshot;
 	{
 		std::lock_guard<std::mutex> lock(options_mutex_);
@@ -668,6 +711,27 @@ void NATTraversal::enqueuePunchTask(const PeerAddress& peer) {
 		return;
 	}
 
+	// ENGINE FIX: Check NAT type before attempting hole punch
+	// Symmetric NAT and Unknown NAT types have <5% success rate - skip hole punch
+	{
+		std::lock_guard<std::mutex> lock(nat_info_mutex_);
+		if (nat_info_.nat_type == NATType::Symmetric) {
+			nativeLog("NAT: Skipping hole punch for " + peer.peer_id + 
+			          " - Symmetric NAT detected (0% success rate). Use relay instead.");
+			// Immediately notify failure so caller can fallback to relay
+			notifyPunchResult_(peer.peer_id, false);
+			return;
+		}
+		// Only auto-scheduled punches wait for NAT detection; explicit requests proceed.
+		if (!explicit_request && nat_info_.nat_type == NATType::Unknown && nat_info_.external_ip.empty()) {
+			nativeLog("NAT: Skipping hole punch for " + peer.peer_id + 
+			          " - NAT type Unknown and no external IP. Network may be transitioning.");
+			notifyPunchResult_(peer.peer_id, false);
+			return;
+		}
+	}
+
+	bool queued_for_on_demand_dispatch = false;
 	{
 		std::lock_guard<std::mutex> lock(punch_mutex_);
 		if (punch_shutdown_) {
@@ -680,14 +744,26 @@ void NATTraversal::enqueuePunchTask(const PeerAddress& peer) {
 			return;
 		}
 
-		const int cooldown_ms = std::max(0, options_snapshot.hole_punch_failure_cooldown_ms);
-		if (cooldown_ms > 0) {
+		// ENGINE FIX: Progressive cooldown for repeated failures
+		// Each failure increases cooldown by 2x, up to 60 seconds
+		const int base_cooldown_ms = std::max(0, options_snapshot.hole_punch_failure_cooldown_ms);
+		if (base_cooldown_ms > 0) {
 			const int64_t now_ms = systemNowMs();
 			auto fail_it = punch_last_failure_ms_.find(peer.peer_id);
+			auto count_it = punch_failure_count_.find(peer.peer_id);
+			int failure_count = (count_it != punch_failure_count_.end()) ? count_it->second : 0;
+			
+			// Progressive cooldown: base * 2^min(failures, 5) = max 32x base cooldown
+			int effective_cooldown_ms = base_cooldown_ms * (1 << std::min(failure_count, 5));
+			effective_cooldown_ms = std::min(effective_cooldown_ms, 60000); // Cap at 60s
+			
 			if (fail_it != punch_last_failure_ms_.end()) {
 				const int64_t delta = now_ms - fail_it->second;
-				if (delta >= 0 && delta < cooldown_ms) {
-					nativeLog("NAT: Punch cooldown active for peer " + peer.peer_id + " (" + std::to_string(delta) + "ms since failure); skipping");
+				if (delta >= 0 && delta < effective_cooldown_ms) {
+					nativeLog("NAT: Punch cooldown active for peer " + peer.peer_id + 
+					          " (" + std::to_string(delta) + "ms / " + 
+					          std::to_string(effective_cooldown_ms) + "ms, failures=" + 
+					          std::to_string(failure_count) + "); skipping");
 					return;
 				}
 			}
@@ -699,71 +775,55 @@ void NATTraversal::enqueuePunchTask(const PeerAddress& peer) {
 			return;
 		}
 		
-		// On-demand mode: spawn a temporary thread for this punch
+		// On-demand mode: queue tasks and dispatch opportunistically (no permanent thread pool).
 		if (on_demand_punch_mode_) {
-			// Check if we're at max concurrent punches
-			if (active_on_demand_punches_.load() >= MAX_ON_DEMAND_PUNCH_THREADS) {
-				nativeLog("NAT: Max on-demand punch threads reached; dropping task for " + peer.peer_id);
+			// Coalesce repeated enqueue requests for the same peer.
+			if (punch_queued_peers_.find(peer.peer_id) != punch_queued_peers_.end()) {
+				punch_reschedule_latest_[peer.peer_id] = peer;
+				nativeLog("NAT: Punch already queued for peer " + peer.peer_id + "; coalescing endpoint update");
 				return;
 			}
-			
-			punch_inflight_peers_.insert(peer.peer_id);
-			active_on_demand_punches_++;
-			
-			// Spawn detached thread that will self-terminate after punch completes
-			std::thread([this, peer]() {
-				try {
-					nativeLog("NAT: On-demand punch thread started for " + peer.peer_id);
-					
-					(void)performHolePunchingInternal(peer);
-				} catch (const std::exception& e) {
-					nativeLog(std::string("NAT: On-demand punch thread exception for ") + peer.peer_id + ": " + e.what());
-				} catch (...) {
-					nativeLog("NAT: On-demand punch thread unknown exception for " + peer.peer_id);
-				}
-				
-				// Handle reschedule if needed
-				PeerAddress reschedule_peer;
-				bool should_reschedule = false;
-				{
-					std::lock_guard<std::mutex> lock(punch_mutex_);
-					punch_inflight_peers_.erase(peer.peer_id);
-					auto it = punch_reschedule_latest_.find(peer.peer_id);
-					if (it != punch_reschedule_latest_.end()) {
-						reschedule_peer = it->second;
-						punch_reschedule_latest_.erase(it);
-						should_reschedule = !punch_shutdown_ && !shutdown_requested_.load();
-					}
-				}
-				
-				active_on_demand_punches_--;
-				nativeLog("NAT: On-demand punch thread finished for " + peer.peer_id);
-				
-				if (should_reschedule) {
-					enqueuePunchTask(reschedule_peer);
-				}
-			}).detach();
-			
-			nativeLog("NAT: Spawned on-demand punch thread for peer " + peer.peer_id);
-			return;
+
+			if (static_cast<int>(punch_queue_.size()) >= options_snapshot.punch_queue_limit) {
+				nativeLog("NAT: Punch queue saturated (on-demand); dropping task for " + peer.peer_id);
+				return;
+			}
+
+			punch_queue_.push(peer);
+			punch_queued_peers_.insert(peer.peer_id);
+			queued_for_on_demand_dispatch = true;
 		}
 		
 		// Legacy thread pool mode
-		if (punch_queued_peers_.find(peer.peer_id) != punch_queued_peers_.end()) {
-			punch_reschedule_latest_[peer.peer_id] = peer;
-			nativeLog("NAT: Punch already queued for peer " + peer.peer_id + "; coalescing endpoint update");
-			return;
+		if (!on_demand_punch_mode_) {
+			if (punch_queued_peers_.find(peer.peer_id) != punch_queued_peers_.end()) {
+				punch_reschedule_latest_[peer.peer_id] = peer;
+				nativeLog("NAT: Punch already queued for peer " + peer.peer_id + "; coalescing endpoint update");
+				return;
+			}
+			if (static_cast<int>(punch_queue_.size()) >= options_snapshot.punch_queue_limit) {
+				nativeLog("NAT: Punch queue saturated; dropping task for " + peer.peer_id);
+				return;
+			}
+			punch_queue_.push(peer);
+			punch_queued_peers_.insert(peer.peer_id);
 		}
-		if (static_cast<int>(punch_queue_.size()) >= options_snapshot.punch_queue_limit) {
-			nativeLog("NAT: Punch queue saturated; dropping task for " + peer.peer_id);
-			return;
-		}
-		punch_queue_.push(peer);
-		punch_queued_peers_.insert(peer.peer_id);
+	}
+
+	if (queued_for_on_demand_dispatch) {
+		nativeLog("NAT: Queued hole punch task for peer " + peer.peer_id + " (on-demand)");
+		// Dispatch outside the lock so worker threads can take punch_mutex_ freely.
+		dispatchOnDemandPunches_();
+		return;
 	}
 
 	punch_cv_.notify_one();
 	nativeLog("NAT: Scheduled hole punch task for peer " + peer.peer_id);
+}
+
+void NATTraversal::dispatchOnDemandPunches_() {
+	// On-demand dispatch intentionally has no implementation.  NATTraversal now
+	// uses a bounded, owned thread pool exclusively; see startPunchThreadPool().
 }
 
 void NATTraversal::punchWorkerLoop() {
@@ -895,6 +955,7 @@ bool NATTraversal::performHolePunchingInternal(const PeerAddress& peer) {
 		if (success) {
 			nativeLog("NAT: Hole punching succeeded for peer " + peer.peer_id);
 			markPeerPunchSuccess(peer.peer_id);
+			notifyPunchResult_(peer.peer_id, true);
 			// Track successful hole punch
 			{
 				std::lock_guard<std::mutex> lock(metrics_mutex_);
@@ -912,9 +973,11 @@ bool NATTraversal::performHolePunchingInternal(const PeerAddress& peer) {
 	}
 
 	nativeLog("NAT: Hole punching exhausted retries for peer " + peer.peer_id);
+	notifyPunchResult_(peer.peer_id, false);
 	{
 		std::lock_guard<std::mutex> lock(punch_mutex_);
 		punch_last_failure_ms_[peer.peer_id] = systemNowMs();
+		punch_failure_count_[peer.peer_id]++;  // Track consecutive failures for progressive backoff
 	}
 	{
 		std::lock_guard<std::mutex> lock(metrics_mutex_);
@@ -929,6 +992,11 @@ void NATTraversal::markPeerPunchSuccess(const std::string& peer_id) {
 	if (it != peers_by_id_.end()) {
 		it->second.last_successful_punch_ms = systemNowMs();
 		it->second.verified = true;
+	}
+	// Reset failure count on success
+	{
+		std::lock_guard<std::mutex> plock(punch_mutex_);
+		punch_failure_count_.erase(peer_id);
 	}
 }
 

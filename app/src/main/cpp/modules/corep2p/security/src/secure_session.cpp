@@ -1,5 +1,6 @@
 #include "secure_session.h"
 #include "logger.h"
+#include "crypto_utils.h"
 #include <cstdio>
 
 namespace {
@@ -96,6 +97,19 @@ bool SecureSession::is_ready() const {
         }
     }
     return session && session->is_ready();
+}
+
+bool SecureSession::get_transport_keys(std::vector<uint8_t>& send_key_out,
+                                       std::vector<uint8_t>& recv_key_out) const {
+    auto session = m_noise_session;
+    if (!session && m_noise_manager) {
+        session = m_noise_manager->get_session(m_peer_id);
+        if (session) {
+            m_noise_session = session;
+        }
+    }
+    if (!session || !session->is_ready()) return false;
+    return session->get_transport_keys(send_key_out, recv_key_out);
 }
 
 std::string SecureSession::send_message(const std::string& plaintext) {
@@ -206,13 +220,13 @@ std::shared_ptr<SecureSession> SecureSessionManager::get_or_create_session(
     const std::string& peer_id,
     NoiseNKSession::Role role) {
 
-    nativeLog("SSM_DEBUG: get_or_create_session called for " + peer_id);
+    LOG_DEBUG("SSM_DEBUG: get_or_create_session called for " + peer_id);
     std::lock_guard<std::mutex> lock(m_mutex);
-    nativeLog("SSM_DEBUG: Acquired lock");
+    LOG_DEBUG("SSM_DEBUG: Acquired lock");
 
     auto existing = m_sessions.find(peer_id);
     if (existing != m_sessions.end()) {
-        nativeLog("SSM_DEBUG: Found existing session");
+        LOG_DEBUG("SSM_DEBUG: Found existing session");
         return existing->second;
     }
 
@@ -243,16 +257,17 @@ std::shared_ptr<SecureSession> SecureSessionManager::get_or_create_session(
     }
     m_noise_manager->register_peer_key(peer_id, peer_key);
 
-    nativeLog("SSM_DEBUG: Creating new SecureSession");
+    LOG_DEBUG("SSM_DEBUG: Creating new SecureSession");
     auto session = std::make_shared<SecureSession>(peer_id, role, m_noise_manager, m_key_store);
-    nativeLog("SSM_DEBUG: Emplacing session");
+    LOG_DEBUG("SSM_DEBUG: Emplacing session");
     m_sessions.emplace(peer_id, session);
-    nativeLog("SSM_DEBUG: Session created and emplaced");
+    LOG_DEBUG("SSM_DEBUG: Session created and emplaced");
 
     return session;
 }
 
 void SecureSessionManager::remove_session(const std::string& peer_id) {
+    clear_peer_transport_keys(peer_id);
     std::lock_guard<std::mutex> lock(m_mutex);
     m_sessions.erase(peer_id);
     if (m_noise_manager) {

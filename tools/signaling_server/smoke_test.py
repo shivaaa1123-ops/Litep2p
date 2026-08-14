@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+import json
 import os
 import sys
 import time
@@ -80,12 +81,32 @@ async def main() -> None:
             assert peer_b in msg
             assert updated_network_id in msg
 
+            # Validate clearing network_id via UPDATE with JSON null.
+            # This is used by clients to avoid advertising stale endpoints after network changes.
+            await b.send('{"type":"UPDATE","network_id":null}')
+            msg = await _recv_until(
+                a,
+                predicate=lambda m: (('"type": "PEER_UPDATED"' in m or '"type":"PEER_UPDATED"' in m) and peer_b in m),
+                timeout=3,
+            )
+            payload = json.loads(msg)
+            assert payload.get("type") == "PEER_UPDATED"
+            peer_obj = payload.get("peer") or {}
+            assert peer_obj.get("peer_id") == peer_b
+            assert "network_id" not in peer_obj
+
             # Validate peer listing. Server can also send PEER_JOINED to existing peers,
             # so we wait specifically for PEER_LIST.
             await a.send('{"type":"LIST_PEERS"}')
             msg = await _recv_until(a, predicate=lambda m: '"type": "PEER_LIST"' in m or '"type":"PEER_LIST"' in m)
             assert peer_b in msg
-            assert updated_network_id in msg
+            # peer_b network_id was cleared above; it should not be present in the listing.
+            payload = json.loads(msg)
+            assert payload.get("type") == "PEER_LIST"
+            peers = payload.get("peers") or []
+            b_entry = next((p for p in peers if p.get("peer_id") == peer_b), None)
+            assert b_entry is not None
+            assert "network_id" not in b_entry
 
             await b.send('{"type":"LIST_PEERS"}')
             msg = await _recv_until(b, predicate=lambda m: '"type": "PEER_LIST"' in m or '"type":"PEER_LIST"' in m)

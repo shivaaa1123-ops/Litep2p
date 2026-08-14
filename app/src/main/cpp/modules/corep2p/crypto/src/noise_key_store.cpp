@@ -8,6 +8,8 @@
 #include <fstream>
 #include <filesystem>
 #include <nlohmann/json.hpp>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using json = nlohmann::json;
 
@@ -199,6 +201,12 @@ bool NoiseKeyStore::save() {
             // Windows-friendly fallback. (Also covers some Android/filesystem quirks.)
             std::filesystem::copy_file(tmp_path, path, std::filesystem::copy_options::overwrite_existing, ec);
             std::filesystem::remove(tmp_path, ec);
+        }
+
+        // Restrict the keystore to owner-only access (best-effort; not
+        // supported on every filesystem/platform).
+        if (::chmod(path.c_str(), S_IRUSR | S_IWUSR) != 0) {
+            nativeLog("WARN: KeyStore: chmod 0600 failed for " + path);
         }
     } catch (const std::exception& e) {
         nativeLog(std::string("ERROR: KeyStore: Exception while saving keystore: ") + e.what());

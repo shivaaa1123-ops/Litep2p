@@ -1,9 +1,11 @@
 package com.zeengal.litep2p
 
+import android.content.Intent
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -20,7 +22,11 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 import android.widget.ArrayAdapter
 import com.zeengal.litep2p.ui.home.HomeFragment
-import com.zeengal.litep2p.ui.logs.LogsFragment
+import com.zeengal.litep2p.ui.dashboard.DashboardFragment
+import com.zeengal.litep2p.hook.P2P
+import java.io.File
+import java.io.IOException
+import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
 
@@ -45,23 +51,38 @@ class MainActivity : AppCompatActivity() {
     private var stopTimeoutHandler: Handler? = null
     private var stopTimeoutRunnable: Runnable? = null
 
+    private var autoStartConsumed = false
+
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var lastPushedNetworkAvailable: Boolean? = null
     private var lastPushedIsWifi: Boolean? = null
+    private var lastPushedNetworkKey: String? = null
+
+    private var multicastLock: WifiManager.MulticastLock? = null
+
+    private data class NetworkState(
+        val available: Boolean,
+        val isWifi: Boolean,
+        val key: String?
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // Ensure Android has a real config.json to load (matches desktop behavior).
+        // We only install it once; after that it can be replaced via adb (or future UI tooling).
+        ensureDefaultConfigInstalled()
         
         // Store instance for JNI callbacks
         Companion.instance = this
 
         supportFragmentManager.beginTransaction()
             .replace(R.id.home_fragment_container, HomeFragment())
-            .replace(R.id.logs_fragment_container, LogsFragment())
+            .replace(R.id.logs_fragment_container, DashboardFragment())
             .commit()
 
         statusText = findViewById(R.id.statusText)
@@ -122,6 +143,156 @@ class MainActivity : AppCompatActivity() {
         updateIpAddress()
 
         startNetworkMonitoring()
+
+        // Optional: allow adb-driven automation to start the engine without manual UI interaction.
+        // Example:
+        //   adb shell am start -n com.zeengal.litep2p/.MainActivity --ez LITEP2P_AUTOSTART true
+        applyLaunchOptions(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        applyLaunchOptions(intent)
+    }
+
+    private fun applyLaunchOptions(intent: Intent?) {
+        if (intent == null) return
+
+        try {
+            val peerId = intent.getStringExtra(EXTRA_PEER_ID)
+            if (!peerId.isNullOrBlank()) {
+                PeerIdManager.setPeerId(this, peerId)
+                android.util.Log.i("MainActivity", "Applied EXTRA_PEER_ID=$peerId")
+            }
+
+            val commsMode = intent.getStringExtra(EXTRA_COMMS_MODE)
+            if (!commsMode.isNullOrBlank()) {
+                setSpinnerSelectionByText(commsModeSpinner, commsMode)
+                android.util.Log.i("MainActivity", "Applied EXTRA_COMMS_MODE=$commsMode")
+            }
+
+            if (intent.hasExtra(EXTRA_PROXY_GATEWAY)) {
+                proxyGatewayCheck.isChecked = intent.getBooleanExtra(EXTRA_PROXY_GATEWAY, false)
+            }
+            if (intent.hasExtra(EXTRA_PROXY_CLIENT)) {
+                proxyClientCheck.isChecked = intent.getBooleanExtra(EXTRA_PROXY_CLIENT, false)
+            }
+
+            val autoStart = intent.getBooleanExtra(EXTRA_AUTOSTART, false)
+            if (autoStart && !autoStartConsumed) {
+                autoStartConsumed = true
+                android.util.Log.i("MainActivity", "EXTRA_AUTOSTART=true; scheduling startEngine()")
+                handler.postDelayed({
+                    startEngine()
+                }, 500)
+            }
+
+            // Handle message sending via intent (for automated testing)
+            val sendToPeer = intent.getStringExtra(EXTRA_SEND_TO_PEER)
+            val sendMessage = intent.getStringExtra(EXTRA_SEND_MESSAGE)
+            if (!sendToPeer.isNullOrBlank() && !sendMessage.isNullOrBlank()) {
+                android.util.Log.i("MainActivity", "EXTRA_SEND_MESSAGE: sending '${sendMessage}' to peer '${sendToPeer}'")
+                // Use handler.post to ensure engine is ready (small delay)
+                handler.postDelayed({
+                    try {
+                        P2P.sendMessageTracked(sendToPeer, sendMessage.toByteArray(Charsets.UTF_8))
+                        android.util.Log.i("MainActivity", "Message sent successfully to peer: $sendToPeer")
+                    } catch (e: Exception) {
+                        android.util.Log.e("MainActivity", "Failed to send message to peer $sendToPeer: ${e.message}", e)
+                    }
+                }, 100)
+                // Clear the extras to avoid re-sending on activity recreation
+                intent.removeExtra(EXTRA_SEND_MESSAGE)
+                intent.removeExtra(EXTRA_SEND_TO_PEER)
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "Failed to apply launch options: ${t.message}")
+        }
+    }
+
+    private fun setSpinnerSelectionByText(spinner: Spinner, value: String) {
+        val adapter = spinner.adapter ?: return
+        val target = value.trim()
+        for (i in 0 until adapter.count) {
+            val item = adapter.getItem(i)?.toString() ?: continue
+            if (item.equals(target, ignoreCase = true)) {
+                spinner.setSelection(i)
+                return
+            }
+        }
+    }
+
+    private fun ensureDefaultConfigInstalled() {
+        val target = File(filesDir, "config.json")
+        if (target.exists() && target.isFile && target.length() > 0) {
+            android.util.Log.d("MainActivity", "Config already present at ${target.absolutePath}")
+            // Still patch missing telemetry keys so UI can show updates quickly.
+            patchTelemetryDefaultsIfMissing(target)
+            return
+        }
+
+        try {
+            assets.open("config.json").use { input ->
+                target.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            android.util.Log.i("MainActivity", "Installed default config.json to ${target.absolutePath}")
+            patchTelemetryDefaultsIfMissing(target)
+        } catch (ioe: IOException) {
+            android.util.Log.w("MainActivity", "Failed to install default config.json: ${ioe.message}")
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "Failed to install default config.json: ${t.message}")
+        }
+    }
+
+    private fun patchTelemetryDefaultsIfMissing(configFile: File) {
+        try {
+            val raw = configFile.readText()
+            val root = JSONObject(raw)
+
+            val monitoring = if (root.has("monitoring")) {
+                root.optJSONObject("monitoring") ?: JSONObject().also { root.put("monitoring", it) }
+            } else {
+                JSONObject().also { root.put("monitoring", it) }
+            }
+
+            val telemetry = if (monitoring.has("telemetry")) {
+                monitoring.optJSONObject("telemetry") ?: JSONObject().also { monitoring.put("telemetry", it) }
+            } else {
+                JSONObject().also { monitoring.put("telemetry", it) }
+            }
+
+            var changed = false
+
+            if (!telemetry.has("enabled")) {
+                telemetry.put("enabled", true)
+                changed = true
+            }
+
+            // Android policy: telemetry must not be emitted as log lines.
+            // (We render telemetry only in the Telemetry tab via a dedicated UI channel.)
+            if (!telemetry.has("log_json") || telemetry.optBoolean("log_json", false)) {
+                telemetry.put("log_json", false)
+                changed = true
+            }
+            if (!telemetry.has("include_peer_ids")) {
+                telemetry.put("include_peer_ids", true)
+                changed = true
+            }
+            if (!telemetry.has("flush_interval_ms")) {
+                telemetry.put("flush_interval_ms", 2000)
+                changed = true
+            }
+
+            if (changed) {
+                configFile.writeText(root.toString(2))
+                android.util.Log.i("MainActivity", "Patched telemetry defaults into config.json")
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "Failed to patch telemetry defaults: ${t.message}")
+        }
     }
 
     override fun onDestroy() {
@@ -131,6 +302,35 @@ class MainActivity : AppCompatActivity() {
         stopEngine()
         // Clear instance reference
         Companion.instance = null
+    }
+
+    private fun updateWifiMulticastLock(enable: Boolean) {
+        try {
+            if (enable) {
+                if (multicastLock?.isHeld == true) {
+                    return
+                }
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                if (wm == null) {
+                    return
+                }
+                val lock = multicastLock ?: wm.createMulticastLock("litep2p-multicast").apply {
+                    // We manage hold state explicitly.
+                    setReferenceCounted(false)
+                }.also { multicastLock = it }
+
+                lock.acquire()
+                android.util.Log.i("LiteP2P_Network", "MulticastLock acquired")
+            } else {
+                val lock = multicastLock
+                if (lock != null && lock.isHeld) {
+                    lock.release()
+                    android.util.Log.i("LiteP2P_Network", "MulticastLock released")
+                }
+            }
+        } catch (t: Throwable) {
+            android.util.Log.w("LiteP2P_Network", "Failed to update MulticastLock: ${t.message}")
+        }
     }
 
     private fun startNetworkMonitoring() {
@@ -147,20 +347,40 @@ class MainActivity : AppCompatActivity() {
         }
 
         fun pushCurrentState() {
-            val (available, isWifi) = queryNetworkState(cm)
-            pushNetworkStateToNative(available, isWifi)
+            val state = queryNetworkState(cm)
+            pushNetworkStateToNative(state.available, state.isWifi, state.key)
+        }
+
+        fun logNetworkCallback(event: String, extra: String = "") {
+            // This is intentionally a regular log line (not telemetry) so our adb logcat harness can
+            // correlate MARK wifi_disable/wifi_enable with when Android reports a network change.
+            val state = queryNetworkState(cm)
+            val suffix = if (extra.isNotBlank()) " $extra" else ""
+            android.util.Log.i(
+                "LiteP2P_Network",
+                "NetworkCallbacks: $event available=${state.available} wifi=${state.isWifi} net=${state.key}$suffix"
+            )
         }
 
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                logNetworkCallback("onAvailable")
                 pushCurrentState()
             }
 
             override fun onLost(network: Network) {
+                logNetworkCallback("onLost")
                 pushCurrentState()
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                val hasInternet = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                val validated = networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                val isWifiTransport = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                logNetworkCallback(
+                    "onCapabilitiesChanged",
+                    "internet=$hasInternet validated=$validated wifiTransport=$isWifiTransport"
+                )
                 pushCurrentState()
             }
         }
@@ -186,53 +406,99 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Throwable) {
             }
         }
+
+        // Best-effort: release in case the activity is destroyed while Wi‑Fi is active.
+        updateWifiMulticastLock(false)
+        multicastLock = null
+
         networkCallback = null
         connectivityManager = null
         lastPushedNetworkAvailable = null
         lastPushedIsWifi = null
+        lastPushedNetworkKey = null
     }
 
-    private fun queryNetworkState(cm: ConnectivityManager): Pair<Boolean, Boolean> {
-        val network = try {
+    private fun queryNetworkState(cm: ConnectivityManager): NetworkState {
+        // Important: the *default* network can remain cellular even while Wi‑Fi is up.
+        // For LAN discovery + private-endpoint gating we care about whether *any* Wi‑Fi
+        // network is connected, not whether Wi‑Fi is the default route.
+
+        val defaultNetwork = try {
             cm.activeNetwork
         } catch (se: SecurityException) {
             android.util.Log.w(
                 "MainActivity",
                 "ACCESS_NETWORK_STATE missing/blocked; disabling network awareness: ${se.message}"
             )
-            return false to false
+            return NetworkState(false, false, null)
         }
 
-        if (network == null) {
-            return false to false
-        }
-
-        val caps = try {
-            cm.getNetworkCapabilities(network)
+        val networks = try {
+            cm.allNetworks
         } catch (se: SecurityException) {
             android.util.Log.w(
                 "MainActivity",
                 "ACCESS_NETWORK_STATE missing/blocked; disabling network awareness: ${se.message}"
             )
-            return false to false
-        } ?: return false to false
+            return NetworkState(false, false, defaultNetwork?.toString())
+        } catch (t: Throwable) {
+            return NetworkState(false, false, defaultNetwork?.toString())
+        }
 
-        // Consider the network "available" as soon as the device reports INTERNET capability.
-        // VALIDATED can lag after toggling data/Wi‑Fi, and we want the native engine to start
-        // recovery (signaling reconnect, endpoint refresh) immediately.
-        val available = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        var wifiNetwork: Network? = null
+        var anyInternet = false
 
-        val isWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-        return available to isWifi
+        for (n in networks) {
+            val caps = try {
+                cm.getNetworkCapabilities(n)
+            } catch (se: SecurityException) {
+                null
+            } catch (_: Throwable) {
+                null
+            } ?: continue
+
+            if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                anyInternet = true
+            }
+
+            // Treat Wi‑Fi as present as soon as the OS exposes a Wi‑Fi transport.
+            // This is intentionally looser than VALIDATED/INTERNET because LAN-only Wi‑Fi
+            // still needs discovery/messaging.
+            if (wifiNetwork == null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                wifiNetwork = n
+            }
+        }
+
+        val isWifi = wifiNetwork != null
+        val available = anyInternet
+
+        // Use a stable-ish identifier for dedupe and logging. Prefer Wi‑Fi identity when present
+        // so wifi->wifi changes still trigger recovery.
+        val networkKey = try {
+            (wifiNetwork ?: defaultNetwork)?.toString()
+        } catch (_: Throwable) {
+            null
+        }
+
+        return NetworkState(available, isWifi, networkKey)
     }
 
-    private fun pushNetworkStateToNative(isAvailable: Boolean, isWifi: Boolean) {
+    private fun pushNetworkStateToNative(isAvailable: Boolean, isWifi: Boolean, networkKey: String?) {
+        // Android Wi‑Fi stacks often filter UDP broadcast/multicast by default to save power.
+        // LAN discovery relies on these packets, so keep a MulticastLock while on Wi‑Fi.
+        updateWifiMulticastLock(isWifi && networkKey != null)
+
         // Avoid spamming native with identical updates.
-        if (lastPushedNetworkAvailable == isAvailable && lastPushedIsWifi == isWifi) {
+        // Include active-network identity so SSID changes (wifi→wifi) still trigger recovery.
+        if (lastPushedNetworkAvailable == isAvailable &&
+            lastPushedIsWifi == isWifi &&
+            lastPushedNetworkKey == networkKey
+        ) {
             return
         }
         lastPushedNetworkAvailable = isAvailable
         lastPushedIsWifi = isWifi
+        lastPushedNetworkKey = networkKey
 
         try {
             com.zeengal.litep2p.hook.P2P.setSystemNetworkInfo(isWifi, isAvailable)
@@ -371,6 +637,18 @@ class MainActivity : AppCompatActivity() {
     companion object {
         @Volatile
         internal var instance: MainActivity? = null
+
+        // adb-intent extras for automation / harnesses.
+        private const val EXTRA_AUTOSTART = "LITEP2P_AUTOSTART"
+        private const val EXTRA_COMMS_MODE = "LITEP2P_COMMS_MODE"
+        private const val EXTRA_PEER_ID = "LITEP2P_PEER_ID"
+        private const val EXTRA_PROXY_GATEWAY = "LITEP2P_PROXY_GATEWAY"
+        private const val EXTRA_PROXY_CLIENT = "LITEP2P_PROXY_CLIENT"
+        // Message sending via adb for automated testing:
+        //   adb shell am start -n com.zeengal.litep2p/.MainActivity \
+        //     --es LITEP2P_SEND_TO_PEER "desktop-1" --es LITEP2P_SEND_MESSAGE "Hello!"
+        private const val EXTRA_SEND_MESSAGE = "LITEP2P_SEND_MESSAGE"
+        private const val EXTRA_SEND_TO_PEER = "LITEP2P_SEND_TO_PEER"
         
         @JvmStatic
         fun onEngineStartComplete() {

@@ -40,6 +40,10 @@ public:
 
     void setStunPacketCallback(OnStunPacketCallback callback) override;
     
+    // Restart the UDP socket - used after network interface changes (WiFi<->LTE)
+    // This closes and reopens the socket to ensure it binds to the new interface
+    bool restartSocket() override;
+    
     // Single-threaded mode: get the socket file descriptor for polling
     int getSocketFd() const;
     

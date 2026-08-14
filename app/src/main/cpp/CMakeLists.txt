@@ -103,7 +103,9 @@ include_directories(
 )
 
 # CoreP2P library
-file(GLOB_RECURSE COREP2P_SOURCES
+# NOTE: CONFIGURE_DEPENDS makes CMake re-glob at build time. Without it, adding or
+# deleting a source file leaves a stale Ninja graph that still compiles removed files.
+file(GLOB_RECURSE COREP2P_SOURCES CONFIGURE_DEPENDS
     "modules/corep2p/core/src/*.cpp"
     "modules/corep2p/crypto/src/*.cpp"
     "modules/corep2p/crypto/src/*.c"
@@ -121,7 +123,7 @@ add_library(litep2p_corep2p STATIC ${COREP2P_SOURCES})
 target_link_libraries(litep2p_corep2p PUBLIC)
 
 # Add missing static libraries for modules
-file(GLOB_RECURSE CRYPTO_SOURCES "modules/corep2p/crypto/src/*.cpp" "modules/corep2p/crypto/src/*.c")
+file(GLOB_RECURSE CRYPTO_SOURCES CONFIGURE_DEPENDS "modules/corep2p/crypto/src/*.cpp" "modules/corep2p/crypto/src/*.c")
 if(NOT LITEP2P_ENABLE_NOISE_PROTOCOL)
     list(FILTER CRYPTO_SOURCES EXCLUDE REGEX ".*/noise_.*\\.(c|cpp)$")
 endif()
@@ -129,27 +131,27 @@ add_library(litep2p_crypto STATIC ${CRYPTO_SOURCES})
 target_link_libraries(litep2p_crypto PUBLIC)
 
 # Add missing static libraries for modules
-file(GLOB_RECURSE SECURITY_SOURCES "modules/corep2p/security/src/*.cpp")
+file(GLOB_RECURSE SECURITY_SOURCES CONFIGURE_DEPENDS "modules/corep2p/security/src/*.cpp")
 add_library(litep2p_security STATIC ${SECURITY_SOURCES})
 target_link_libraries(litep2p_security PUBLIC)
 
-file(GLOB_RECURSE REACTOR_SOURCES "modules/corep2p/reactor/src/*.cpp")
+file(GLOB_RECURSE REACTOR_SOURCES CONFIGURE_DEPENDS "modules/corep2p/reactor/src/*.cpp")
 add_library(litep2p_reactor STATIC ${REACTOR_SOURCES})
 target_link_libraries(litep2p_reactor PUBLIC)
 
-file(GLOB_RECURSE TRANSPORT_SOURCES "modules/corep2p/transport/src/*.cpp")
+file(GLOB_RECURSE TRANSPORT_SOURCES CONFIGURE_DEPENDS "modules/corep2p/transport/src/*.cpp")
 add_library(litep2p_transport STATIC ${TRANSPORT_SOURCES})
 target_link_libraries(litep2p_transport PUBLIC)
 
 # Plugin libraries
 if(LITEP2P_ENABLE_DISCOVERY)
-    file(GLOB_RECURSE DISCOVERY_SOURCES "modules/plugins/discovery/src/*.cpp")
+    file(GLOB_RECURSE DISCOVERY_SOURCES CONFIGURE_DEPENDS "modules/plugins/discovery/src/*.cpp")
     add_library(litep2p_discovery STATIC ${DISCOVERY_SOURCES})
     target_link_libraries(litep2p_discovery litep2p_corep2p)
 endif()
 
 if(LITEP2P_ENABLE_ROUTING)
-    file(GLOB_RECURSE ROUTING_SOURCES "modules/plugins/routing/src/*.cpp")
+    file(GLOB_RECURSE ROUTING_SOURCES CONFIGURE_DEPENDS "modules/plugins/routing/src/*.cpp")
     add_library(litep2p_routing STATIC ${ROUTING_SOURCES})
     target_link_libraries(litep2p_routing litep2p_corep2p)
 endif()
@@ -171,12 +173,13 @@ set(SESSION_SOURCES
     "modules/plugins/session/src/maintenance_manager.cpp"
     "modules/plugins/session/src/local_peer_db.cpp"
     "modules/plugins/session/src/sqlite3_dyn.cpp"
+    "modules/plugins/session/src/rugged_recovery_manager.cpp"
 )
 add_library(litep2p_session STATIC ${SESSION_SOURCES})
 target_link_libraries(litep2p_session litep2p_corep2p)
 
 if(ENABLE_PROXY_MODULE)
-    file(GLOB_RECURSE PROXY_SOURCES "modules/plugins/proxy/src/*.cpp")
+    file(GLOB_RECURSE PROXY_SOURCES CONFIGURE_DEPENDS "modules/plugins/proxy/src/*.cpp")
     add_library(litep2p_proxy STATIC ${PROXY_SOURCES})
     target_link_libraries(litep2p_proxy litep2p_corep2p)
     target_include_directories(litep2p_proxy PUBLIC
@@ -195,13 +198,13 @@ if(LITEP2P_ENABLE_ROUTING)
 endif()
 
 if(LITEP2P_ENABLE_OPTIMIZATION)
-    file(GLOB_RECURSE OPTIMIZATION_SOURCES "modules/plugins/optimization/src/*.cpp")
+    file(GLOB_RECURSE OPTIMIZATION_SOURCES CONFIGURE_DEPENDS "modules/plugins/optimization/src/*.cpp")
     add_library(litep2p_optimization STATIC ${OPTIMIZATION_SOURCES})
     target_link_libraries(litep2p_optimization litep2p_corep2p)
 endif()
 
 if(LITEP2P_ENABLE_FILE_TRANSFER)
-    file(GLOB_RECURSE FILE_TRANSFER_SOURCES "modules/plugins/file_transfer/src/*.cpp")
+    file(GLOB_RECURSE FILE_TRANSFER_SOURCES CONFIGURE_DEPENDS "modules/plugins/file_transfer/src/*.cpp")
     add_library(litep2p_file_transfer STATIC ${FILE_TRANSFER_SOURCES})
     target_link_libraries(litep2p_file_transfer litep2p_corep2p)
 endif()

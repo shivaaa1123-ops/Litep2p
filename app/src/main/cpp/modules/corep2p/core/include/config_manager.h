@@ -36,6 +36,9 @@ public:
     bool isNoiseNKMandatory() const;
     std::string getKeyStorePath() const;
     int getKeyRotationInterval() const;
+    // Optional shared transport key (64 hex chars). When set, all peers use it
+    // for transport-layer encryption instead of their device-local key.
+    std::string getTransportKeyHex() const;
     
     // Batch Connection Manager
     bool isBatchManagerEnabled() const;

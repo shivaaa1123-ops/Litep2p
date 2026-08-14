@@ -13,8 +13,7 @@
     <FrameLayout
         android:id="@+id/home_fragment_container"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1" />
+        android:layout_height="@dimen/peers_panel_height" />
 
     <!-- Container for the LogsFragment -->
     <FrameLayout
