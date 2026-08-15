@@ -1,7 +1,7 @@
 # LiteP2P Public API Specification
 
-**Version:** 0.3.0-draft
-**Status:** Proposal — pending review
+**Version:** 0.4.0-draft
+**Status:** Design decisions resolved (§9) — ready for Phase 1 implementation
 **Audience:** Engine maintainers, library integrators
 
 ---
@@ -18,8 +18,8 @@ The engine is distributed as a **library**:
 
 | Platform | Artifact |
 |---|---|
-| Android | AAR (`litep2p-core`) containing the native `.so` + Kotlin API |
-| Linux/macOS | Static/shared library + C header (`liblitep2p`) |
+| Android | AAR (`litep2p-core`) containing the native `.so` + Kotlin API — the only published artifact |
+| Linux/macOS | In-repo desktop build consuming the same C header — development/test target, not published |
 
 The Android app in this repository is a **development/test harness** only. It is
 not part of the library surface and must not leak into the library's public API.
@@ -40,8 +40,11 @@ not part of the library surface and must not leak into the library's public API.
 ### 1.2 Non-goals (v1)
 
 - Application-layer protocols (chat, sync, etc.) — those belong to consumers.
-- Multi-engine instances per process (single engine per process; handle-based
-  API leaves the door open for multi-instance later).
+- Multiple engine instances per process. Exactly **one engine per process**,
+  enforced by the API (process-wide singleton, no handles). This keeps the ABI
+  minimal and eliminates an entire class of lifetime bugs.
+- Engine-level delivery notifications. `litep2p_send` is **fire-and-forget**;
+  applications needing delivery confirmation implement app-layer ACKs.
 - Public C++ API. C++ headers are internal; integrators use the C ABI or the
   Kotlin wrapper.
 
@@ -58,7 +61,7 @@ not part of the library surface and must not leak into the library's public API.
 ┌──────────────────────────▼──────────────────────────────────┐
 │  :litep2p-core (Android library module)                     │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │ Kotlin API: LiteP2PEngine, LiteP2PConfig, listeners   │  │
+│  │ Kotlin API: LiteP2P, LiteP2PConfig, listeners           │  │
 │  ├───────────────────────────────────────────────────────┤  │
 │  │ JNI binding layer (jni_bridge.cpp)                    │  │
 │  ├───────────────────────────────────────────────────────┤  │
@@ -89,7 +92,11 @@ The desktop build (`desktop/`) consumes the same C ABI instead of wrapping
 ### 3.1 Conventions
 
 - All functions are `extern "C"`, prefixed `litep2p_`.
-- Opaque handle: `litep2p_engine_t` (pointer to internal engine object).
+- Process-wide singleton: **no handles**. The engine is initialized once with
+  `litep2p_init` and torn down with `litep2p_shutdown`. Calling
+  `litep2p_init` twice without `litep2p_shutdown` returns
+  `LITEP2P_ERR_INVALID_STATE`. This mirrors the engine's existing design
+  (single global `SessionManager`).
 - All fallible operations return `litep2p_result_t` (int32 error code) unless
   stated otherwise.
 - Strings are UTF-8, NUL-terminated. Byte buffers carry explicit lengths.
@@ -162,11 +169,10 @@ void litep2p_config_init(litep2p_config_t* config); // fills defaults, sets stru
 ### 3.5 Lifecycle
 
 ```c
-litep2p_result_t litep2p_engine_create(const litep2p_config_t* config,
-                                       litep2p_engine_t* out_engine);
-litep2p_result_t litep2p_engine_start(litep2p_engine_t engine);   // async; completion via event
-litep2p_result_t litep2p_engine_stop(litep2p_engine_t engine);    // async; completion via event
-litep2p_result_t litep2p_engine_destroy(litep2p_engine_t engine); // stops if running; frees handle
+litep2p_result_t litep2p_init(const litep2p_config_t* config); // once per process
+litep2p_result_t litep2p_start(void);    // async; completion via on_engine_started
+litep2p_result_t litep2p_stop(void);     // async; completion via on_engine_stopped
+litep2p_result_t litep2p_shutdown(void); // stops if running; releases all state; idempotent
 
 // Engine state: STOPPED | STARTING | RUNNING | STOPPING
 typedef enum litep2p_state {
@@ -176,9 +182,8 @@ typedef enum litep2p_state {
     LITEP2P_STATE_STOPPING = 3,
 } litep2p_state_t;
 
-litep2p_state_t litep2p_engine_get_state(litep2p_engine_t engine);
-litep2p_result_t litep2p_engine_get_peer_id(litep2p_engine_t engine,
-                                            char* buf, uint32_t buf_len);
+litep2p_state_t litep2p_get_state(void);
+litep2p_result_t litep2p_get_peer_id(char* buf, uint32_t buf_len);
 ```
 
 State transitions are guarded: `start` from STOPPED only, `stop` from RUNNING
@@ -229,72 +234,82 @@ typedef struct litep2p_callbacks {
     void (*on_telemetry)(void* user_data, const char* json);
 } litep2p_callbacks_t;
 
-litep2p_result_t litep2p_engine_set_callbacks(litep2p_engine_t engine,
-                                              const litep2p_callbacks_t* callbacks);
+litep2p_result_t litep2p_set_callbacks(const litep2p_callbacks_t* callbacks);
 ```
 
 ### 3.7 Peer operations
 
 ```c
-litep2p_result_t litep2p_connect(litep2p_engine_t engine, const char* peer_id);
-litep2p_result_t litep2p_add_peer(litep2p_engine_t engine, const char* peer_id,
-                                  const char* network_id);
-litep2p_result_t litep2p_disconnect(litep2p_engine_t engine, const char* peer_id);
+litep2p_result_t litep2p_connect(const char* peer_id);
+litep2p_result_t litep2p_add_peer(const char* peer_id, const char* network_id);
+litep2p_result_t litep2p_disconnect(const char* peer_id);
 
-litep2p_result_t litep2p_peer_is_connected(litep2p_engine_t engine,
-                                           const char* peer_id, int* out_connected);
-litep2p_result_t litep2p_peer_get_connection_path(litep2p_engine_t engine,
-                                                  const char* peer_id,
+litep2p_result_t litep2p_peer_is_connected(const char* peer_id, int* out_connected);
+litep2p_result_t litep2p_peer_get_connection_path(const char* peer_id,
                                                   char* buf, uint32_t buf_len);
 ```
 
 ### 3.8 Messaging
 
 ```c
-// Asynchronous send. Delivery semantics are engine-defined (best-effort over
-// the active transport). Returns LITEP2P_OK when the message was accepted for
-// sending, not when delivered.
-litep2p_result_t litep2p_send(litep2p_engine_t engine, const char* peer_id,
-                              const uint8_t* data, uint32_t len);
+// Fire-and-forget send. Returns LITEP2P_OK when the message was accepted into
+// the send path, not when (or whether) it was delivered. There is no
+// engine-level delivery notification by design; applications that need
+// delivery confirmation implement app-layer ACKs.
+litep2p_result_t litep2p_send(const char* peer_id, const uint8_t* data, uint32_t len);
 ```
 
 Application-level concerns (ACKs, envelopes, retries at the app layer) are
-**out of scope** for the engine API. The engine guarantees ordered, encrypted,
-binary-safe delivery over an established session; reliability features
+**out of scope** for the engine API. Within an established session the engine
+provides ordered, encrypted, binary-safe delivery; reliability features
 (reconnect, path failover) are engine-internal.
 
 ### 3.9 Security (Noise NK)
 
 ```c
 // Local static public key, hex-encoded. buf_len >= 65.
-litep2p_result_t litep2p_get_local_public_key(litep2p_engine_t engine,
-                                              char* buf, uint32_t buf_len);
-litep2p_result_t litep2p_register_peer_key(litep2p_engine_t engine,
-                                           const char* peer_id,
+litep2p_result_t litep2p_get_local_public_key(char* buf, uint32_t buf_len);
+litep2p_result_t litep2p_register_peer_key(const char* peer_id,
                                            const char* public_key_hex);
-litep2p_result_t litep2p_has_peer_key(litep2p_engine_t engine,
-                                      const char* peer_id, int* out_has_key);
+litep2p_result_t litep2p_has_peer_key(const char* peer_id, int* out_has_key);
 ```
 
 ### 3.10 File transfer (optional module)
 
 ```c
+// Offer metadata delivered via on_file_transfer_offered. Nothing is written to
+// disk until the receiver explicitly accepts.
+typedef struct litep2p_file_offer {
+    char transfer_id[64];
+    char peer_id[128];
+    char file_name[256];
+    uint64_t size_bytes;
+} litep2p_file_offer_t;
+
 typedef struct litep2p_transfer_callbacks {
     uint32_t struct_size;
     void* user_data;
+    // Sender side: progress/completion of an outgoing transfer.
     void (*on_progress)(void* user_data, const char* transfer_id, float progress,
                         float bytes_per_sec);
     void (*on_completed)(void* user_data, const char* transfer_id, int success,
                          const char* error);
+    // Receiver side: an incoming transfer offer; accept with
+    // litep2p_accept_file_transfer(save_path) or decline it.
+    void (*on_file_transfer_offered)(void* user_data,
+                                     const litep2p_file_offer_t* offer);
 } litep2p_transfer_callbacks_t;
 
-litep2p_result_t litep2p_send_file(litep2p_engine_t engine, const char* peer_id,
-                                   const char* file_path, int priority,
-                                   const litep2p_transfer_callbacks_t* callbacks,
-                                   char* out_transfer_id, uint32_t buf_len);
-litep2p_result_t litep2p_pause_transfer(litep2p_engine_t engine, const char* transfer_id);
-litep2p_result_t litep2p_resume_transfer(litep2p_engine_t engine, const char* transfer_id);
-litep2p_result_t litep2p_cancel_transfer(litep2p_engine_t engine, const char* transfer_id);
+litep2p_result_t litep2p_set_transfer_callbacks(const litep2p_transfer_callbacks_t* callbacks);
+
+litep2p_result_t litep2p_send_file(const char* peer_id, const char* file_path,
+                                   int priority, char* out_transfer_id, uint32_t buf_len);
+litep2p_result_t litep2p_accept_file_transfer(const char* transfer_id,
+                                              const char* save_path);
+litep2p_result_t litep2p_decline_file_transfer(const char* transfer_id);
+litep2p_result_t litep2p_pause_transfer(const char* transfer_id);
+litep2p_result_t litep2p_resume_transfer(const char* transfer_id);
+litep2p_result_t litep2p_cancel_transfer(const char* transfer_id);
 ```
 
 Returns `LITEP2P_ERR_UNSUPPORTED` when compiled without
@@ -304,18 +319,16 @@ Returns `LITEP2P_ERR_UNSUPPORTED` when compiled without
 
 ```c
 // role: "off" | "gateway" | "exit" | "client" | "both"
-litep2p_result_t litep2p_set_proxy_role(litep2p_engine_t engine, const char* role);
+litep2p_result_t litep2p_set_proxy_role(const char* role);
 ```
 
 ### 3.12 Environment hints (mobile integration)
 
 ```c
-litep2p_result_t litep2p_set_network_info(litep2p_engine_t engine,
-                                          int is_wifi, int network_available);
-litep2p_result_t litep2p_set_battery_level(litep2p_engine_t engine,
-                                           int percent, int is_charging);
+litep2p_result_t litep2p_set_network_info(int is_wifi, int network_available);
+litep2p_result_t litep2p_set_battery_level(int percent, int is_charging);
 // mode: "auto" | "aggressive" | "balanced" | "power_saver"
-litep2p_result_t litep2p_set_reconnect_mode(litep2p_engine_t engine, const char* mode);
+litep2p_result_t litep2p_set_reconnect_mode(const char* mode);
 ```
 
 ### 3.13 Telemetry and diagnostics
@@ -323,11 +336,12 @@ litep2p_result_t litep2p_set_reconnect_mode(litep2p_engine_t engine, const char*
 ```c
 // Force an immediate snapshot; delivered via on_telemetry callback and/or
 // returned as a malloc'd JSON string the caller must free with litep2p_free.
-litep2p_result_t litep2p_telemetry_snapshot(litep2p_engine_t engine, char** out_json);
+litep2p_result_t litep2p_telemetry_snapshot(char** out_json);
 void litep2p_free(void* ptr);
 
 // Logging level: 0=DEBUG 1=INFO 2=WARN 3=ERROR
-litep2p_result_t litep2p_set_log_level(litep2p_engine_t engine, int level);
+litep2p_result_t litep2p_set_log_level(int level);
+```
 
 ---
 
@@ -381,9 +395,11 @@ public interface LiteP2PListener {
     fun onTelemetry(json: String) {}
 }
 
-public class LiteP2PEngine(config: LiteP2PConfig) : AutoCloseable {
+public object LiteP2P {
+    fun init(config: LiteP2PConfig): EngineResult  // once per process
     fun start(): EngineResult          // async; completion via onEngineStarted
     fun stop(): EngineResult           // async; completion via onEngineStopped
+    fun shutdown(): EngineResult       // stops if running; releases native state; idempotent
     val state: EngineState
     val peerId: String
 
@@ -394,6 +410,8 @@ public class LiteP2PEngine(config: LiteP2PConfig) : AutoCloseable {
     fun addPeer(peerId: String, networkId: String): EngineResult
     fun disconnect(peerId: String): EngineResult
     fun isPeerConnected(peerId: String): Boolean
+
+    // Fire-and-forget: OK means accepted into the send path, not delivered.
     fun send(peerId: String, data: ByteArray): EngineResult
 
     // Security
@@ -409,11 +427,7 @@ public class LiteP2PEngine(config: LiteP2PConfig) : AutoCloseable {
     // Diagnostics
     fun telemetrySnapshot(): String    // JSON, see §6
 
-    override fun close()               // stops engine, releases native handle
-
-    companion object {
-        val version: String
-    }
+    val version: String
 }
 
 public enum class EngineResult { OK, INVALID_ARG, INVALID_STATE, BUSY,
@@ -426,14 +440,17 @@ public enum class EngineResult { OK, INVALID_ARG, INVALID_STATE, BUSY,
   does **not** post to the main thread; that is the consumer's choice.
 - The harness (`:app`) adapts listeners to `LiveData` — exactly what
   `hook/p2p.kt` does today, but moved out of the library.
-- `LiteP2PEngine` is safe to call from any thread.
+- `LiteP2P` is safe to call from any thread.
+- `LiteP2P` is a Kotlin `object` (singleton), mirroring the one-engine-per-
+  process C ABI. There is no instance construction and no `close()`;
+  `shutdown()` releases native state.
 
 ### 4.2 Migration of current harness code
 
 | Today (in `:app`, mixed) | After split |
 |---|---|
 | `EngineNative.kt` (JNI externs) | Internal to `:litep2p-core` |
-| `hook/p2p.kt` engine calls | `LiteP2PEngine` API |
+| `hook/p2p.kt` engine calls | `LiteP2P` API |
 | `hook/p2p.kt` LiveData + message history | Harness-side adapter in `:app` |
 | `sendMessageTracked` ACK envelopes | Harness-only feature in `:app` |
 | `LiteP2PLogger` (JNI log sink) | `onLog` listener; harness renders it |
@@ -446,7 +463,7 @@ public enum class EngineResult { OK, INVALID_ARG, INVALID_STATE, BUSY,
 - `peer_id` is a stable UTF-8 string (current format retained). It is the
   primary key for connections, keys, and telemetry attribution.
 - If `config.peer_id` is null, the engine generates one and reports it via
-  `litep2p_engine_get_peer_id` / `LiteP2PEngine.peerId`.
+  `litep2p_get_peer_id` / `LiteP2P.peerId`.
 - Discovery populates `network_id` (LAN identity) used for rendezvous.
 
 
@@ -499,9 +516,9 @@ the engine consuming" without external profiling.
 The library is considered release-ready when:
 
 1. **Lifecycle rigidity:** start/stop races, double-start, stop-while-starting,
-   and destroy-while-running are all handled without crashes or deadlocks
-   (state machine in §3.5; existing guard already enforces this — it becomes
-   part of the contract and is unit-tested).
+   double-init, and shutdown-while-running are all handled without crashes or
+   deadlocks (state machine in §3.5; existing guard already enforces this — it
+   becomes part of the contract and is unit-tested).
 2. **JNI safety:** no pending-exception leaks across the JNI boundary (the
    `ExceptionClear` discipline in the current bridge becomes a binding-layer
    rule with tests).
@@ -510,7 +527,7 @@ The library is considered release-ready when:
 4. **Bounded resources:** memory and thread counts stay within documented
    budgets per mode (multi-thread vs single-thread), verified via §6.1 gauges.
 5. **Clean shutdown:** `stop` completes within a documented deadline; all
-   sockets, threads, and file handles are released; `destroy` is idempotent.
+   sockets, threads, and file handles are released; `shutdown` is idempotent.
 
 ---
 
@@ -526,7 +543,7 @@ The library is considered release-ready when:
 - Create `:litep2p-core` library module; move `cpp/`, JNI bridge, and a new
   Kotlin API (§4) into it.
 - `:app` keeps only harness code; `hook/p2p.kt` becomes a thin adapter over
-  `LiteP2PEngine`.
+  `LiteP2P`.
 - Both flavors (`multiThread`/`singleThread`) keep building.
 
 **Phase 3 — Re-point JNI onto the C ABI**
@@ -543,14 +560,20 @@ functional (start/stop, peers, messages, logs, telemetry).
 
 ---
 
-## 9. Open questions
+## 9. Resolved design decisions
 
-1. Should `litep2p_send` expose a completion callback (accepted/delivered/failed)
-   at the engine level, or remain fire-and-forget with app-layer ACKs?
-2. Multi-instance support: needed for any known consumer, or defer?
-3. Should the C ABI expose file-transfer *receive* initiation, or is receive
-   always accept-by-callback?
-4. Preferred distribution: AAR only, or also a plain `.so` + header tarball for
-   NDK-only integrators?
+1. **Send semantics:** `litep2p_send` is **fire-and-forget**. No engine-level
+   delivery callback; applications needing confirmation implement app-layer
+   ACKs. (See §3.8.)
+2. **Multi-instance:** **Not supported.** One engine per process, enforced by
+   the API — process-wide singleton, no handles. (See §3.5.)
+3. **File-transfer receive:** **Callback-accepted.** Incoming offers arrive via
+   `on_file_transfer_offered`; the receiver explicitly calls
+   `litep2p_accept_file_transfer(transfer_id, save_path)` or
+   `litep2p_decline_file_transfer(transfer_id)`. Nothing is written to disk
+   before acceptance. (See §3.10.)
+4. **Distribution:** **AAR only** (`:litep2p-core`). The desktop build remains
+   in-repo as a development/test target consuming the same C header; no
+   separate `.so` + headers tarball is published. (See §2.)
 
 ```
