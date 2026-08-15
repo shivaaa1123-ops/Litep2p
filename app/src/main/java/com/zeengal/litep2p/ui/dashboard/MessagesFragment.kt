@@ -1,42 +1,35 @@
 package com.zeengal.litep2p.ui.dashboard
 
 import android.os.Bundle
-import android.view.Gravity
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
-import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.button.MaterialButton
 import com.zeengal.litep2p.MessageTraceStore
+import com.zeengal.litep2p.R
 import com.zeengal.litep2p.hook.P2P
 
 class MessagesFragment : Fragment() {
 
     private lateinit var adapter: MessageEventsAdapter
     private var latestEvents: List<P2P.MessageEvent> = emptyList()
+    private var countText: TextView? = null
 
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View {
-        val root = LinearLayout(requireContext()).apply {
-            orientation = LinearLayout.VERTICAL
-        }
+        val root = inflater.inflate(R.layout.fragment_messages, container, false)
 
-        val hint = TextView(requireContext()).apply {
-            text = "Tap a message for trace details."
-            textSize = 12f
-            setPadding(16, 12, 16, 12)
-            gravity = Gravity.START
-        }
+        countText = root.findViewById(R.id.messageCountText)
 
-        val list = RecyclerView(requireContext()).apply {
-            layoutManager = LinearLayoutManager(requireContext())
-        }
+        val list = root.findViewById<RecyclerView>(R.id.messagesRecycler)
+        list.layoutManager = LinearLayoutManager(requireContext())
 
         adapter = MessageEventsAdapter()
         adapter.setOnItemClickListener { event ->
@@ -44,15 +37,9 @@ class MessagesFragment : Fragment() {
         }
         list.adapter = adapter
 
-        root.addView(hint, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
-        root.addView(list, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            0,
-            1f
-        ))
+        root.findViewById<MaterialButton>(R.id.clearMessagesButton).setOnClickListener {
+            P2P.clearMessageEvents()
+        }
 
         return root
     }
@@ -63,6 +50,7 @@ class MessagesFragment : Fragment() {
         P2P.messageEvents.observe(viewLifecycleOwner) { events ->
             latestEvents = events
             adapter.submit(events)
+            countText?.text = events.size.toString()
         }
 
         // Re-render whenever a message's delivery state changes (ACK received,
@@ -72,6 +60,11 @@ class MessagesFragment : Fragment() {
                 adapter.submit(latestEvents)
             }
         }
+    }
+
+    override fun onDestroyView() {
+        super.onDestroyView()
+        countText = null
     }
 
     private fun showTraceDialog(messageId: String) {

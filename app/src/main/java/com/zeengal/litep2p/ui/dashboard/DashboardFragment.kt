@@ -37,6 +37,15 @@ class DashboardFragment : Fragment() {
                 3 -> "Resources"
                 else -> "Tab ${position + 1}"
             }
+            tab.setIcon(
+                when (position) {
+                    0 -> R.drawable.ic_terminal
+                    1 -> R.drawable.ic_message
+                    2 -> R.drawable.ic_gauge
+                    3 -> R.drawable.ic_network
+                    else -> R.drawable.ic_terminal
+                }
+            )
         }.attach()
 
         // Ensure the home screen shows peers + logs by default.

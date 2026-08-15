@@ -1,17 +1,57 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Base application theme. -->
-    <style name="Theme.MyApplication" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
-        <!-- Primary brand color. -->
-        <item name="colorPrimary">@color/purple_500</item>
-        <item name="colorPrimaryVariant">@color/purple_700</item>
+    <!--
+        Base application theme: Material 3, dark-only.
+
+        LiteP2P is used side by side with a terminal running the desktop peer, so the
+        app is deliberately dark in both system modes. The whole palette is mapped onto
+        the "console" design system in colors.xml: low-luminance surfaces, greyscale
+        text ramp, and a small number of saturated accents reserved for state.
+    -->
+    <style name="Theme.MyApplication" parent="Theme.Material3.Dark.NoActionBar">
+        <!-- Brand / interactive -->
+        <item name="colorPrimary">@color/accent</item>
         <item name="colorOnPrimary">@color/white</item>
-        <!-- Secondary brand color. -->
-        <item name="colorSecondary">@color/teal_200</item>
-        <item name="colorSecondaryVariant">@color/teal_700</item>
-        <item name="colorOnSecondary">@color/black</item>
-        <!-- Status bar color. -->
-        <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
-        <!-- Customize your theme here. -->
+        <item name="colorPrimaryContainer">@color/accent_container</item>
+        <item name="colorOnPrimaryContainer">@color/text_primary</item>
+        <item name="colorSecondary">@color/accent</item>
+        <item name="colorOnSecondary">@color/white</item>
+        <item name="colorSecondaryContainer">@color/surface_2</item>
+        <item name="colorOnSecondaryContainer">@color/text_primary</item>
+        <item name="colorTertiary">@color/teal_200</item>
+        <item name="colorOnTertiary">@color/black</item>
+
+        <!-- Surfaces -->
+        <item name="android:windowBackground">@color/surface_0</item>
+        <item name="colorSurface">@color/surface_0</item>
+        <item name="colorOnSurface">@color/text_primary</item>
+        <item name="colorOnSurfaceVariant">@color/text_secondary</item>
+        <item name="colorSurfaceContainerLow">@color/surface_1</item>
+        <item name="colorSurfaceContainer">@color/surface_2</item>
+        <item name="colorSurfaceContainerHigh">@color/surface_3</item>
+        <item name="colorSurfaceContainerHighest">@color/surface_container_highest</item>
+        <item name="colorSurfaceBright">@color/surface_3</item>
+        <item name="colorSurfaceDim">@color/surface_0</item>
+        <item name="colorOutline">@color/stroke</item>
+        <item name="colorOutlineVariant">@color/stroke</item>
+
+        <!-- State -->
+        <item name="colorError">@color/status_err</item>
+        <item name="colorOnError">@color/white</item>
+
+        <!-- System bars blend into the console surface. -->
+        <item name="android:statusBarColor">@color/surface_0</item>
+        <item name="android:navigationBarColor">@color/surface_0</item>
+        <item name="android:windowLightStatusBar">false</item>
+
+        <!-- Widget defaults -->
+        <item name="colorControlNormal">@color/text_secondary</item>
+        <item name="colorControlHighlight">@color/ripple_soft</item>
+        <item name="android:textColorPrimary">@color/text_primary</item>
+        <item name="android:textColorSecondary">@color/text_secondary</item>
+        <item name="android:textColorTertiary">@color/text_tertiary</item>
+        <item name="android:textColorHint">@color/text_tertiary</item>
+        <item name="tabStyle">@style/Widget.LiteP2P.TabLayout</item>
+        <item name="materialAlertDialogTheme">@style/ThemeOverlay.LiteP2P.Dialog</item>
     </style>
 
     <style name="Theme.MyApplication.NoActionBar">
@@ -19,9 +59,24 @@
         <item name="windowNoTitle">true</item>
     </style>
 
-    <style name="Theme.MyApplication.AppBarOverlay" parent="ThemeOverlay.AppCompat.Dark.ActionBar" />
+    <style name="Theme.MyApplication.AppBarOverlay" parent="ThemeOverlay.Material3.Dark" />
 
-    <style name="Theme.MyApplication.PopupOverlay" parent="ThemeOverlay.AppCompat.Light" />
+    <style name="Theme.MyApplication.PopupOverlay" parent="ThemeOverlay.Material3.Dark" />
+
+    <!-- Dialogs (send message, message trace) follow the console palette. -->
+    <style name="ThemeOverlay.LiteP2P.Dialog" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="colorSurface">@color/surface_2</item>
+        <item name="colorOnSurface">@color/text_primary</item>
+        <item name="colorOnSurfaceVariant">@color/text_secondary</item>
+        <item name="colorPrimary">@color/accent</item>
+        <item name="colorSecondary">@color/accent</item>
+        <item name="materialAlertDialogTitleTextStyle">@style/TextAppearance.LiteP2P.DialogTitle</item>
+    </style>
+
+    <style name="TextAppearance.LiteP2P.DialogTitle" parent="MaterialAlertDialog.Material3.Title.Text">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">18sp</item>
+    </style>
 
     <!--
         LiteP2P component styles.
@@ -31,16 +86,16 @@
         each layout.
     -->
 
-    <style name="Widget.LiteP2P.Card" parent="Widget.MaterialComponents.CardView">
+    <style name="Widget.LiteP2P.Card" parent="Widget.Material3.CardView.Filled">
         <item name="cardBackgroundColor">@color/surface_1</item>
-        <item name="cardCornerRadius">14dp</item>
+        <item name="cardCornerRadius">16dp</item>
         <item name="cardElevation">0dp</item>
         <item name="strokeColor">@color/stroke</item>
         <item name="strokeWidth">1dp</item>
     </style>
 
     <!-- Label: small, uppercase, low contrast. Used for field captions and stat names. -->
-    <style name="TextAppearance.LiteP2P.Label" parent="TextAppearance.MaterialComponents.Caption">
+    <style name="TextAppearance.LiteP2P.Label" parent="TextAppearance.Material3.LabelSmall">
         <item name="android:textColor">@color/text_tertiary</item>
         <item name="android:textSize">10sp</item>
         <item name="android:textAllCaps">true</item>
@@ -49,17 +104,24 @@
     </style>
 
     <!-- Stat value: the large number in a stat tile. Monospace so digits don't jitter. -->
-    <style name="TextAppearance.LiteP2P.StatValue" parent="TextAppearance.MaterialComponents.Headline6">
+    <style name="TextAppearance.LiteP2P.StatValue" parent="TextAppearance.Material3.TitleMedium">
         <item name="android:textColor">@color/text_primary</item>
         <item name="android:textSize">18sp</item>
         <item name="android:fontFamily">monospace</item>
     </style>
 
-    <style name="Widget.LiteP2P.Button" parent="Widget.MaterialComponents.Button">
+    <!-- App bar title. -->
+    <style name="TextAppearance.LiteP2P.Title" parent="TextAppearance.Material3.TitleLarge">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">20sp</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+    </style>
+
+    <style name="Widget.LiteP2P.Button" parent="Widget.Material3.Button">
         <item name="android:textAllCaps">false</item>
         <item name="android:textSize">14sp</item>
         <item name="android:letterSpacing">0</item>
-        <item name="cornerRadius">10dp</item>
+        <item name="cornerRadius">12dp</item>
         <item name="elevation">0dp</item>
     </style>
 
@@ -80,22 +142,52 @@
         <item name="iconTint">@color/btn_stop_text</item>
     </style>
 
-    <style name="Widget.LiteP2P.Button.Outlined" parent="Widget.MaterialComponents.Button.OutlinedButton">
+    <style name="Widget.LiteP2P.Button.Outlined" parent="Widget.Material3.Button.OutlinedButton">
         <item name="android:textAllCaps">false</item>
         <item name="android:textSize">13sp</item>
         <item name="android:letterSpacing">0</item>
-        <item name="cornerRadius">10dp</item>
+        <item name="cornerRadius">12dp</item>
         <item name="strokeColor">@color/stroke</item>
         <item name="android:textColor">@color/text_secondary</item>
         <item name="iconTint">@color/text_secondary</item>
     </style>
 
-    <style name="Widget.LiteP2P.Chip" parent="Widget.MaterialComponents.Chip.Filter">
+    <!-- Small icon-only button used for inline actions (clear, copy, ...). -->
+    <style name="Widget.LiteP2P.Button.Icon" parent="Widget.Material3.Button.IconButton">
+        <item name="iconTint">@color/text_tertiary</item>
+        <item name="iconSize">20dp</item>
+        <item name="android:insetTop">0dp</item>
+        <item name="android:insetBottom">0dp</item>
+    </style>
+
+    <style name="Widget.LiteP2P.Chip" parent="Widget.Material3.Chip.Filter">
         <item name="chipBackgroundColor">@color/chip_bg</item>
         <item name="android:textColor">@color/chip_text</item>
         <item name="chipStrokeColor">@color/stroke</item>
         <item name="chipStrokeWidth">1dp</item>
         <item name="chipCornerRadius">8dp</item>
         <item name="android:textSize">12sp</item>
+        <item name="checkedIconVisible">false</item>
+        <item name="chipMinHeight">32dp</item>
+    </style>
+
+    <!-- Dashboard tabs: transparent strip, accent indicator, no all-caps. -->
+    <style name="Widget.LiteP2P.TabLayout" parent="Widget.Material3.TabLayout">
+        <item name="android:background">@android:color/transparent</item>
+        <item name="tabBackground">@android:color/transparent</item>
+        <item name="tabIndicatorColor">@color/accent</item>
+        <item name="tabIndicatorHeight">3dp</item>
+        <item name="tabIndicatorFullWidth">false</item>
+        <item name="tabSelectedTextColor">@color/text_primary</item>
+        <item name="tabTextColor">@color/text_tertiary</item>
+        <item name="tabIconTint">@color/tab_icon_tint</item>
+        <item name="tabRippleColor">@color/ripple_soft</item>
+        <item name="tabTextAppearance">@style/TextAppearance.LiteP2P.Tab</item>
+    </style>
+
+    <style name="TextAppearance.LiteP2P.Tab" parent="TextAppearance.Material3.LabelLarge">
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:letterSpacing">0</item>
     </style>
 </resources>

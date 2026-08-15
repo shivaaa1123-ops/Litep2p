@@ -1,11 +1,76 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Main screen: slim app bar, engine control panel, collapsible peers section and the
+    dashboard pager (Logs / Messages / Telemetry / Resources).
+
+    The root applies the system-bar insets (edge-to-edge is enabled in MainActivity),
+    while the inner content applies the navigation-bar inset so nothing is drawn
+    under the gesture bar.
+-->
 <LinearLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/mainRoot"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
     android:background="@color/surface_0">
+
+    <!-- App bar: identity on the left, console actions on the right. -->
+    <LinearLayout
+        android:id="@+id/appBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="@color/surface_0"
+        android:paddingHorizontal="12dp"
+        android:paddingTop="10dp"
+        android:paddingBottom="6dp">
+
+        <ImageView
+            android:layout_width="34dp"
+            android:layout_height="34dp"
+            android:padding="6dp"
+            android:background="@drawable/bg_empty_circle"
+            android:src="@drawable/ic_terminal"
+            android:contentDescription="@string/app_name"
+            app:tint="@color/accent" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="10dp"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_name"
+                android:textAppearance="@style/TextAppearance.LiteP2P.Title"
+                android:singleLine="true" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_tagline"
+                android:textColor="@color/text_tertiary"
+                android:textSize="11sp"
+                android:singleLine="true" />
+        </LinearLayout>
+
+        <!-- One tap clears the whole console: logs, messages and traces. -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/clearConsoleButton"
+            style="@style/Widget.LiteP2P.Button.Icon"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:contentDescription="@string/action_clear_console"
+            android:tooltipText="@string/action_clear_console"
+            app:icon="@drawable/ic_clear" />
+
+    </LinearLayout>
 
     <!-- Include the header with IP and status -->
     <include layout="@layout/header_layout" />
@@ -30,7 +95,7 @@
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Peers"
+            android:text="@string/peers_section_title"
             android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
 
         <TextView
@@ -39,7 +104,7 @@
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:layout_marginStart="8dp"
-            android:text="none discovered"
+            android:text="@string/peers_none_discovered"
             android:textColor="@color/text_tertiary"
             android:textSize="11sp"
             android:singleLine="true"

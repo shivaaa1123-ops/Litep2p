@@ -26,4 +26,13 @@ object LiteP2PLogger {
         logHistory.add(0, message)
         _logs.postValue(logHistory.toList())
     }
+
+    /**
+     * Clears the visible log buffer (UI "clear console" action). New engine output
+     * keeps arriving afterwards; only the history captured so far is dropped.
+     */
+    fun clear() {
+        logHistory.clear()
+        _logs.postValue(emptyList())
+    }
 }

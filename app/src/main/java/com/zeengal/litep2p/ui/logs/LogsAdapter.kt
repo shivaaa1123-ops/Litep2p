@@ -25,7 +25,7 @@ class LogsAdapter(private var logs: List<String> = emptyList()) :
         val line = logs[position]
         holder.logTextView.text = line
         holder.logTextView.setTextColor(
-            ContextCompat.getColor(holder.itemView.context, severityColorId(line))
+            ContextCompat.getColor(holder.itemView.context, severityColorId(severityOf(line)))
         )
     }
 
@@ -36,31 +36,39 @@ class LogsAdapter(private var logs: List<String> = emptyList()) :
         notifyDataSetChanged()
     }
 
+    enum class Severity { INFO, WARN, ERROR }
+
     companion object {
         /**
          * Best-effort severity detection. The native logger emits messages through a
          * single string channel (no level token), so we infer severity from the
          * prefixes the engine actually uses, e.g. LOG_ERROR -> "ERROR: ...",
          * LOG_WARN -> "WARN: ...", or component-scoped "TCP Error: ..." /
-         * "BufferPool: Warning - ...". Colour tokens come from colors.xml.
+         * "BufferPool: Warning - ...". Shared with the Logs tab's severity filter.
          */
-        private fun severityColorId(line: String): Int {
-            if (line.isEmpty()) return R.color.log_info
+        fun severityOf(line: String): Severity {
+            if (line.isEmpty()) return Severity.INFO
             val lower = line.lowercase()
             val start = lower.take(24)
             if (start.startsWith("error") || start.startsWith("fatal")) {
-                return R.color.log_error
+                return Severity.ERROR
             }
             if (start.startsWith("warn")) {
-                return R.color.log_warn
+                return Severity.WARN
             }
             if (lower.contains("error:")) {
-                return R.color.log_error
+                return Severity.ERROR
             }
             if (lower.contains("warning:") || lower.contains("warning -") || lower.contains(" warning ")) {
-                return R.color.log_warn
+                return Severity.WARN
             }
-            return R.color.log_info
+            return Severity.INFO
+        }
+
+        private fun severityColorId(severity: Severity): Int = when (severity) {
+            Severity.ERROR -> R.color.log_error
+            Severity.WARN -> R.color.log_warn
+            Severity.INFO -> R.color.log_info
         }
     }
 }

@@ -154,4 +154,17 @@ object P2P {
             _messageEvents.postValue(messageHistory.toList())
         }
     }
+
+    /**
+     * Clears the message event list and the associated traces (UI "clear" action).
+     * In-flight messages are unaffected; only the recorded history is dropped.
+     */
+    @JvmStatic
+    fun clearMessageEvents() {
+        synchronized(messageHistory) {
+            messageHistory.clear()
+            _messageEvents.postValue(emptyList())
+        }
+        MessageTraceStore.clear()
+    }
 }

@@ -1,12 +1,15 @@
 <resources>
     <string name="app_name">Litep2p</string>
-    <string name="nav_header_desc">Navigation header</string>
-    <string name="nav_header_title">Android Studio</string>
-    <string name="nav_header_subtitle">android.studio@android.com</string>
-    <string name="menu_home">Home</string>
-    <string name="menu_gallery">Gallery</string>
-    <string name="menu_slideshow">Slideshow</string>
-    <string name="action_settings">Settings</string>
+    <string name="app_tagline">mesh console</string>
+    <string name="action_clear_console">Clear console</string>
+    <string name="action_clear_messages">Clear messages</string>
+    <string name="peers_section_title">Peers</string>
+    <string name="peers_none_discovered">none discovered</string>
+    <string name="logs_filter_all">All</string>
+    <string name="logs_filter_warnings">Warnings</string>
+    <string name="logs_filter_errors">Errors</string>
+    <string name="logs_empty_hint">Engine output will appear here.</string>
+    <string name="messages_hint">Tap a message for trace details.</string>
     <string-array name="comms_modes_array">
         <item>UDP</item>
         <item>TCP</item>

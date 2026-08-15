@@ -1,6 +1,5 @@
 package com.zeengal.litep2p.ui.dashboard
 
-import android.app.AlertDialog
 import android.app.Dialog
 import android.graphics.Typeface
 import android.os.Bundle
@@ -11,8 +10,11 @@ import android.text.style.StyleSpan
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.DialogFragment
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.zeengal.litep2p.MessageTraceStore
+import com.zeengal.litep2p.R
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -79,9 +81,12 @@ class MessageTraceDialog : DialogFragment() {
                 MessageTraceStore.MessageStatus.RECEIVED -> "✓ RECEIVED"
             }
             val statusColor = when (trace.status) {
-                MessageTraceStore.MessageStatus.PENDING -> android.graphics.Color.parseColor("#FFA000")
-                MessageTraceStore.MessageStatus.DELIVERED, MessageTraceStore.MessageStatus.RECEIVED -> android.graphics.Color.parseColor("#4CAF50")
-                MessageTraceStore.MessageStatus.FAILED -> android.graphics.Color.parseColor("#F44336")
+                MessageTraceStore.MessageStatus.PENDING ->
+                    ContextCompat.getColor(context, R.color.status_warn)
+                MessageTraceStore.MessageStatus.DELIVERED, MessageTraceStore.MessageStatus.RECEIVED ->
+                    ContextCompat.getColor(context, R.color.status_ok)
+                MessageTraceStore.MessageStatus.FAILED ->
+                    ContextCompat.getColor(context, R.color.status_err)
             }
             container.addView(createColoredInfoRow("Status", statusText, statusColor))
 
@@ -92,7 +97,8 @@ class MessageTraceDialog : DialogFragment() {
                 container.addView(createInfoRow("Retries", trace.retryCount.toString()))
             }
             if (!trace.errorMessage.isNullOrEmpty()) {
-                container.addView(createColoredInfoRow("Error", trace.errorMessage!!, android.graphics.Color.parseColor("#F44336")))
+                container.addView(createColoredInfoRow("Error", trace.errorMessage!!,
+                    ContextCompat.getColor(context, R.color.status_err)))
             }
 
             // Preview section
@@ -101,7 +107,8 @@ class MessageTraceDialog : DialogFragment() {
                 text = trace.preview.ifEmpty { "(empty)" }
                 textSize = 12f
                 typeface = Typeface.MONOSPACE
-                setBackgroundColor(android.graphics.Color.parseColor("#F5F5F5"))
+                setTextColor(ContextCompat.getColor(context, R.color.text_secondary))
+                setBackgroundColor(ContextCompat.getColor(context, R.color.surface_2))
                 setPadding(16, 12, 16, 12)
             })
 
@@ -112,7 +119,7 @@ class MessageTraceDialog : DialogFragment() {
                 container.addView(TextView(context).apply {
                     text = "No events recorded."
                     textSize = 12f
-                    setTextColor(android.graphics.Color.GRAY)
+                    setTextColor(ContextCompat.getColor(context, R.color.text_tertiary))
                 })
             } else {
                 for ((index, event) in trace.events.withIndex()) {
@@ -123,7 +130,7 @@ class MessageTraceDialog : DialogFragment() {
 
         scrollView.addView(container)
 
-        return AlertDialog.Builder(context)
+        return MaterialAlertDialogBuilder(context)
             .setTitle("Message Trace")
             .setView(scrollView)
             .setPositiveButton("Close", null)
@@ -136,7 +143,7 @@ class MessageTraceDialog : DialogFragment() {
             textSize = 14f
             setTypeface(null, Typeface.BOLD)
             setPadding(0, 24, 0, 8)
-            setTextColor(android.graphics.Color.parseColor("#1976D2"))
+            setTextColor(ContextCompat.getColor(requireContext(), R.color.accent))
         }
     }
 
@@ -185,10 +192,13 @@ class MessageTraceDialog : DialogFragment() {
         }
 
         val eventColor = when (event.eventType) {
-            MessageTraceStore.EventType.TX_ACK, MessageTraceStore.EventType.RX_RECEIVED, MessageTraceStore.EventType.RX_DECRYPTED -> android.graphics.Color.parseColor("#4CAF50")
-            MessageTraceStore.EventType.TX_FAILED, MessageTraceStore.EventType.RX_DECRYPT_FAIL, MessageTraceStore.EventType.ERROR -> android.graphics.Color.parseColor("#F44336")
-            MessageTraceStore.EventType.TX_TIMEOUT, MessageTraceStore.EventType.TX_RETRY -> android.graphics.Color.parseColor("#FFA000")
-            else -> android.graphics.Color.parseColor("#666666")
+            MessageTraceStore.EventType.TX_ACK, MessageTraceStore.EventType.RX_RECEIVED, MessageTraceStore.EventType.RX_DECRYPTED ->
+                ContextCompat.getColor(requireContext(), R.color.status_ok)
+            MessageTraceStore.EventType.TX_FAILED, MessageTraceStore.EventType.RX_DECRYPT_FAIL, MessageTraceStore.EventType.ERROR ->
+                ContextCompat.getColor(requireContext(), R.color.status_err)
+            MessageTraceStore.EventType.TX_TIMEOUT, MessageTraceStore.EventType.TX_RETRY ->
+                ContextCompat.getColor(requireContext(), R.color.status_warn)
+            else -> ContextCompat.getColor(requireContext(), R.color.text_tertiary)
         }
 
         return TextView(requireContext()).apply {

@@ -10,8 +10,8 @@
     style="@style/Widget.LiteP2P.Card"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:layout_marginHorizontal="10dp"
-    android:layout_marginVertical="5dp">
+    android:layout_marginHorizontal="12dp"
+    android:layout_marginVertical="4dp">
 
     <LinearLayout
         android:layout_width="match_parent"
@@ -22,8 +22,8 @@
 
         <View
             android:id="@+id/peerStatusDot"
-            android:layout_width="12dp"
-            android:layout_height="12dp"
+            android:layout_width="10dp"
+            android:layout_height="10dp"
             android:background="@drawable/bg_status_dot"
             android:importantForAccessibility="no" />
 

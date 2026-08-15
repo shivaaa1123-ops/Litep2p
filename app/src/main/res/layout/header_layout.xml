@@ -2,9 +2,7 @@
 <!--
     Engine control panel.
 
-    The old header was a flat stack of raw TextViews, a Spinner, two checkboxes and
-    three buttons with no grouping, so engine state was hard to read at a glance.
-    This version splits it into three scannable zones:
+    Split into three scannable zones:
       1. Identity/status row - is it running, who am I, how long
       2. Stat strip          - live counters for peers and message flow
       3. Controls            - start/stop plus collapsible advanced options
@@ -16,7 +14,7 @@
     android:orientation="vertical"
     android:background="@color/surface_0"
     android:paddingHorizontal="12dp"
-    android:paddingTop="12dp"
+    android:paddingTop="4dp"
     android:paddingBottom="8dp">
 
     <com.google.android.material.card.MaterialCardView
@@ -56,66 +54,119 @@
                     android:singleLine="true"
                     android:ellipsize="end" />
 
-                <TextView
-                    android:id="@+id/uptimeText"
+                <!-- Uptime pill: only meaningful while the engine is RUNNING. -->
+                <LinearLayout
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="--:--:--"
-                    android:fontFamily="monospace"
-                    android:textColor="@color/text_tertiary"
-                    android:textSize="12sp" />
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:background="@drawable/bg_pill"
+                    android:paddingHorizontal="10dp"
+                    android:paddingVertical="4dp">
+
+                    <ImageView
+                        android:layout_width="12dp"
+                        android:layout_height="12dp"
+                        android:src="@drawable/ic_clock"
+                        android:importantForAccessibility="no"
+                        app:tint="@color/text_tertiary" />
+
+                    <TextView
+                        android:id="@+id/uptimeText"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="5dp"
+                        android:text="--:--:--"
+                        android:fontFamily="monospace"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="12sp" />
 
             </LinearLayout>
 
-            <!-- Tap to copy: peer IDs are long strings that are painful to retype into
-                 a desktop test client. -->
+                </LinearLayout>
+
+
+            <!-- Identity well: peer ID (tap to copy) and local IP. -->
             <LinearLayout
-                android:id="@+id/peerIdRow"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="10dp"
-                android:orientation="horizontal"
-                android:gravity="center_vertical"
+                android:orientation="vertical"
                 android:background="@drawable/bg_stat_tile"
-                android:padding="8dp">
+                android:paddingHorizontal="10dp"
+                android:paddingVertical="8dp">
 
-                <TextView
-                    android:layout_width="wrap_content"
+                <LinearLayout
+                    android:id="@+id/peerIdRow"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="ID"
-                    android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:background="?attr/selectableItemBackground">
 
-                <TextView
-                    android:id="@+id/peerIdText"
-                    android:layout_width="0dp"
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="ID"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                    <TextView
+                        android:id="@+id/peerIdText"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="8dp"
+                        android:text="—"
+                        android:fontFamily="monospace"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="11sp"
+                        android:singleLine="true"
+                        android:ellipsize="middle" />
+
+                    <ImageView
+                        android:layout_width="16dp"
+                        android:layout_height="16dp"
+                        android:src="@drawable/ic_copy"
+                        android:contentDescription="Copy peer ID"
+                        app:tint="@color/text_tertiary" />
+
+                </LinearLayout>
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginVertical="6dp"
+                    android:background="@color/stroke" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_weight="1"
-                    android:layout_marginStart="8dp"
-                    android:text="—"
-                    android:fontFamily="monospace"
-                    android:textColor="@color/text_secondary"
-                    android:textSize="11sp"
-                    android:singleLine="true"
-                    android:ellipsize="middle" />
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
 
-                <ImageView
-                    android:layout_width="16dp"
-                    android:layout_height="16dp"
-                    android:src="@drawable/ic_copy"
-                    android:contentDescription="Copy peer ID"
-                    app:tint="@color/text_tertiary" />
+                    <ImageView
+                        android:layout_width="14dp"
+                        android:layout_height="14dp"
+                        android:src="@drawable/ic_network"
+                        android:importantForAccessibility="no"
+                        app:tint="@color/text_tertiary" />
+
+                    <TextView
+                        android:id="@+id/ipAddressText"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="6dp"
+                        android:text="IP: N/A"
+                        android:fontFamily="monospace"
+                        android:textColor="@color/text_tertiary"
+                        android:textSize="11sp"
+                        android:singleLine="true"
+                        android:ellipsize="end" />
+                </LinearLayout>
 
             </LinearLayout>
 
-            <TextView
-                android:id="@+id/ipAddressText"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                android:text="IP: N/A"
-                android:fontFamily="monospace"
-                android:textColor="@color/text_tertiary"
-                android:textSize="11sp" />
 
             <!-- ===== Zone 2: live counters ===== -->
             <LinearLayout
@@ -230,6 +281,7 @@
 
             </LinearLayout>
 
+
             <!-- ===== Zone 3: primary controls ===== -->
             <LinearLayout
                 android:layout_width="match_parent"
@@ -270,6 +322,7 @@
                 android:layout_marginTop="10dp"
                 android:orientation="horizontal"
                 android:gravity="center_vertical"
+                android:background="?attr/selectableItemBackground"
                 android:paddingVertical="4dp">
 
                 <TextView
@@ -299,6 +352,7 @@
 
             </LinearLayout>
 
+
             <LinearLayout
                 android:id="@+id/advancedPanel"
                 android:layout_width="match_parent"
@@ -313,14 +367,29 @@
                     android:text="TRANSPORT"
                     android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
 
-                <Spinner
-                    android:id="@+id/comms_mode_spinner"
+                <!-- Spinner with a chevron affordance so it reads as a dropdown. -->
+                <FrameLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    android:background="@drawable/bg_stat_tile"
-                    android:paddingHorizontal="10dp"
-                    android:paddingVertical="6dp" />
+                    android:layout_marginTop="4dp">
+
+                    <Spinner
+                        android:id="@+id/comms_mode_spinner"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/bg_spinner"
+                        android:paddingHorizontal="10dp"
+                        android:paddingVertical="8dp" />
+
+                    <ImageView
+                        android:layout_width="16dp"
+                        android:layout_height="16dp"
+                        android:layout_gravity="end|center_vertical"
+                        android:layout_marginEnd="10dp"
+                        android:src="@drawable/ic_chevron_down"
+                        android:importantForAccessibility="no"
+                        app:tint="@color/text_tertiary" />
+                </FrameLayout>
 
                 <TextView
                     android:layout_width="wrap_content"

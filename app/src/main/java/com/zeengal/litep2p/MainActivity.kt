@@ -22,6 +22,9 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import com.zeengal.litep2p.databinding.ActivityMainBinding
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -110,6 +113,22 @@ class MainActivity : AppCompatActivity() {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        // Edge-to-edge: the console surface runs under the system bars, and the root
+        // view pads itself by the status/navigation bar insets so content stays clear.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        ViewCompat.setOnApplyWindowInsetsListener(binding.mainRoot) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            WindowInsetsCompat.CONSUMED
+        }
+
+        // One tap clears the whole console: logs, messages and traces.
+        findViewById<View>(R.id.clearConsoleButton).setOnClickListener {
+            LiteP2PLogger.clear()
+            P2P.clearMessageEvents()
+            Toast.makeText(this, "Console cleared", Toast.LENGTH_SHORT).show()
+        }
 
         // Ensure Android has a real config.json to load (matches desktop behavior).
         // We only install it once; after that it can be replaced via adb (or future UI tooling).

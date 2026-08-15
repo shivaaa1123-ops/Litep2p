@@ -11,10 +11,11 @@
     android:id="@+id/logText"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:paddingHorizontal="12dp"
-    android:paddingVertical="4dp"
+    android:paddingHorizontal="14dp"
+    android:paddingVertical="5dp"
     android:textSize="12sp"
     android:lineSpacingExtra="2dp"
     android:textColor="@color/text_secondary"
     android:textIsSelectable="true"
-    android:fontFamily="monospace" />
+    android:fontFamily="monospace"
+    android:background="?attr/selectableItemBackground" />
