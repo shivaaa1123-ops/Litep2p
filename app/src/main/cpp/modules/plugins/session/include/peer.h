@@ -110,6 +110,12 @@ struct Peer {
     // its public mapping). We keep it separate so we can switch cleanly on reconnect
     // without breaking an otherwise healthy LAN session.
     std::string advertised_network_id;
+
+    // Transport the peer uses to talk to us: "" (unknown), "UDP", "TCP", or "QUIC".
+    // In heterogeneous mode the engine listens on both UDP and TCP, so this records which
+    // transport a peer connected on. Outbound traffic is then routed on the SAME transport
+    // so a peer that uses only one protocol can still talk to us.
+    std::string transport;
     
     // Endpoint candidate set: Multiple paths (LAN, WAN, Relay) that may work for this peer.
     // This enables happy-eyeballs parallel connects and intelligent fallback.

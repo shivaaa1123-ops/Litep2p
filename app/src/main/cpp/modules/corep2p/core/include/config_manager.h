@@ -30,6 +30,14 @@ public:
     int getUDPTimeout() const;
     bool isTCPNoDelayEnabled() const;
     int getTCPConnectTimeout() const;
+
+    // Communication mode: "HOMOGENEOUS" (accept only the default protocol) or
+    // "HETEROGENEOUS" (accept UDP and TCP simultaneously). Read from
+    // `communication.mode`. Homogeneous is the safe default and matches the
+    // historic single-protocol behavior.
+    std::string getCommsMode() const;
+    void setCommsMode(const std::string& mode);
+    void setDefaultProtocol(const std::string& protocol);
     
     // Security
     bool isNoiseNKEnabled() const;

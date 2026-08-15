@@ -10,5 +10,7 @@
     <string-array name="comms_modes_array">
         <item>UDP</item>
         <item>TCP</item>
+        <item>QUIC</item>
+        <item>Heterogeneous</item>
     </string-array>
 </resources>

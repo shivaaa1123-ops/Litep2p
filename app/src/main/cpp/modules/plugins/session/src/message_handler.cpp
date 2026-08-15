@@ -1,6 +1,7 @@
 #include "message_handler.h"
 #include "session_manager_p.h"
 #include "device_utils.h"
+#include "crypto_utils.h"
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "message_types.h"
@@ -493,24 +494,65 @@ namespace detail {
                 }
                 
                 bool cleared_ready_noise = false;
-                // Restart safety: clear READY session if:
-                //  - peer was connected AND (key changed OR boot id changed)
+                // Restart safety: clear the Noise session + derived transport keys when the
+                // remote restarts.
                 if (remote_boot_id != 0 && stored_remote_boot_id != 0 && remote_boot_id != stored_remote_boot_id) {
                     remote_boot_changed = true;
                     LOG_INFO("MH: Peer " + peer_id + " boot id CHANGED - likely process restart (old=" + std::to_string(stored_remote_boot_id) + ", new=" + std::to_string(remote_boot_id) + ")");
                 }
-                if (peer_was_connected && (remote_key_changed || remote_boot_changed) && m_sm->m_secure_session_manager) {
-                    std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
-                    auto existing = m_sm->m_secure_session_manager->get_session(peer_id);
-                    if (existing && existing->is_ready()) {
+                // A changed boot id or a changed static public key is a DEFINITIVE signal that the
+                // remote process restarted, so its previous Noise session and the per-peer transport
+                // keys derived from it are invalid on the remote side. We must drop our copy of that
+                // session and those transport keys regardless of whether we currently consider the
+                // peer connected.
+                //
+                // IMPORTANT: Do NOT gate this on `peer_was_connected`. When the remote goes down we
+                // usually mark it DISCONNECTED *before* it comes back and re-sends CONTROL_CONNECT.
+                // If we skip clearing in that case we keep the stale transport keys, and our
+                // CONTROL_CONNECT_ACK / handshake replies get encrypted with keys the restarted peer
+                // no longer holds, so it can never decrypt them and the reconnect deadlocks
+                // (observed as: peer restarts once and reconnects, but a second restart leaves the
+                // remote peers stuck in CONNECTING forever with "Decryption returned empty").
+                if ((remote_key_changed || remote_boot_changed) && m_sm->m_secure_session_manager) {
+                    bool had_ready_session = false;
+                    {
+                        std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
+                        auto existing = m_sm->m_secure_session_manager->get_session(peer_id);
+                        had_ready_session = (existing && existing->is_ready());
+                        // remove_session() clears the per-peer transport keys registered under
+                        // `peer_id`.
                         m_sm->m_secure_session_manager->remove_session(peer_id);
-                        cleared_ready_noise = true;
                     }
+                    // Transport keys are ALSO registered under the peer's network_id(s) (ip:port),
+                    // because the transports only know ip:port and encrypt with
+                    // encrypt_message_for_peer(network_id, ...). remove_session() only cleared the
+                    // peer-id entry, so the stale network_id keys would still be used for outbound
+                    // traffic to the restarted peer, which no longer holds them -> it can never
+                    // decrypt our CONTROL_CONNECT/heartbeats and the reconnect stays deadlocked.
+                    // Clear the peer's current/advertised network ids and the source of this
+                    // CONTROL_CONNECT.
+                    {
+                        std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                        Peer* peer = m_sm->find_peer_by_id(peer_id);
+                        if (peer) {
+                            if (!peer->network_id.empty()) clear_peer_transport_keys(peer->network_id);
+                            if (!peer->advertised_network_id.empty() &&
+                                peer->advertised_network_id != peer->network_id) {
+                                clear_peer_transport_keys(peer->advertised_network_id);
+                            }
+                        }
+                    }
+                    if (!event.network_id.empty()) {
+                        clear_peer_transport_keys(event.network_id);
+                    }
+                    cleared_ready_noise = true;
+                    LOG_INFO("MH: Cleared Noise session + transport keys for restarted peer " + peer_id +
+                             " (had_ready_session=" + std::string(had_ready_session ? "true" : "false") +
+                             ", peer_was_connected=" + std::string(peer_was_connected ? "true" : "false") +
+                             ", key_changed=" + std::string(remote_key_changed ? "true" : "false") +
+                             ", boot_id_changed=" + std::string(remote_boot_changed ? "true" : "false") + ")");
                 }
                 if (cleared_ready_noise) {
-                    LOG_INFO("MH: Cleared READY Noise session for peer " + peer_id + 
-                             " upon CONTROL_CONNECT (peer_was_connected=true, key_changed=" + std::string(remote_key_changed ? "true" : "false") +
-                             ", boot_id_changed=" + std::string(remote_boot_changed ? "true" : "false") + ")");
                     m_sm->clearQueuedMessages(peer_id);
                     if (m_sm->m_message_batcher) {
                         (void)m_sm->m_message_batcher->flush_peer(peer_id);

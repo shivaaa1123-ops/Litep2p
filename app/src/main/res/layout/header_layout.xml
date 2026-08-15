@@ -1,78 +1,385 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Engine control panel.
+
+    The old header was a flat stack of raw TextViews, a Spinner, two checkboxes and
+    three buttons with no grouping, so engine state was hard to read at a glance.
+    This version splits it into three scannable zones:
+      1. Identity/status row - is it running, who am I, how long
+      2. Stat strip          - live counters for peers and message flow
+      3. Controls            - start/stop plus collapsible advanced options
+-->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:orientation="vertical"
-    android:padding="16dp">
+    android:background="@color/surface_0"
+    android:paddingHorizontal="12dp"
+    android:paddingTop="12dp"
+    android:paddingBottom="8dp">
 
-    <TextView
-        android:id="@+id/ipAddressText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="IP: N/A"
-        android:textSize="16sp" />
-
-    <TextView
-        android:id="@+id/statusText"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Idle"
-        android:textSize="16sp" />
-        
-    <Spinner
-        android:id="@+id/comms_mode_spinner"
+    <com.google.android.material.card.MaterialCardView
+        style="@style/Widget.LiteP2P.Card"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"/>
+        android:layout_height="wrap_content">
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:orientation="horizontal">
-
-        <CheckBox
-            android:id="@+id/proxyGatewayCheck"
-            android:layout_width="0dp"
+        <LinearLayout
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:checked="true"
-            android:text="Proxy Gateway"
-            android:textSize="12sp"
-            android:singleLine="true"
-            android:ellipsize="end" />
+            android:orientation="vertical"
+            android:padding="14dp">
 
-        <CheckBox
-            android:id="@+id/proxyClientCheck"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Proxy Client"
-            android:textSize="12sp"
-            android:singleLine="true"
-            android:ellipsize="end" />
+            <!-- ===== Zone 1: status + identity ===== -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
 
-    </LinearLayout>
+                <View
+                    android:id="@+id/statusDot"
+                    android:layout_width="10dp"
+                    android:layout_height="10dp"
+                    android:background="@drawable/bg_status_dot" />
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal">
+                <TextView
+                    android:id="@+id/statusText"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="8dp"
+                    android:text="Idle"
+                    android:textColor="@color/text_primary"
+                    android:textSize="16sp"
+                    android:fontFamily="sans-serif-medium"
+                    android:singleLine="true"
+                    android:ellipsize="end" />
 
-        <Button
-            android:id="@+id/startButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Start" />
+                <TextView
+                    android:id="@+id/uptimeText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="--:--:--"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/text_tertiary"
+                    android:textSize="12sp" />
 
-        <Button
-            android:id="@+id/stopButton"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Stop" />
+            </LinearLayout>
 
-    </LinearLayout>
+            <!-- Tap to copy: peer IDs are long strings that are painful to retype into
+                 a desktop test client. -->
+            <LinearLayout
+                android:id="@+id/peerIdRow"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:background="@drawable/bg_stat_tile"
+                android:padding="8dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="ID"
+                    android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                <TextView
+                    android:id="@+id/peerIdText"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="8dp"
+                    android:text="—"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="11sp"
+                    android:singleLine="true"
+                    android:ellipsize="middle" />
+
+                <ImageView
+                    android:layout_width="16dp"
+                    android:layout_height="16dp"
+                    android:src="@drawable/ic_copy"
+                    android:contentDescription="Copy peer ID"
+                    app:tint="@color/text_tertiary" />
+
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/ipAddressText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="IP: N/A"
+                android:fontFamily="monospace"
+                android:textColor="@color/text_tertiary"
+                android:textSize="11sp" />
+
+            <!-- ===== Zone 2: live counters ===== -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal"
+                android:baselineAligned="false">
+
+                <LinearLayout
+                    android:id="@+id/statPeers"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:gravity="center"
+                    android:background="@drawable/bg_stat_tile"
+                    android:paddingVertical="8dp">
+
+                    <TextView
+                        android:id="@+id/statPeersValue"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.StatValue" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="PEERS"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="6dp"
+                    android:orientation="vertical"
+                    android:gravity="center"
+                    android:background="@drawable/bg_stat_tile"
+                    android:paddingVertical="8dp">
+
+                    <TextView
+                        android:id="@+id/statReadyValue"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0"
+                        android:textColor="@color/status_ok"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.StatValue" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="READY"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="6dp"
+                    android:orientation="vertical"
+                    android:gravity="center"
+                    android:background="@drawable/bg_stat_tile"
+                    android:paddingVertical="8dp">
+
+                    <TextView
+                        android:id="@+id/statInValue"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0"
+                        android:textColor="@color/msg_in"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.StatValue" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="IN"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                </LinearLayout>
+
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="6dp"
+                    android:orientation="vertical"
+                    android:gravity="center"
+                    android:background="@drawable/bg_stat_tile"
+                    android:paddingVertical="8dp">
+
+                    <TextView
+                        android:id="@+id/statOutValue"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="0"
+                        android:textColor="@color/msg_out"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.StatValue" />
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="OUT"
+                        android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                </LinearLayout>
+
+            </LinearLayout>
+
+            <!-- ===== Zone 3: primary controls ===== -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/startButton"
+                    style="@style/Widget.LiteP2P.Button.Primary"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Start"
+                    app:icon="@drawable/ic_play"
+                    app:iconGravity="textStart" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/stopButton"
+                    style="@style/Widget.LiteP2P.Button.Stop"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:layout_marginStart="8dp"
+                    android:enabled="false"
+                    android:text="Stop"
+                    app:icon="@drawable/ic_stop"
+                    app:iconGravity="textStart" />
+
+            </LinearLayout>
+
+            <!-- Advanced options collapse by default: they are set once per test run,
+                 while start/stop and the counters are looked at constantly. -->
+            <LinearLayout
+                android:id="@+id/advancedToggle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="10dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingVertical="4dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="ADVANCED"
+                    android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                <TextView
+                    android:id="@+id/advancedSummary"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginEnd="6dp"
+                    android:text="UDP"
+                    android:fontFamily="monospace"
+                    android:textColor="@color/text_tertiary"
+                    android:textSize="11sp" />
+
+                <ImageView
+                    android:id="@+id/advancedChevron"
+                    android:layout_width="18dp"
+                    android:layout_height="18dp"
+                    android:src="@drawable/ic_chevron_down"
+                    android:contentDescription="Toggle advanced options"
+                    app:tint="@color/text_tertiary" />
+
+            </LinearLayout>
+
+            <LinearLayout
+                android:id="@+id/advancedPanel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="TRANSPORT"
+                    android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                <Spinner
+                    android:id="@+id/comms_mode_spinner"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:background="@drawable/bg_stat_tile"
+                    android:paddingHorizontal="10dp"
+                    android:paddingVertical="6dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="PROXY ROLES"
+                    android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                <com.google.android.material.chip.ChipGroup
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    app:singleSelection="false"
+                    app:chipSpacingHorizontal="6dp">
+
+                    <!-- Gateway relays other peers' traffic, so it stays off by default. -->
+                    <com.google.android.material.chip.Chip
+                        android:id="@+id/proxyGatewayCheck"
+                        style="@style/Widget.LiteP2P.Chip"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Gateway"
+                        android:checked="false" />
+
+                    <com.google.android.material.chip.Chip
+                        android:id="@+id/proxyClientCheck"
+                        style="@style/Widget.LiteP2P.Chip"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Client"
+                        android:checked="true" />
+
+                </com.google.android.material.chip.ChipGroup>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:text="BACKGROUND"
+                    android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+                <!--
+                    Doze / App Standby can defer network access while the device is idle,
+                    which delays or drops incoming messages even with a foreground service.
+                -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/batteryExemptionButton"
+                    style="@style/Widget.LiteP2P.Button.Outlined"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="Allow background battery use"
+                    app:icon="@drawable/ic_bolt"
+                    app:iconGravity="textStart" />
+
+            </LinearLayout>
+
+        </LinearLayout>
+
+    </com.google.android.material.card.MaterialCardView>
 
 </LinearLayout>

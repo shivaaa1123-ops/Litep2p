@@ -4,10 +4,57 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical">
+    android:orientation="vertical"
+    android:background="@color/surface_0">
 
     <!-- Include the header with IP and status -->
     <include layout="@layout/header_layout" />
+
+    <!--
+        Collapsible peers section.
+
+        The peers list and the log stream compete for a small screen. Giving peers a
+        header that reports its own count means the list can be collapsed when the user
+        is reading logs, without losing sight of how many peers are connected.
+    -->
+    <LinearLayout
+        android:id="@+id/peersSectionHeader"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="?attr/selectableItemBackground"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="10dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Peers"
+            android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+        <TextView
+            android:id="@+id/peersCountBadge"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:text="none discovered"
+            android:textColor="@color/text_tertiary"
+            android:textSize="11sp"
+            android:singleLine="true"
+            android:ellipsize="end" />
+
+        <ImageView
+            android:id="@+id/peersChevron"
+            android:layout_width="18dp"
+            android:layout_height="18dp"
+            android:src="@drawable/ic_chevron_down"
+            android:rotation="180"
+            android:contentDescription="Toggle peers list"
+            app:tint="@color/text_tertiary" />
+
+    </LinearLayout>
 
     <!-- Container for the HomeFragment (Peers List) -->
     <FrameLayout

@@ -475,9 +475,38 @@ namespace detail {
                                                                  prior_state == PeerState::CONNECTING);
                                 
                                 if (peer_is_recovering) {
-                                    // Peer was disconnected - LAN endpoint likely stale, switch to WAN
-                                    LOG_INFO("SM: Peer " + event.peerId + " was DISCONNECTED/DEGRADED/CONNECTING, switching to new WAN endpoint: " +
-                                             existing_peer->network_id + " -> " + event.networkId);
+                                    // Same-NAT guard: if the advertised WAN endpoint's IP is our OWN
+                                    // public IP, the two peers are behind the same router. Hairpinning
+                                    // out to our own public IP then back is pointless for a LAN peer and,
+                                    // worse, every CONNECTING->WAN switch re-runs the Noise handshake and
+                                    // re-keys the session. Because the peer state is DISCONNECTED/DEGRADED/
+                                    // CONNECTING, the next signaling update triggers this switch again ->
+                                    // an endless reconnect+re-key storm that makes application messages
+                                    // fail with "auth tag mismatch" (message encrypted on session gen N,
+                                    // decrypted after a re-key on gen N+1). For same-NAT peers, keep the
+                                    // (reachable) LAN endpoint instead.
+                                    bool same_nat_wan = false;
+                                    std::string my_public;
+                                    {
+                                        auto wan_ep = parseNetworkId(event.networkId);
+                                        std::lock_guard<std::mutex> lock(m_sm->m_signaling_update_mutex);
+                                        my_public = m_sm->m_pending_signaling_network_id;
+                                        auto my_ep = parseNetworkId(my_public);
+                                        if (!wan_ep.ip.empty() && !my_ep.ip.empty() && wan_ep.ip == my_ep.ip) {
+                                            same_nat_wan = true;
+                                        }
+                                    }
+
+                                    if (same_nat_wan) {
+                                        LOG_INFO("SM: Peer " + event.peerId +
+                                                 " advertised WAN endpoint " + event.networkId +
+                                                 " equals our own public IP (" + my_public +
+                                                 "); same-NAT, keeping LAN endpoint to avoid re-key storm");
+                                        m_sm->add_peer_to_network_index_locked_(event.peerId, event.networkId);
+                                    } else {
+                                        // Peer was disconnected - LAN endpoint likely stale, switch to WAN
+                                        LOG_INFO("SM: Peer " + event.peerId + " was DISCONNECTED/DEGRADED/CONNECTING, switching to new WAN endpoint: " +
+                                                 existing_peer->network_id + " -> " + event.networkId);
                                     
                                     // Check for collisions
                                     auto collision_it = m_sm->m_network_id_to_peer_id.find(event.networkId);
@@ -502,6 +531,7 @@ namespace detail {
                                         should_trigger_connect = true;
                                     }
                                     PeerReconnectPolicy::getInstance().reset_peer_stats(event.peerId);
+                                }
                                 } else {
                                     // Peer is READY or has stable connection - keep LAN endpoint
                                     // Do NOT replace it with a public (WAN) endpoint from signaling; doing so can
@@ -1280,8 +1310,11 @@ namespace detail {
         
         bool connection_success = false;
         
-        // Defer the actual connection logic to the appropriate connection manager
-        if (m_sm->m_comms_mode == "TCP") {
+        // Defer the actual connection logic to the appropriate connection manager.
+        // Homogeneous mode always uses the single configured protocol; heterogeneous
+        // mode uses the transport the peer connected on (or UDP for unknown peers).
+        const std::string transport = m_sm->outbound_transport_for_peer(event.peerId);
+        if (transport == "TCP") {
             connection_success = m_sm->m_tcpConnectionManager->connectToPeer(endpoint.ip, endpoint.port);
         } else {
             // Handle UDP/QUIC connection

@@ -616,6 +616,15 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
     m_comms_mode = comms_mode;
     m_localPeerId = peer_id;
 
+    // Read the communication mode (homogeneous/heterogeneous) from the effective config.
+    // In heterogeneous mode the engine listens on and accepts BOTH UDP and TCP.
+    m_comms_heterogeneous = (ConfigManager::getInstance().getCommsMode() == "HETEROGENEOUS");
+    if (m_comms_heterogeneous) {
+        LOG_INFO("SM: Communication mode = HETEROGENEOUS (accept UDP + TCP connections)");
+    } else {
+        LOG_INFO("SM: Communication mode = HOMOGENEOUS (only " + m_comms_mode + " connections)");
+    }
+
     // stop() clears NATTraversal's connection manager pointer. Re-register on every start so
     // bound-socket STUN probing and hole punching remain functional across engine restarts.
     ensure_nat_connection_manager_registered_();
@@ -774,12 +783,17 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
         }
         
         // Start UDP in event-loop mode (no listener thread)
-        if (comms_mode != "TCP") {
+        // Start UDP in event-loop mode (no listener thread). In heterogeneous mode we
+        // start UDP regardless of the primary protocol, then also open the TCP listener.
+        if (comms_mode != "TCP" || m_comms_heterogeneous) {
             // Cast to concrete type to access event-loop methods
             single_thread_udp_mgr = dynamic_cast<UdpConnectionManager*>(m_udpConnectionManager.get());
             if (single_thread_udp_mgr) {
                 single_thread_udp_mgr->startServerEventLoop(port,
-                    [this](const std::string& id, const std::string& data) { onData(id, data); },
+                    [this](const std::string& id, const std::string& data) {
+                        note_inbound_transport(id, "UDP");
+                        onData(id, data);
+                    },
                     [this](const std::string& id) { onDisconnect(id); });
                 single_thread_udp_fd = single_thread_udp_mgr->getSocketFd();
                 LOG_INFO("SM: UDP started in event-loop mode, fd=" + std::to_string(single_thread_udp_fd));
@@ -787,8 +801,22 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
         } else {
             // TCP not supported in single-thread mode yet
             m_tcpConnectionManager->startServer(port, 
-                [this](const std::string& id, const std::string& data) { onData(id, data); },
+                [this](const std::string& id, const std::string& data) {
+                    note_inbound_transport(id, "TCP");
+                    onData(id, data);
+                },
                 [this](const std::string& id) { onDisconnect(id); });
+        }
+
+        // Heterogeneous mode: also accept TCP connections alongside the UDP socket.
+        if (m_comms_heterogeneous) {
+            m_tcpConnectionManager->startServer(port,
+                [this](const std::string& id, const std::string& data) {
+                    note_inbound_transport(id, "TCP");
+                    onData(id, data);
+                },
+                [this](const std::string& id) { onDisconnect(id); });
+            LOG_INFO("SM: TCP listener started additionally (heterogeneous mode)");
         }
         
         // Do NAT detection synchronously at startup (no thread)
@@ -861,24 +889,44 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
         // ================================================================
         
         discovery->start(port, peer_id);
-        
+
+        // Per-transport inbound data callbacks. In heterogeneous mode both UDP and
+        // TCP listeners feed the same message pipeline, so we first record which
+        // transport each peer came in on (Peer::transport) to route replies back on
+        // the same protocol.
+        auto udp_on_data = [this](const std::string& id, const std::string& data) {
+            note_inbound_transport(id, "UDP");
+            onData(id, data);
+        };
+        auto tcp_on_data = [this](const std::string& id, const std::string& data) {
+            note_inbound_transport(id, "TCP");
+            onData(id, data);
+        };
+        auto on_disc = [this](const std::string& id) { onDisconnect(id); };
+        const bool comms_hetero = m_comms_heterogeneous;
+
         if (comms_mode == "TCP") {
-            m_tcpConnectionManager->startServer(port, 
-                [this](const std::string& id, const std::string& data) { onData(id, data); },
-                [this](const std::string& id) { onDisconnect(id); });
+            if (comms_hetero) {
+                // Heterogeneous: accept TCP and UDP connections.
+                m_tcpConnectionManager->startServer(port, tcp_on_data, on_disc);
+                m_udpConnectionManager->startServer(port, udp_on_data, on_disc);
+            } else {
+                // Homogeneous TCP: only accept TCP connections.
+                m_tcpConnectionManager->startServer(port, tcp_on_data, on_disc);
+            }
         } else if (comms_mode == "QUIC") {
             LOG_INFO("SM: Switching to QUIC protocol");
             NATTraversal::getInstance().setConnectionManager(nullptr);
             auto ptr = std::make_unique<QuicConnectionManager>();
             m_udpConnectionManager = std::move(ptr);
             NATTraversal::getInstance().setConnectionManager(m_udpConnectionManager.get());
-            m_udpConnectionManager->startServer(port,
-                [this](const std::string& id, const std::string& data) { onData(id, data); },
-                [this](const std::string& id) { onDisconnect(id); });
+            m_udpConnectionManager->startServer(port, udp_on_data, on_disc);
         } else {
-            m_udpConnectionManager->startServer(port,
-                [this](const std::string& id, const std::string& data) { onData(id, data); },
-                [this](const std::string& id) { onDisconnect(id); });
+            // UDP (homogeneous UDP, or the UDP half of heterogeneous mode).
+            m_udpConnectionManager->startServer(port, udp_on_data, on_disc);
+            if (comms_hetero) {
+                m_tcpConnectionManager->startServer(port, tcp_on_data, on_disc);
+            }
         }
 
         // NAT detection in separate thread (multi-threaded mode)
@@ -1469,12 +1517,25 @@ void SessionManager::Impl::stop() {
         // Even in TCP mode we construct a UDP manager (used for NAT/STUN and UDP sessions).
         // Ensure NATTraversal never holds a dangling raw pointer across SessionManager lifetimes.
         NATTraversal::getInstance().setConnectionManager(nullptr);
+
+        // Heterogeneous mode started a UDP listener too; tear it down as well.
+        if (m_comms_heterogeneous) {
+            m_udpConnectionManager->stop();
+            NATTraversal::getInstance().shutdown();
+            LOG_INFO("SM: UDP connection manager stopped (heterogeneous mode teardown).");
+        }
     } else {
         LOG_INFO("SM: Stopping UDP connection manager...");
         NATTraversal::getInstance().setConnectionManager(nullptr);
         m_udpConnectionManager->stop();
         NATTraversal::getInstance().shutdown();
         LOG_INFO("SM: UDP connection manager stopped.");
+
+        // Heterogeneous mode started a TCP listener too; tear it down as well.
+        if (m_comms_heterogeneous) {
+            m_tcpConnectionManager->stop();
+            LOG_INFO("SM: TCP connection manager stopped (heterogeneous mode teardown).");
+        }
     }
 
     log_phase_ms("stop_network_io", phase);
@@ -1975,10 +2036,24 @@ void SessionManager::Impl::sendNoiseHandshakeMessage(const std::string& peer_id,
     const std::string encoded = wire::encode_message(MessageType::HANDSHAKE_NOISE, handshake_payload);
     send_message_to_peer(network_id, encoded);
     
-    // SIGNALING RELAY FALLBACK: Also relay handshake via signaling for AP isolation scenarios
-    // This ensures handshakes can complete even when direct UDP is blocked
-    // AP isolation commonly blocks device-to-device traffic on WiFi networks
-    if (m_signaling_client && m_signaling_registered.load(std::memory_order_acquire)) {
+    // SIGNALING RELAY FALLBACK: Also relay handshake via signaling for AP isolation scenarios.
+    // This ensures handshakes can complete even when direct UDP is blocked on WiFi networks.
+    // IMPORTANT: Only relay when the direct destination is NOT a private/LAN endpoint.
+    // On the same LAN, direct UDP already delivers the handshake; duplicating it over the
+    // signaling relay makes the responder process the handshake twice back-to-back. The
+    // second (relayed) handshake generates a NEW ephemeral and re-keys the session on the
+    // responder while the initiator keeps the first key set -> one-sided re-key -> every
+    // subsequent application message fails with "auth tag mismatch".
+    {
+        std::string hs_ip;
+        uint16_t hs_port = 0;
+        bool hs_parsed = parse_network_id(network_id, hs_ip, hs_port);
+        // Minimal RFC-1918 private-IPv4 check (10/8, 172.16/12, 192.168/16).
+        const bool hs_is_lan = hs_parsed && (
+            hs_ip.rfind("10.", 0) == 0 ||
+            hs_ip.rfind("192.168.", 0) == 0 ||
+            hs_ip.rfind("172.", 0) == 0);
+        if (!hs_is_lan && m_signaling_client && m_signaling_registered.load(std::memory_order_acquire)) {
         // Base64 encode the handshake payload for signaling transport
         auto base64_encode = [](const std::string& data) -> std::string {
             static const char* base64_chars = 
@@ -2013,6 +2088,7 @@ void SessionManager::Impl::sendNoiseHandshakeMessage(const std::string& peer_id,
         } catch (...) {
             LOG_WARN("SM: Failed to relay handshake via signaling to " + peer_id);
         }
+    }
     }
 }
 
@@ -3257,6 +3333,32 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
                 old_network_id_for_change_detection != network_id &&
                 is_connectable_ipv4_endpoint(network_id)) {
                 
+                // Same-NAT guard: when two peers share one router, the signaling
+                // server periodically advertises the peer's STUN-discovered PUBLIC
+                // endpoint, which equals OUR OWN public IP. Treating that as an
+                // "endpoint change" and forcing a reconnect tears down a perfectly
+                // healthy LAN/READY session and re-keys Noise on one side only
+                // ("auth tag mismatch"), causing endless connect churn (observed in
+                // the rugged soak: READY -> DISCONNECT_DETECTED -> CONNECTING -> ...).
+                // Keep the working LAN connection; the secondary receive mapping
+                // added above already accepts packets from the advertised WAN endpoint.
+                bool same_nat_advertised = false;
+                {
+                    std::string adv_ip, our_ip;
+                    uint16_t adv_port = 0, our_port = 0;
+                    bool adv_ok = parse_network_id(network_id, adv_ip, adv_port);
+                    std::lock_guard<std::mutex> lock(m_signaling_update_mutex);
+                    bool our_ok = parse_network_id(m_pending_signaling_network_id, our_ip, our_port);
+                    same_nat_advertised = adv_ok && our_ok && !adv_ip.empty() && adv_ip == our_ip;
+                }
+
+                if (same_nat_advertised) {
+                    LOG_INFO("SM: PEER_UPDATED: peer " + pid + " advertised endpoint " + network_id +
+                             " equals our own public IP; same-NAT, keeping existing connection (old=" +
+                             old_network_id_for_change_detection + ")");
+                    return;
+                }
+
                 LOG_INFO("SM: PEER_UPDATED: Peer " + pid + " endpoint changed from " + 
                          old_network_id_for_change_detection + " to " + network_id + " - forcing immediate reconnect");
                 
@@ -4412,11 +4514,66 @@ void SessionManager::Impl::send_message_to_peer(const std::string& network_id, c
         }
     }
     
-    if (m_comms_mode == "TCP") {
+    // Choose the outbound transport. Homogeneous mode always uses the single
+    // configured protocol. Heterogeneous mode replies on the same transport the
+    // peer used to reach us (Peer::transport), falling back to UDP for peers we
+    // have not heard from (e.g., an outbound connect to a just-discovered peer).
+    // The peers lookup acquires m_peers_mutex separately (not nested with
+    // m_network_index_mutex above) to preserve lock ordering.
+    std::string transport = (m_comms_mode == "TCP") ? "TCP" : "UDP";
+    if (m_comms_heterogeneous) {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        Peer* peer = find_peer_by_network_id_locked_(network_id);
+        if (peer && (peer->transport == "TCP" || peer->transport == "UDP")) {
+            transport = peer->transport;
+        }
+    }
+
+    if (transport == "TCP") {
         m_tcpConnectionManager->sendMessageToPeer(actual_network_id, message);
     } else {
         m_udpConnectionManager->sendMessageToPeer(actual_network_id, message);
     }
+}
+
+// Implements the mode helpers declared in session_manager_p.h.
+void SessionManager::Impl::note_inbound_transport(const std::string& network_id, const std::string& transport) {
+    std::lock_guard<std::mutex> lock(m_peers_mutex);
+    Peer* peer = find_peer_by_network_id_locked_(network_id);
+    if (!peer) {
+        // Fallback: incoming connections may arrive on an ephemeral port, so match
+        // by IP when the full network_id is not yet indexed.
+        size_t colon = network_id.find(':');
+        if (colon != std::string::npos) {
+            const std::string ip = network_id.substr(0, colon);
+            for (auto& kv : m_peers) {
+                const std::string id_net = kv.second.network_id;
+                const std::string id_adv = kv.second.advertised_network_id;
+                if (id_net.rfind(ip + ":", 0) == 0 || id_adv.rfind(ip + ":", 0) == 0) {
+                    peer = &kv.second;
+                    break;
+                }
+            }
+        }
+    }
+    if (peer) {
+        peer->transport = transport;
+    }
+}
+
+std::string SessionManager::Impl::outbound_transport_for_peer(const std::string& peer_id) const {
+    if (!m_comms_heterogeneous) {
+        return (m_comms_mode == "TCP") ? "TCP" : "UDP";
+    }
+    std::lock_guard<std::mutex> lock(m_peers_mutex);
+    auto it = m_peers.find(peer_id);
+    if (it != m_peers.end()) {
+        const std::string& t = it->second.transport;
+        if (t == "TCP" || t == "UDP" || t == "QUIC") {
+            return t;
+        }
+    }
+    return "UDP";
 }
 
 Peer* SessionManager::Impl::find_peer_by_id(const std::string& peer_id) {

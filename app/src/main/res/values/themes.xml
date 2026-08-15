@@ -22,4 +22,80 @@
     <style name="Theme.MyApplication.AppBarOverlay" parent="ThemeOverlay.AppCompat.Dark.ActionBar" />
 
     <style name="Theme.MyApplication.PopupOverlay" parent="ThemeOverlay.AppCompat.Light" />
+
+    <!--
+        LiteP2P component styles.
+
+        Centralised so the console look stays consistent: every card, button and label
+        in the app pulls from here rather than repeating colours and corner radii in
+        each layout.
+    -->
+
+    <style name="Widget.LiteP2P.Card" parent="Widget.MaterialComponents.CardView">
+        <item name="cardBackgroundColor">@color/surface_1</item>
+        <item name="cardCornerRadius">14dp</item>
+        <item name="cardElevation">0dp</item>
+        <item name="strokeColor">@color/stroke</item>
+        <item name="strokeWidth">1dp</item>
+    </style>
+
+    <!-- Label: small, uppercase, low contrast. Used for field captions and stat names. -->
+    <style name="TextAppearance.LiteP2P.Label" parent="TextAppearance.MaterialComponents.Caption">
+        <item name="android:textColor">@color/text_tertiary</item>
+        <item name="android:textSize">10sp</item>
+        <item name="android:textAllCaps">true</item>
+        <item name="android:letterSpacing">0.08</item>
+        <item name="android:fontFamily">sans-serif-medium</item>
+    </style>
+
+    <!-- Stat value: the large number in a stat tile. Monospace so digits don't jitter. -->
+    <style name="TextAppearance.LiteP2P.StatValue" parent="TextAppearance.MaterialComponents.Headline6">
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textSize">18sp</item>
+        <item name="android:fontFamily">monospace</item>
+    </style>
+
+    <style name="Widget.LiteP2P.Button" parent="Widget.MaterialComponents.Button">
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="cornerRadius">10dp</item>
+        <item name="elevation">0dp</item>
+    </style>
+
+    <!--
+        Start button. Uses ColorStateList selectors rather than a flat colour so the
+        disabled state is visually obvious; previously a disabled Start looked
+        identical to an enabled one, which made it easy to tap during startup.
+    -->
+    <style name="Widget.LiteP2P.Button.Primary" parent="Widget.LiteP2P.Button">
+        <item name="backgroundTint">@color/btn_primary_bg</item>
+        <item name="android:textColor">@color/btn_primary_text</item>
+        <item name="iconTint">@color/btn_primary_text</item>
+    </style>
+
+    <style name="Widget.LiteP2P.Button.Stop" parent="Widget.LiteP2P.Button">
+        <item name="backgroundTint">@color/btn_stop_bg</item>
+        <item name="android:textColor">@color/btn_stop_text</item>
+        <item name="iconTint">@color/btn_stop_text</item>
+    </style>
+
+    <style name="Widget.LiteP2P.Button.Outlined" parent="Widget.MaterialComponents.Button.OutlinedButton">
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="cornerRadius">10dp</item>
+        <item name="strokeColor">@color/stroke</item>
+        <item name="android:textColor">@color/text_secondary</item>
+        <item name="iconTint">@color/text_secondary</item>
+    </style>
+
+    <style name="Widget.LiteP2P.Chip" parent="Widget.MaterialComponents.Chip.Filter">
+        <item name="chipBackgroundColor">@color/chip_bg</item>
+        <item name="android:textColor">@color/chip_text</item>
+        <item name="chipStrokeColor">@color/stroke</item>
+        <item name="chipStrokeWidth">1dp</item>
+        <item name="chipCornerRadius">8dp</item>
+        <item name="android:textSize">12sp</item>
+    </style>
 </resources>

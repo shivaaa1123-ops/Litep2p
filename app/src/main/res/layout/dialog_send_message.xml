@@ -1,14 +1,109 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+    Send-message dialog: a text field, a repeat count, and quick presets so a peer
+    can be exercised (ping, 1KB, 64KB, 256KB) without typing.
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
-    android:layout_height="wrap_content"
-    android:orientation="vertical"
-    android:padding="24dp">
+    android:layout_height="wrap_content">
 
-    <EditText
-        android:id="@+id/messageEditText"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:hint="Enter your message" />
+        android:orientation="vertical"
+        android:padding="20dp">
 
-</LinearLayout>
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Message"
+            app:boxBackgroundMode="outline">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/messageEditText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="textMultiLine"
+                android:minLines="2"
+                android:gravity="top"
+                android:importantForAutofill="no" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Repeat"
+                android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+            <com.google.android.material.textfield.TextInputLayout
+                android:layout_width="80dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="12dp"
+                android:hint="1"
+                app:boxBackgroundMode="outline">
+
+                <com.google.android.material.textfield.TextInputEditText
+                    android:id="@+id/repeatEditText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:inputType="number"
+                    android:maxLength="5"
+                    android:text="1"
+                    android:importantForAutofill="no" />
+            </com.google.android.material.textfield.TextInputLayout>
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="PRESETS"
+            android:textAppearance="@style/TextAppearance.LiteP2P.Label" />
+
+        <com.google.android.material.chip.ChipGroup
+            android:id="@+id/presetChips"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="6dp"
+            app:singleLine="false"
+            app:chipSpacingHorizontal="6dp">
+
+            <com.google.android.material.chip.Chip
+                android:id="@+id/presetPing"
+                style="@style/Widget.LiteP2P.Chip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="ping" />
+
+            <com.google.android.material.chip.Chip
+                android:id="@+id/preset1k"
+                style="@style/Widget.LiteP2P.Chip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="1 KB" />
+
+            <com.google.android.material.chip.Chip
+                android:id="@+id/preset64k"
+                style="@style/Widget.LiteP2P.Chip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="64 KB" />
+
+            <com.google.android.material.chip.Chip
+                android:id="@+id/preset256k"
+                style="@style/Widget.LiteP2P.Chip"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="256 KB" />
+        </com.google.android.material.chip.ChipGroup>
+
+    </LinearLayout>
+</ScrollView>

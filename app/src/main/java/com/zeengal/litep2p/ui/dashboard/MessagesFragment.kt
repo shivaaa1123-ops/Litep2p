@@ -10,11 +10,13 @@ import android.widget.TextView
 import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.zeengal.litep2p.MessageTraceStore
 import com.zeengal.litep2p.hook.P2P
 
 class MessagesFragment : Fragment() {
 
     private lateinit var adapter: MessageEventsAdapter
+    private var latestEvents: List<P2P.MessageEvent> = emptyList()
 
     override fun onCreateView(
         inflater: LayoutInflater,
@@ -59,7 +61,16 @@ class MessagesFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
 
         P2P.messageEvents.observe(viewLifecycleOwner) { events ->
+            latestEvents = events
             adapter.submit(events)
+        }
+
+        // Re-render whenever a message's delivery state changes (ACK received,
+        // failure detected, retry, etc.) so row colours track the live status.
+        MessageTraceStore.traceUpdates.observe(viewLifecycleOwner) {
+            if (latestEvents.isNotEmpty()) {
+                adapter.submit(latestEvents)
+            }
         }
     }
 

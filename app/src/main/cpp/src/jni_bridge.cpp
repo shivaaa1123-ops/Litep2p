@@ -60,6 +60,75 @@ std::string jstring_to_utf8(JNIEnv* env, jstring s) {
     return out;
 }
 
+// ------------------------------------------------------------------
+// Android app-private files directory.
+//
+// The native engine needs a writable files dir (config.json location,
+// Noise keystore, peer DB). The old code tried to derive it by calling
+// getFilesDir() on whatever *object* the engine was started with. The
+// engine is now started from LiteP2PService through the plain
+// `EngineNative` object (no Context), so getFilesDir() on it throws
+// NoSuchMethodError; the pending exception was never cleared and the
+// next JNI call killed the process. Instead the service now supplies
+// the real path explicitly via nativeSetFilesDir().
+// ------------------------------------------------------------------
+static std::mutex g_android_files_dir_mutex;
+static std::string g_android_files_dir;
+
+// Returns the app-private files dir. Prefers the value supplied by
+// LiteP2PService via nativeSetFilesDir(); falls back to getFilesDir()
+// on `thiz` only if present. Every potentially-throwing JNI call is
+// followed by ExceptionClear() so a non-Context object can never leave
+// a pending exception that crashes the next JNI call.
+std::string android_files_dir(JNIEnv* env, jobject thiz) {
+    if (env) {
+        {
+            std::lock_guard<std::mutex> lock(g_android_files_dir_mutex);
+            if (!g_android_files_dir.empty()) return g_android_files_dir;
+        }
+        if (thiz) {
+            jclass cls = env->GetObjectClass(thiz);
+            if (cls) {
+                jmethodID mid = env->GetMethodID(cls, "getFilesDir", "()Ljava/io/File;");
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (mid) {
+                    jobject file = env->CallObjectMethod(thiz, mid);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionClear();
+                    } else if (file) {
+                        jclass fcls = env->GetObjectClass(file);
+                        if (fcls) {
+                            jmethodID midAbs = env->GetMethodID(fcls, "getAbsolutePath", "()Ljava/lang/String;");
+                            if (env->ExceptionCheck()) env->ExceptionClear();
+                            if (midAbs) {
+                                jstring s = static_cast<jstring>(env->CallObjectMethod(file, midAbs));
+                                if (env->ExceptionCheck()) {
+                                    env->ExceptionClear();
+                                } else if (s) {
+                                    std::string r = jstring_to_utf8(env, s);
+                                    env->DeleteLocalRef(s);
+                                    env->DeleteLocalRef(fcls);
+                                    env->DeleteLocalRef(file);
+                                    env->DeleteLocalRef(cls);
+                                    if (!r.empty()) {
+                                        std::lock_guard<std::mutex> lock(g_android_files_dir_mutex);
+                                        g_android_files_dir = r;
+                                    }
+                                    return r;
+                                }
+                            }
+                            env->DeleteLocalRef(fcls);
+                        }
+                        env->DeleteLocalRef(file);
+                    }
+                }
+                env->DeleteLocalRef(cls);
+            }
+        }
+    }
+    return {};
+}
+
 void maybe_configure_peer_db_path_from_files_dir(JNIEnv* env, jobject activity) {
     if (!env || !activity) return;
 
@@ -67,58 +136,12 @@ void maybe_configure_peer_db_path_from_files_dir(JNIEnv* env, jobject activity) 
     if (!cfg.isPeerDbEnabled()) return;
     if (!cfg.getPeerDbPath().empty()) return;
 
-    jclass activity_cls = env->GetObjectClass(activity);
-    if (!activity_cls) return;
-
-    jmethodID mid_get_files_dir = env->GetMethodID(activity_cls, "getFilesDir", "()Ljava/io/File;");
-    if (!mid_get_files_dir) {
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jobject files_dir_file = env->CallObjectMethod(activity, mid_get_files_dir);
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-
-    if (!files_dir_file) {
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jclass file_cls = env->GetObjectClass(files_dir_file);
-    if (!file_cls) {
-        env->DeleteLocalRef(files_dir_file);
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jmethodID mid_get_abs_path = env->GetMethodID(file_cls, "getAbsolutePath", "()Ljava/lang/String;");
-    if (!mid_get_abs_path) {
-        env->DeleteLocalRef(file_cls);
-        env->DeleteLocalRef(files_dir_file);
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jstring dir_str = static_cast<jstring>(env->CallObjectMethod(files_dir_file, mid_get_abs_path));
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-
-    const std::string dir = jstring_to_utf8(env, dir_str);
+    const std::string dir = android_files_dir(env, activity);
     if (!dir.empty()) {
         const std::string db_path = dir + "/litep2p_peers.sqlite";
         cfg.setValueAtPath({"storage", "peer_db", "path"}, db_path);
         nativeLog("NATIVE: Peer DB path set to " + db_path);
     }
-
-    if (dir_str) env->DeleteLocalRef(dir_str);
-    env->DeleteLocalRef(file_cls);
-    env->DeleteLocalRef(files_dir_file);
-    env->DeleteLocalRef(activity_cls);
 }
 
 void maybe_configure_noise_keystore_path_from_files_dir(JNIEnv* env, jobject activity) {
@@ -135,58 +158,12 @@ void maybe_configure_noise_keystore_path_from_files_dir(JNIEnv* env, jobject act
         return;
     }
 
-    jclass activity_cls = env->GetObjectClass(activity);
-    if (!activity_cls) return;
-
-    jmethodID mid_get_files_dir = env->GetMethodID(activity_cls, "getFilesDir", "()Ljava/io/File;");
-    if (!mid_get_files_dir) {
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jobject files_dir_file = env->CallObjectMethod(activity, mid_get_files_dir);
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-
-    if (!files_dir_file) {
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jclass file_cls = env->GetObjectClass(files_dir_file);
-    if (!file_cls) {
-        env->DeleteLocalRef(files_dir_file);
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jmethodID mid_get_abs_path = env->GetMethodID(file_cls, "getAbsolutePath", "()Ljava/lang/String;");
-    if (!mid_get_abs_path) {
-        env->DeleteLocalRef(file_cls);
-        env->DeleteLocalRef(files_dir_file);
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jstring dir_str = static_cast<jstring>(env->CallObjectMethod(files_dir_file, mid_get_abs_path));
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-
-    const std::string dir = jstring_to_utf8(env, dir_str);
+    const std::string dir = android_files_dir(env, activity);
     if (!dir.empty()) {
         const std::string key_store_dir = dir + "/keystore";
         cfg.setValueAtPath({"security", "noise_nk_protocol", "key_store_path"}, key_store_dir);
         nativeLog("NATIVE: Noise keystore path set to " + key_store_dir);
     }
-
-    if (dir_str) env->DeleteLocalRef(dir_str);
-    env->DeleteLocalRef(file_cls);
-    env->DeleteLocalRef(files_dir_file);
-    env->DeleteLocalRef(activity_cls);
 }
 
 bool file_readable(const std::string& path) {
@@ -212,48 +189,7 @@ void maybe_load_config_from_files_dir(JNIEnv* env, jobject activity) {
         }
     }
 
-    jclass activity_cls = env->GetObjectClass(activity);
-    if (!activity_cls) return;
-
-    jmethodID mid_get_files_dir = env->GetMethodID(activity_cls, "getFilesDir", "()Ljava/io/File;");
-    if (!mid_get_files_dir) {
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jobject files_dir_file = env->CallObjectMethod(activity, mid_get_files_dir);
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-
-    if (!files_dir_file) {
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jclass file_cls = env->GetObjectClass(files_dir_file);
-    if (!file_cls) {
-        env->DeleteLocalRef(files_dir_file);
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jmethodID mid_get_abs_path = env->GetMethodID(file_cls, "getAbsolutePath", "()Ljava/lang/String;");
-    if (!mid_get_abs_path) {
-        env->DeleteLocalRef(file_cls);
-        env->DeleteLocalRef(files_dir_file);
-        env->DeleteLocalRef(activity_cls);
-        return;
-    }
-
-    jstring dir_str = static_cast<jstring>(env->CallObjectMethod(files_dir_file, mid_get_abs_path));
-    if (env->ExceptionCheck()) {
-        env->ExceptionDescribe();
-        env->ExceptionClear();
-    }
-
-    const std::string dir = jstring_to_utf8(env, dir_str);
+    const std::string dir = android_files_dir(env, activity);
     if (!dir.empty()) {
         const std::string config_path = dir + "/config.json";
         if (file_readable(config_path)) {
@@ -266,11 +202,6 @@ void maybe_load_config_from_files_dir(JNIEnv* env, jobject activity) {
             nativeLog("NATIVE: No config.json found at " + config_path + "; using built-in defaults");
         }
     }
-
-    if (dir_str) env->DeleteLocalRef(dir_str);
-    env->DeleteLocalRef(file_cls);
-    env->DeleteLocalRef(files_dir_file);
-    env->DeleteLocalRef(activity_cls);
 }
 
 } // namespace
@@ -370,7 +301,7 @@ extern "C" JNIEXPORT void JNICALL JNI_OnUnload(JavaVM* vm, void* reserved) {
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_zeengal_litep2p_MainActivity_nativeStartLiteP2PWithPeerId(JNIEnv* env, jobject thiz, jstring commsMode, jstring peerId) {
+Java_com_zeengal_litep2p_EngineNative_nativeStartLiteP2PWithPeerId(JNIEnv* env, jobject thiz, jstring commsMode, jstring peerId) {
     nativeLog("NATIVE: Starting LiteP2P engine...");
 
     {
@@ -544,7 +475,7 @@ Java_com_zeengal_litep2p_MainActivity_nativeStartLiteP2PWithPeerId(JNIEnv* env, 
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_zeengal_litep2p_MainActivity_nativeConfigureProxy(JNIEnv* /* env */, jobject /* this */, jboolean enableGateway, jboolean enableClient) {
+Java_com_zeengal_litep2p_EngineNative_nativeConfigureProxy(JNIEnv* /* env */, jobject /* this */, jboolean enableGateway, jboolean enableClient) {
 #if ENABLE_PROXY_MODULE
     proxy::ProxySettings s;
     s.enable_gateway = (enableGateway == JNI_TRUE);
@@ -560,7 +491,7 @@ Java_com_zeengal_litep2p_MainActivity_nativeConfigureProxy(JNIEnv* /* env */, jo
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_zeengal_litep2p_MainActivity_nativeStopLiteP2P(JNIEnv* env, jobject /* this */) {
+Java_com_zeengal_litep2p_EngineNative_nativeStopLiteP2P(JNIEnv* env, jobject /* this */) {
     nativeLog("NATIVE: Stopping LiteP2P engine asynchronously...");
 
     {
@@ -712,6 +643,24 @@ Java_com_zeengal_litep2p_hook_P2P_sendMessage(JNIEnv* env, jclass /* clazz */, j
         env->ExceptionDescribe();
         env->ExceptionClear();
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_zeengal_litep2p_EngineNative_nativeSetFilesDir(JNIEnv* env, jclass /* clazz */, jstring dir) {
+    if (!env || !dir) return;
+    const char* d = env->GetStringUTFChars(dir, nullptr);
+    if (!d) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return;
+    }
+    std::string path(d);
+    env->ReleaseStringUTFChars(dir, d);
+    if (path.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_android_files_dir_mutex);
+        g_android_files_dir = path;
+    }
+    nativeLog("NATIVE: App files dir set to " + path);
 }
 
 bool jniBridgeInit(JNIEnv* env) {

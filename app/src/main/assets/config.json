@@ -3,6 +3,10 @@
         "Android default config for LiteP2P.",
         "This file is copied to the app's private storage on first launch: <filesDir>/config.json",
         "After that, you can replace it (e.g., via adb) to keep Android and desktop behavior consistent.",
+        "NOTE: security.transport_key is a SHARED network key. Every peer that must talk to",
+        "      each other has to run with the SAME value (desktop reads repo-root config.json).",
+        "      If Android and desktop use different keys (or none), CONTROL_CONNECT datagrams",
+        "      cannot be decrypted ('Decryption returned empty') and peers stay CONNECTING forever.",
         "NOTE: Avoid baking real TURN credentials into the APK.",
         "NOTE: The desktop version can read repo-root config.json; Android cannot."
     ],
@@ -36,6 +40,7 @@
         }
     },
     "security": {
+        "transport_key": "61dd960e7968e3f290fba01634fe9031c99d09c4bd0a788f1597b7f6405ff96e",
         "noise_nk_protocol": {
             "enabled": true,
             "mandatory": true,

@@ -253,6 +253,17 @@ private:
     // Unified communication interface to reduce code duplication
     void send_message_to_peer(const std::string& network_id, const std::string& message);
 
+    // ---------------------------------------------------------------
+    // Homogeneous / heterogeneous communication modes
+    // ---------------------------------------------------------------
+    // Records which transport (UDP/TCP) a peer used on inbound, so heterogeneous
+    // mode can route outbound traffic back on the same transport.
+    void note_inbound_transport(const std::string& network_id, const std::string& transport);
+    // Returns the transport to use for outbound traffic to `peer_id`:
+    //  - homogeneous mode: the configured single protocol (UDP/TCP/QUIC)
+    //  - heterogeneous mode: the peer's inbound transport if known, else the default UDP
+    std::string outbound_transport_for_peer(const std::string& peer_id) const;
+
     // Member variables
     std::atomic<bool> m_running;
     std::unique_ptr<ITcpConnectionManager> m_tcpConnectionManager;
@@ -265,6 +276,10 @@ private:
     // (Noise sessions cannot survive process restarts even if static keys persist.)
     uint64_t m_local_boot_id{0};
     std::string m_comms_mode;
+    // True when the engine runs in heterogeneous mode (accepts both UDP and TCP
+    // connections). Dictated by `communication.mode` in config / `--mode` on the
+    // desktop CLI. Homogeneous (false) is the historic single-protocol behavior.
+    bool m_comms_heterogeneous{false};
     
     std::shared_ptr<ISessionDependenciesFactory> m_factory;
     std::unique_ptr<PeerIndex> m_peer_index;

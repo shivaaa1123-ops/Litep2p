@@ -105,6 +105,9 @@ dependencies {
     implementation(libs.androidx.navigation.ui.ktx)
     implementation(libs.androidx.viewpager2)
 
+    // Watchdog that restores the engine after aggressive OEM battery kills.
+    implementation(libs.androidx.work.runtime.ktx)
+
     // Use libsodium from Maven Central
     implementation("com.goterl:lazysodium-java:5.1.4")
     implementation("net.java.dev.jna:jna:5.13.0")

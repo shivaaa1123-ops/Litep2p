@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Stop button background.
+
+    Stop is destructive, so it is tinted with the error colour when available and
+    visibly inert when the engine is not running.
+-->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_enabled="false" android:color="@color/surface_3" />
+    <item android:state_pressed="true" android:color="#FFDA3633" />
+    <item android:color="#FF8E2A26" />
+</selector>

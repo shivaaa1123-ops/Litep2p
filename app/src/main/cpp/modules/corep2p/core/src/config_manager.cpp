@@ -1,5 +1,6 @@
 #include "config_manager.h"
 #include "logger.h"
+#include <cctype>
 #include <fstream>
 #include <iterator>
 #include <sstream>
@@ -129,6 +130,29 @@ std::string ConfigManager::getDefaultProtocol() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return "TCP";
     return jsonGetOr<std::string>(m_config, {"communication", "default_protocol"}, "UDP");
+}
+
+std::string ConfigManager::getCommsMode() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return "HOMOGENEOUS";
+    std::string mode = jsonGetOr<std::string>(m_config, {"communication", "mode"}, "HOMOGENEOUS");
+    for (auto& c : mode) c = static_cast<char>(::toupper(static_cast<unsigned char>(c)));
+    // Accept both "HETEROGENEOUS" and loose synonyms; anything else (including empty)
+    // falls back to the safe homogeneous single-protocol behavior.
+    if (mode == "HETEROGENEOUS" || mode == "HYBRID" || mode == "BOTH") {
+        return "HETEROGENEOUS";
+    }
+    return "HOMOGENEOUS";
+}
+
+void ConfigManager::setCommsMode(const std::string& mode) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_config["communication"]["mode"] = mode;
+}
+
+void ConfigManager::setDefaultProtocol(const std::string& protocol) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_config["communication"]["default_protocol"] = protocol;
 }
 
 bool ConfigManager::isUDPEnabled() const {

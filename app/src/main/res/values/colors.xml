@@ -10,10 +10,63 @@
     <color name="red">#FF0000</color>
 
     <!-- Peer status colors (UI peers list) -->
-    <color name="peer_status_discovered">#FFD32F2F</color>
+    <color name="peer_status_discovered">#FF58A6FF</color>
     <color name="peer_status_connecting">#FFFFB74D</color>
     <color name="peer_status_connected">#FFFB8C00</color>
     <color name="peer_status_handshaking">#FF9CCC65</color>
     <color name="peer_status_ready">#FF2E7D32</color>
     <color name="peer_status_disconnected">#FF9E9E9E</color>
+
+    <!--
+        Dark "console" design system.
+
+        This app is used side by side with a terminal running the desktop peer, so the
+        palette is deliberately low-luminance with a small number of saturated accents
+        reserved for state. Anything that is not state information stays greyscale.
+    -->
+
+    <!-- Elevation ramp: 0 = window, 1 = card, 2 = inset tile/well -->
+    <color name="surface_0">#FF0D1117</color>
+    <color name="surface_1">#FF161B22</color>
+    <color name="surface_2">#FF1C2129</color>
+    <color name="surface_3">#FF21262D</color>
+    <color name="stroke">#FF30363D</color>
+
+    <!-- Text ramp: primary for values, secondary for content, tertiary for labels -->
+    <color name="text_primary">#FFE6EDF3</color>
+    <color name="text_secondary">#FF9DA7B3</color>
+    <color name="text_tertiary">#FF6E7681</color>
+
+    <!-- Accent (interactive / branding) -->
+    <color name="accent">#FF2F81F7</color>
+    <color name="accent_pressed">#FF1F6FEB</color>
+    <color name="accent_disabled">#FF1B2A3F</color>
+
+    <!-- Engine state -->
+    <color name="status_ok">#FF3FB950</color>
+    <color name="status_warn">#FFD29922</color>
+    <color name="status_err">#FFF85149</color>
+    <color name="status_idle">#FF6E7681</color>
+
+    <!-- Message direction (used by the message trace list) -->
+    <color name="msg_in">#FF3FB950</color>
+    <color name="msg_out">#FF58A6FF</color>
+
+    <!-- Message delivery state (used by the Messages list).
+         Three visual categories, per requirement:
+           - Received                 : green  (msg_received)
+           - Delivered (ACK received) : blue   (msg_delivered)
+           - Not delivered        / sent-but-awaiting-ACK : amber (msg_not_delivered)
+           - Failed               (send failed)           : red   (msg_failed)
+         The last two are both in the "not delivered / just sent / failed" bucket. -->
+    <color name="msg_received">#FF3FB950</color>
+    <color name="msg_delivered">#FF58A6FF</color>
+    <color name="msg_not_delivered">#FFD29922</color>
+    <color name="msg_failed">#FFF85149</color>
+
+    <!-- Log severity -->
+    <color name="log_debug">#FF6E7681</color>
+    <color name="log_info">#FF9DA7B3</color>
+    <color name="log_warn">#FFD29922</color>
+    <color name="log_error">#FFF85149</color>
 </resources>

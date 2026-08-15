@@ -205,7 +205,28 @@ namespace detail {
                 auto last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - peer.last_seen).count();
                 auto last_discovery_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - peer.last_discovery_seen).count();
 
-                if (peer.connected) {
+                // Grace: a connection that just completed its Noise handshake must not be
+                // torn down by the inactivity detector. A spurious DISCONNECT_DETECTED right
+                // after READY triggers a *one-sided* re-handshake (new ephemeral/keys on one
+                // peer only) whose counterpart keeps the old session. That desyncs the two
+                // peers' transport/Noise keys and every subsequent application message fails
+                // with "auth tag mismatch" (this is a very likely cause of "I connected but
+                // messages never arrive"). Give freshly-established sessions a short window so
+                // heartbeats/PONGs have a chance to refresh last_seen before we renegotiate.
+                static constexpr int kReadyGraceMs = 4000;
+                bool recently_ready = false;
+                {
+                    auto ctx_it = m_sm->m_peer_contexts.find(peer.id);
+                    if (ctx_it != m_sm->m_peer_contexts.end() &&
+                        ctx_it->second.last_handshake_completed != std::chrono::steady_clock::time_point{}) {
+                        const auto since_ready_ms =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now - ctx_it->second.last_handshake_completed).count();
+                        recently_ready = (since_ready_ms >= 0 && since_ready_ms < kReadyGraceMs);
+                    }
+                }
+
+                if (peer.connected && !recently_ready) {
                     // Primary inactivity timeout.
                     const int effective_expiration_ms = std::min(peer_expiration_ms, heartbeat_liveness_ms);
                     if (last_seen_ms > effective_expiration_ms) {
@@ -497,6 +518,12 @@ namespace detail {
                 struct Candidate {
                     std::string peer_id;
                     int priority = 0;
+                    // True for peers we had a session with before this process's most recent
+                    // restart (i.e. their Noise static public key is persisted in our keystore).
+                    // After a restart these peers must be re-established, but the remote side
+                    // keeps the stale encrypted session from the previous incarnation and never
+                    // re-initiates on its own.
+                    bool known_prior = false;
                 };
                 std::vector<Candidate> candidates;
                 candidates.reserve(8);
@@ -518,7 +545,25 @@ namespace detail {
                         // Only retry peers that have already failed/disconnected.
                         // Do NOT proactively auto-connect newly discovered peers here; that can
                         // disrupt endpoint-upgrade logic and can create connect storms.
-                        if (st != PeerState::DEGRADED && st != PeerState::DISCONNECTED && st != PeerState::FAILED) {
+                        // Exception: peers we had a persisted Noise session with before a restart.
+                        // When a peer is kill -9'd and restarted (same workdir/keystore), its remote
+                        // peers still hold the encrypted session from the killed process and keep
+                        // sending encrypted data the restarted peer cannot decrypt. They never
+                        // re-initiate because from their perspective the session is still READY, and
+                        // WE are not the deterministic Noise initiator either. The peers thus sit in
+                        // DISCOVERED forever. Restoring a *previously-established* (keystore-known)
+                        // peer via an outbound CONTROL_CONNECT lets the remote side clear its stale
+                        // session and re-handshake. This only applies to known peers, so brand-new
+                        // broadcast discoveries are still skipped (no connect storms).
+                        bool known_prior = false;
+#if HAVE_NOISE_PROTOCOL
+                        if ((st == PeerState::DISCOVERED || st == PeerState::CONNECTED) &&
+                            m_sm->m_noise_key_store && m_sm->m_noise_key_store->has_peer_key(peer.id)) {
+                            known_prior = true;
+                        }
+#endif
+                        if (st != PeerState::DEGRADED && st != PeerState::DISCONNECTED &&
+                            st != PeerState::FAILED && !known_prior) {
                             continue;
                         }
 
@@ -532,9 +577,10 @@ namespace detail {
                         int pri = 0;
                         if (st == PeerState::DEGRADED) pri = 3;
                         else if (st == PeerState::DISCONNECTED) pri = 2;
+                        else if (known_prior) pri = 2;   // restore known peers like a disconnect
                         else if (st == PeerState::FAILED) pri = 1;
 
-                        candidates.push_back(Candidate{peer.id, pri});
+                        candidates.push_back(Candidate{peer.id, pri, known_prior});
                     }
                 }
 
@@ -583,7 +629,12 @@ namespace detail {
                             if (reconnects_this_scan > 0) {
                                 break;
                             }
-                            LOG_INFO("MM: Scheduling reconnect attempt for non-connected peer " + cand.peer_id);
+                            if (cand.known_prior) {
+                                LOG_INFO("MM: Restart-recovery reconnect for previously-known peer " +
+                                         cand.peer_id + " (stale remote session; sending CONTROL_CONNECT to re-key)");
+                            } else {
+                                LOG_INFO("MM: Scheduling reconnect attempt for non-connected peer " + cand.peer_id);
+                            }
                         }
                         
                         m_sm->connectToPeer(cand.peer_id, is_degraded, "maintenance_retry");

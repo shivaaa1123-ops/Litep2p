@@ -19,6 +19,11 @@ void print_usage(const char* program_name) {
               << "  --config FILE   Path to configuration file (default: config.json)\n"
               << "  --log-level LVL Log level: debug|info|warning|error|none (default: none)\n"
               << "  --proxy ROLE    Set local proxy role: off|gateway|exit|client|both (default: off)\n"
+              << "  --mode MODE     Communication mode: homogeneous|heterogeneous (default: homogeneous)\n"
+              << "                    homogeneous: \n"
+              << "                    accept connections ONLY via --protocol / communication.default_protocol\n"
+              << "                    heterogeneous: accept BOTH UDP and TCP connections simultaneously\n"
+              << "  --protocol P    Transport protocol for homogeneous mode: UDP|TCP (default: config default_protocol)\n"
               << "  --tui-telemetry-ms MS  Telemetry pane refresh interval in ms (default: 1000)\n"
               << "  --no-tui        Force plain log output (no interactive UI)\n"
               << "  --daemon        Run as daemon (no stdin, suitable for background/testing)\n"
@@ -69,6 +74,8 @@ int main(int argc, char* argv[]) {
     bool daemon_mode = false;
     std::string proxy_role;
     int tui_telemetry_ms = 1000;
+    std::string comms_mode_override;
+    std::string protocol_override;
     
     // Parse arguments
     for (int i = 1; i < argc; i++) {
@@ -120,6 +127,28 @@ int main(int argc, char* argv[]) {
                 proxy_role = argv[++i];
             } else {
                 std::cerr << "Error: --proxy requires an argument" << std::endl;
+                return 1;
+            }
+        } else if (arg == "--mode") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --mode requires an argument (homogeneous|heterogeneous)" << std::endl;
+                return 1;
+            }
+            comms_mode_override = argv[++i];
+            for (auto& c : comms_mode_override) c = static_cast<char>(::tolower((unsigned char)c));
+            if (comms_mode_override != "homogeneous" && comms_mode_override != "heterogeneous") {
+                std::cerr << "Error: --mode must be 'homogeneous' or 'heterogeneous'" << std::endl;
+                return 1;
+            }
+        } else if (arg == "--protocol") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --protocol requires an argument (UDP|TCP)" << std::endl;
+                return 1;
+            }
+            protocol_override = argv[++i];
+            for (auto& c : protocol_override) c = static_cast<char>(::toupper((unsigned char)c));
+            if (protocol_override != "UDP" && protocol_override != "TCP" && protocol_override != "QUIC") {
+                std::cerr << "Error: --protocol must be 'UDP', 'TCP', or 'QUIC'" << std::endl;
                 return 1;
             }
         } else if (arg == "--tui-telemetry-ms") {
@@ -211,13 +240,27 @@ int main(int argc, char* argv[]) {
     
     nativeLog("MAIN: About to start engine...");
     
-    // Start engine - calls SessionManager::start() exactly like JNI bridge
-    std::string protocol = ConfigManager::getInstance().getDefaultProtocol();
+    // Start engine - calls SessionManager::start() exactly like JNI bridge.
+    // First apply any explicit CLI overrides for mode/protocol so the session
+    // manager (which reads the effective config) starts in the requested mode.
+    ConfigManager& cfg = ConfigManager::getInstance();
+    if (!comms_mode_override.empty()) {
+        cfg.setCommsMode(comms_mode_override == "heterogeneous" ? "HETEROGENEOUS" : "HOMOGENEOUS");
+        nativeLog("MAIN: Communication mode overridden via --mode: " + comms_mode_override);
+    }
+    if (!protocol_override.empty()) {
+        cfg.setDefaultProtocol(protocol_override);
+        nativeLog("MAIN: Protocol overridden via --protocol: " + protocol_override);
+    }
+
+    std::string protocol = cfg.getDefaultProtocol();
     if (protocol.empty()) {
         protocol = "TCP"; // Fallback
     }
-    
-    nativeLog("MAIN: Calling node.start() with port=" + std::to_string(port) + ", peer_id=" + peer_id + ", protocol=" + protocol);
+    const std::string mode = cfg.getCommsMode();
+
+    nativeLog("MAIN: Calling node.start() with port=" + std::to_string(port) + ", peer_id=" + peer_id
+              + ", protocol=" + protocol + ", mode=" + mode);
     
     if (!node.start(port, peer_id, protocol)) {
         std::cerr << "Error: Failed to start P2P node" << std::endl;

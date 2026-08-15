@@ -25,11 +25,34 @@ def _default_config_path() -> Path:
 
 
 def _load_signaling_url(config_path: Path) -> str:
-    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    raw = config_path.read_text(encoding="utf-8")
+    # The repo's config.json contains JSON5-style /* ... */ comment blocks, which
+    # Python's `json` cannot parse. Strip block comments before parsing so the
+    # liveness check works against the same file the desktop engine uses.
+    stripped = _strip_block_comments(raw)
+    cfg = json.loads(stripped)
     url = cfg.get("signaling", {}).get("url")
     if not isinstance(url, str) or not url:
         raise ValueError(f"No signaling.url found in {config_path}")
     return url
+
+
+def _strip_block_comments(text: str) -> str:
+    """Remove /* ... */ blocks, keeping the contents either side intact."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j == -1:
+                j = n
+            out.append(text[i : i + 2].replace("/*", ""))
+            i = j + 2 if j < n else j
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
 
 async def main_async(url: str, timeout: float) -> None:

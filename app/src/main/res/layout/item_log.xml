@@ -1,9 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Single console line shared by the Logs, Messages and Telemetry tabs.
+
+    The app uses the dark "console" design system (surface_0 background), so the
+    monospace text is a light grey (text_secondary) rather than the framework's
+    default black. Black on the near-black surface was effectively invisible.
+    Each tab's adapter may override the colour per row (e.g. severity tinting).
+-->
 <TextView xmlns:android="http://schemas.android.com/apk/res/android"
     android:id="@+id/logText"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:padding="4dp"
+    android:paddingHorizontal="12dp"
+    android:paddingVertical="4dp"
     android:textSize="12sp"
-    android:textColor="@android:color/black"
+    android:lineSpacingExtra="2dp"
+    android:textColor="@color/text_secondary"
+    android:textIsSelectable="true"
     android:fontFamily="monospace" />
