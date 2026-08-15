@@ -259,6 +259,7 @@ endif()
 # Main shared library
 add_library(litep2p SHARED
     src/jni_bridge.cpp
+    src/litep2p_c_api.cpp
     modules/plugins/jni/src/jni_helpers.cpp
 )
 
