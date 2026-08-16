@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Build libsodium static library (libsodium.a) for Android ABIs and place it
 # where this project expects it:
-#   app/src/main/cpp/libsodium/<abi>/lib/libsodium.a
-#   app/src/main/cpp/libsodium/<abi>/include/
+#   litep2p-core/src/main/cpp/libsodium/<abi>/lib/libsodium.a
+#   litep2p-core/src/main/cpp/libsodium/<abi>/include/
 #
 # Requirements:
 # - Android NDK installed (via Android Studio)
@@ -19,7 +19,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LIBSODIUM_VERSION="${LIBSODIUM_VERSION:-1.0.19}"
 ANDROID_API="${ANDROID_API:-21}"
 
-LIBSODIUM_DST_ROOT="$ROOT_DIR/app/src/main/cpp/libsodium"
+LIBSODIUM_DST_ROOT="$ROOT_DIR/litep2p-core/src/main/cpp/libsodium"
 WORK_DIR="$ROOT_DIR/.libsodium_build"
 
 mkdir -p "$WORK_DIR"

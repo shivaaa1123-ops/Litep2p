@@ -73,6 +73,27 @@ object TelemetryStore {
         if (uptimeMs >= 0) sb.appendLine("  uptime: ${formatDuration(uptimeMs)} ($uptimeMs ms)")
         sb.appendLine()
 
+        // Resource footprint (api-spec.md §6.1): RAM / CPU / threads / connections.
+        val gauges = obj.optJSONObject("gauges")
+        if (gauges != null) {
+            val rssBytes = gauges.optLong("rss_bytes", -1L)
+            val threadCount = gauges.optLong("thread_count", -1L)
+            val cpuPct = gauges.optLong("cpu_pct_estimate", -1L)
+            val peersConnected = gauges.optLong("peers_connected", -1L)
+            val peersTotal = gauges.optLong("peers_total", -1L)
+            if (rssBytes > 0 || threadCount > 0 || cpuPct >= 0 || peersConnected >= 0) {
+                sb.appendLine("Resources")
+                if (rssBytes > 0) sb.appendLine("  RAM: ${formatBytes(rssBytes)}")
+                if (cpuPct >= 0) sb.appendLine("  CPU: ~$cpuPct% of one core")
+                if (threadCount > 0) sb.appendLine("  Threads: $threadCount")
+                if (peersConnected >= 0) {
+                    val total = if (peersTotal >= 0) "/$peersTotal" else ""
+                    sb.appendLine("  Peers connected: $peersConnected$total")
+                }
+                sb.appendLine()
+            }
+        }
+
         fun appendFlatSection(title: String, o: JSONObject?) {
             if (o == null) return
             val names = o.keys().asSequence().toList().sorted()
@@ -171,5 +192,15 @@ object TelemetryStore {
         val minutes = s / 60
         val seconds = s % 60
         return String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds)
+    }
+
+    private fun formatBytes(bytes: Long): String = when {
+        bytes >= 1024L * 1024L * 1024L ->
+            String.format(Locale.US, "%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
+        bytes >= 1024L * 1024L ->
+            String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024.0))
+        bytes >= 1024L ->
+            String.format(Locale.US, "%.1f KB", bytes / 1024.0)
+        else -> "$bytes B"
     }
 }

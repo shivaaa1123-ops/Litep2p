@@ -4,14 +4,32 @@ import android.util.Log
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import com.zeengal.litep2p.MessageTraceStore
-import com.zeengal.litep2p.PeerInfo
+import com.zeengal.litep2p.core.CommsMode
+import com.zeengal.litep2p.core.LiteP2P
+import com.zeengal.litep2p.core.LogLevel
+import com.zeengal.litep2p.core.PeerInfo
 import org.json.JSONObject
 
+/**
+ * Harness-side P2P facade (Phase 2 module split).
+ *
+ * After the split, the native engine is driven exclusively through the core
+ * [LiteP2P] API (`:litep2p-core`). This object no longer declares JNI `external`
+ * functions; it delegates engine calls to [LiteP2P] and keeps the harness-only
+ * concerns that used to live here:
+ *
+ *  - LiveData streams the UI observes (peers, received messages, message events)
+ *  - the ACK-envelope protocol ([sendMessageTracked]) used to measure delivery
+ *  - the in-memory message history for the Messages tab
+ *
+ * Engine events (peers/messages) arrive via [EngineBridge], which forwards the
+ * core [LiteP2P] listener callbacks into [onPeersUpdated] / [onMessageReceived].
+ */
 object P2P {
     private const val TAG = "LiteP2P_P2P_Hook"
     private val _peers = MutableLiveData<List<PeerInfo>>()
     val peers: LiveData<List<PeerInfo>> get() = _peers
-    
+
     // Message received callback - stores peer_id and message content
     data class ReceivedMessage(val peerId: String, val message: String, val timestamp: Long = System.currentTimeMillis())
     private val _receivedMessages = MutableLiveData<ReceivedMessage>()
@@ -31,15 +49,21 @@ object P2P {
     private val messageHistory = ArrayDeque<MessageEvent>(MAX_MESSAGE_EVENTS)
     private val _messageEvents = MutableLiveData<List<MessageEvent>>(emptyList())
     val messageEvents: LiveData<List<MessageEvent>> get() = _messageEvents
-    
+
     // Store the current connection type
     private var currentConnectionType: String = "UDP"
 
+    /** Initiates a connection to a discovered peer (delegates to the core engine). */
     @JvmStatic
-    external fun connect(peerId: String)
+    fun connect(peerId: String) {
+        LiteP2P.connect(peerId)
+    }
 
+    /** Fire-and-forget send (delegates to the core engine). */
     @JvmStatic
-    external fun sendMessage(peerId: String, message: ByteArray)
+    fun sendMessage(peerId: String, message: ByteArray) {
+        LiteP2P.send(peerId, message)
+    }
 
     /**
      * UI should call this instead of [sendMessage] so we can show outgoing messages in the Messages tab.
@@ -77,29 +101,37 @@ object P2P {
             return
         }
     }
-    
+
     @JvmStatic
-    external fun setLogLevel(level: Int)
+    fun setLogLevel(level: Int) {
+        LiteP2P.setLogLevel(LogLevel.fromLevel(level))
+    }
 
     // System network state callbacks (drives signaling/NAT recovery in native engine)
     @JvmStatic
-    external fun setSystemNetworkInfo(isWiFi: Boolean, isNetworkAvailable: Boolean)
+    fun setSystemNetworkInfo(isWiFi: Boolean, isNetworkAvailable: Boolean) {
+        LiteP2P.setNetworkInfo(isWiFi, isNetworkAvailable)
+    }
 
     // Returns "TCP" or "UDP" based on current UI selection
     @JvmStatic
     fun getConnectionType(): String {
         return currentConnectionType
     }
-    
+
     // Set the connection type from the UI
     @JvmStatic
     fun setConnectionType(type: String) {
         currentConnectionType = type
     }
 
+    /** Maps a UI comms-mode label to the core [CommsMode] used at engine start. */
+    @JvmStatic
+    fun toCommsMode(selectedMode: String): CommsMode = CommsMode.fromWire(selectedMode)
+
     @JvmStatic
     fun onPeersUpdated(peers: Array<PeerInfo>) {
-        // Log what we received from C++
+        // Log what we received from the engine
         Log.d(TAG, "onPeersUpdated called with ${peers.size} peers.")
         for (peer in peers) {
             Log.d(
@@ -109,19 +141,6 @@ object P2P {
         }
         // This posts the updated list to any observers.
         _peers.postValue(peers.toList())
-    }
-    
-    // Callbacks from native code for engine state changes
-    @JvmStatic
-    fun onEngineStartComplete() {
-        Log.d(TAG, "Engine start complete callback received")
-        // We could post to a LiveData here if we want to observe engine state in the UI
-    }
-    
-    @JvmStatic
-    fun onEngineStopComplete() {
-        Log.d(TAG, "Engine stop complete callback received")
-        // We could post to a LiveData here if we want to observe engine state in the UI
     }
 
     @JvmStatic

@@ -19,7 +19,7 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.chip.Chip
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import com.zeengal.litep2p.PeerInfo
+import com.zeengal.litep2p.core.PeerInfo
 import com.zeengal.litep2p.R
 import com.zeengal.litep2p.hook.P2P
 
@@ -62,11 +62,12 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
 
         // --- meta line: endpoint · status · path · latency ---
         val latency = if (p.latency >= 0) "${p.latency}ms" else "—"
+        // The C ABI reports canonical connection-path names (litep2p.h §3.6).
         val connType = when (p.connectionType) {
-            "LAN" -> "LAN"
-            "WAN_DIRECT" -> "Direct"
-            "TURN" -> "TURN"
-            "SIGNALING" -> "Relay"
+            "LAN_DIRECT", "LAN" -> "LAN"
+            "WAN_HOLE_PUNCH", "WAN_DIRECT" -> "Direct"
+            "TURN_RELAY", "TURN" -> "TURN"
+            "SIGNALING_RELAY", "SIGNALING" -> "Relay"
             else -> null
         }
         val meta = buildString {

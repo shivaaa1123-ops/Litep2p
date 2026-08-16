@@ -14,6 +14,10 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.zeengal.litep2p.core.CommsMode
+import com.zeengal.litep2p.core.EngineResult
+import com.zeengal.litep2p.core.LiteP2P
+import com.zeengal.litep2p.core.LiteP2PConfig
 import java.util.concurrent.Executors
 
 /**
@@ -47,6 +51,9 @@ class LiteP2PService : Service() {
     override fun onCreate() {
         super.onCreate()
         EngineController.attachContext(this)
+        // Wire core engine events (start/stop completion, peers, messages, logs,
+        // telemetry, ACKs) into the harness stores before the engine can emit anything.
+        EngineBridge.install()
         createNotificationChannel()
         instance = this
         Log.i(TAG, "Service created")
@@ -102,21 +109,26 @@ class LiteP2PService : Service() {
                 acquireLocks()
                 Log.i(TAG, "Starting engine mode=$commsMode peer=$peerId")
 
-                // The native engine is started through the plain EngineNative object (not a
-                // Context), so it cannot call getFilesDir() itself. Supply the real files
-                // directory up front; the native bridge uses it for config.json, the Noise
-                // keystore and the peer DB (and to avoid a JNI NoSuchMethodError crash).
-                EngineNative.nativeSetFilesDir(filesDir.absolutePath)
+                // Configure the core engine through the public LiteP2P API. The files
+                // directory is required for config.json, the Noise keystore and the
+                // peer DB; init() passes it to the native bridge before start.
+                EngineBridge.install()
+                val config = LiteP2PConfig.Builder()
+                    .filesDir(filesDir.absolutePath)
+                    .peerId(peerId)
+                    .commsMode(CommsMode.fromWire(commsMode))
+                    .build()
+                LiteP2P.init(config)
 
-                val result = EngineNative.nativeStartLiteP2PWithPeerId(commsMode, peerId)
+                val result = LiteP2P.start()
                 Log.i(TAG, "Native start returned: $result")
 
-                if (!result.startsWith("BUSY")) {
+                if (result == EngineResult.OK) {
                     // Proxy roles are applied after start so they survive a restart.
-                    EngineNative.nativeConfigureProxy(proxyGateway, proxyClient)
+                    LiteP2P.configureProxy(proxyGateway, proxyClient)
                 } else {
                     // Native refused; don't leave the UI stuck in STARTING forever.
-                    Log.w(TAG, "Native engine busy; aborting start")
+                    Log.w(TAG, "Native engine refused start ($result); aborting")
                     releaseLocks()
                     EngineController.onEngineStopComplete()
                 }
@@ -132,7 +144,7 @@ class LiteP2PService : Service() {
         engineExecutor.execute {
             try {
                 Log.i(TAG, "Stopping engine")
-                EngineNative.nativeStopLiteP2P()
+                LiteP2P.stop()
             } catch (t: Throwable) {
                 Log.e(TAG, "Engine stop failed: ${t.message}", t)
                 // Force the state machine back to IDLE so the UI is usable again.

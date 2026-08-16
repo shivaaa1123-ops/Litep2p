@@ -1,2 +1,0 @@
-getkey
-quit

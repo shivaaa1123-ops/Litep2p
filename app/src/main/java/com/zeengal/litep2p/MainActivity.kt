@@ -32,6 +32,7 @@ import android.widget.ArrayAdapter
 import com.zeengal.litep2p.ui.home.HomeFragment
 import com.zeengal.litep2p.ui.dashboard.DashboardFragment
 import com.zeengal.litep2p.hook.P2P
+import com.zeengal.litep2p.core.LiteP2P
 import java.io.File
 import java.io.IOException
 import org.json.JSONObject
@@ -205,14 +206,14 @@ class MainActivity : AppCompatActivity() {
         // (Previously, proxy config was only applied once at Start, which made runtime testing easy to misconfigure.)
         proxyGatewayCheck.setOnCheckedChangeListener { _, _ ->
             if (engineState == EngineState.RUNNING) {
-                EngineNative.nativeConfigureProxy(proxyGatewayCheck.isChecked, proxyClientCheck.isChecked)
+                LiteP2P.configureProxy(proxyGatewayCheck.isChecked, proxyClientCheck.isChecked)
                 EngineController.rememberProxySettings(proxyGatewayCheck.isChecked, proxyClientCheck.isChecked)
             }
             updateAdvancedSummary()
         }
         proxyClientCheck.setOnCheckedChangeListener { _, _ ->
             if (engineState == EngineState.RUNNING) {
-                EngineNative.nativeConfigureProxy(proxyGatewayCheck.isChecked, proxyClientCheck.isChecked)
+                LiteP2P.configureProxy(proxyGatewayCheck.isChecked, proxyClientCheck.isChecked)
                 EngineController.rememberProxySettings(proxyGatewayCheck.isChecked, proxyClientCheck.isChecked)
             }
             updateAdvancedSummary()
@@ -236,6 +237,15 @@ class MainActivity : AppCompatActivity() {
             engineState = mapEngineState(state)
             statusText.text = when (state) {
                 EngineController.State.IDLE -> {
+                    // Engine fully stopped: cancel the slow-stop watchdog if one is armed.
+                    // (Previously done in the removed MainActivity.onEngineStopComplete
+                    // JNI callback; now driven by the EngineController state observer.)
+                    stopTimeoutHandler?.let { h ->
+                        stopTimeoutRunnable?.let { r -> h.removeCallbacks(r) }
+                    }
+                    stopTimeoutHandler = null
+                    stopTimeoutRunnable = null
+
                     // If we stopped the engine to apply a new protocol mode, restart it
                     // now that it is fully idle and safe to start again.
                     if (pendingRestartCommsMode != null) {
@@ -955,9 +965,10 @@ class MainActivity : AppCompatActivity() {
         ipAddressText.text = "IP: N/A"
     }
 
-    // Native engine entry points now live on EngineNative so the engine can be driven by
-    // LiteP2PService with no Activity present. MainActivity only receives completion
-    // callbacks (below), which native invokes as static methods on this class.
+    // Native engine entry points live in :litep2p-core (LiteP2PNative / LiteP2P). The
+    // engine is driven by LiteP2PService with no Activity present, and completion
+    // callbacks flow through EngineBridge -> EngineController. MainActivity observes
+    // EngineController.state for UI updates; it no longer receives direct JNI calls.
 
     companion object {
         @Volatile
@@ -978,32 +989,10 @@ class MainActivity : AppCompatActivity() {
         //   adb shell am start -n com.zeengal.litep2p/.MainActivity --es LITEP2P_CONNECT_TO_PEER "<peer_id>"
         private const val EXTRA_CONNECT_TO_PEER = "LITEP2P_CONNECT_TO_PEER"
         private const val REQ_POST_NOTIFICATIONS = 4101
-        
-        @JvmStatic
-        fun onEngineStartComplete() {
-            android.util.Log.d("MainActivity", "onEngineStartComplete called, instance: ${instance != null}")
-            // Authoritative state lives in EngineController so the service stays correct even
-            // when no Activity exists. The LiveData observer refreshes the UI if one does.
-            EngineController.onEngineStartComplete()
-        }
-        
-        @JvmStatic
-        fun onEngineStopComplete() {
-            android.util.Log.d("MainActivity", "onEngineStopComplete called, instance: ${instance != null}")
-            EngineController.onEngineStopComplete()
 
-            // Cancel the UI watchdog if an Activity is present.
-            instance?.stopTimeoutHandler?.let { handler ->
-                instance?.stopTimeoutRunnable?.let { runnable ->
-                    handler.removeCallbacks(runnable)
-                }
-            }
-            instance?.stopTimeoutHandler = null
-            instance?.stopTimeoutRunnable = null
-        }
-        
-        init {
-            System.loadLibrary("litep2p")
-        }
+        // NOTE: The native library (liblitep2p.so) is loaded by :litep2p-core's
+        // LiteP2PNative, not here. Engine completion callbacks are delivered via
+        // EngineBridge -> EngineController, so MainActivity has no @JvmStatic
+        // native-callback methods.
     }
 }

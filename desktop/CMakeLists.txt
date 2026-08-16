@@ -7,6 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Optional compile-time module: Proxy / Relay
 option(ENABLE_PROXY_MODULE "Enable Proxy (relay) module" ON)
 
+# Optional compile-time module: Multi-hop overlay (LPX2)
+# NOTE: declared BEFORE the compile-definitions block below — CMake evaluates
+# `if(ENABLE_OVERLAY_MODULE)` at its position, and an undeclared variable
+# evaluates to false (silently disabling the module).
+option(ENABLE_OVERLAY_MODULE "Enable multi-hop overlay module (LPX2)" ON)
+
 # Single-thread mode: reduces thread count for efficiency
 # Enable with: cmake -DSINGLE_THREAD_MODE=ON ..
 option(SINGLE_THREAD_MODE "Enable single-thread mode for reduced resource usage" OFF)
@@ -72,6 +78,12 @@ else()
     add_compile_definitions(ENABLE_PROXY_MODULE=0)
 endif()
 
+if(ENABLE_OVERLAY_MODULE)
+    add_compile_definitions(ENABLE_OVERLAY_MODULE=1)
+else()
+    add_compile_definitions(ENABLE_OVERLAY_MODULE=0)
+endif()
+
 # On Linux, find uuid
 if(UNIX AND NOT APPLE)
     find_package(PkgConfig REQUIRED)
@@ -93,107 +105,117 @@ set(DESKTOP_SOURCES
 
 # Core logging (uses conditional compilation for platform-specific output)
 set(CORE_SOURCES
-    ../app/src/main/cpp/modules/corep2p/core/src/logger.cpp
-    ../app/src/main/cpp/modules/corep2p/core/src/device_utils.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/core/src/logger.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/core/src/device_utils.cpp
 )
 
 # Session Manager and related components
 set(SESSION_SOURCES
-    ../app/src/main/cpp/modules/plugins/session/src/session_manager.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/event_manager.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/unified_event_loop.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/peer_manager.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/peer_state_machine.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/nat_traversal_manager.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/engine_handler.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/message_handler.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/wire_codec.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/peer_lifecycle_manager.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/maintenance_manager.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/local_peer_db.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/sqlite3_dyn.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/session_cache.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/tier_manager.cpp
-    ../app/src/main/cpp/modules/plugins/session/src/rugged_recovery_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/session_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/event_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/unified_event_loop.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/peer_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/peer_state_machine.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/nat_traversal_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/engine_handler.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/message_handler.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/wire_codec.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/peer_lifecycle_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/maintenance_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/local_peer_db.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/sqlite3_dyn.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/session_cache.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/tier_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/rugged_recovery_manager.cpp
 )
 
 # Transport layer
 set(TRANSPORT_SOURCES
-    ../app/src/main/cpp/modules/corep2p/transport/src/connection_manager.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/udp_connection_manager.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/tcp_message.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/udp_message.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/quic_message.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/quic_connection_manager.cpp
-    ../app/src/main/cpp/modules/corep2p/transport/src/real_quic_transport.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/transport/src/connection_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/transport/src/udp_connection_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/transport/src/tcp_message.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/transport/src/udp_message.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/transport/src/quic_message.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/transport/src/quic_connection_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/transport/src/real_quic_transport.cpp
 )
 
 # Security and crypto
 set(CRYPTO_SOURCES
-    ../app/src/main/cpp/modules/corep2p/crypto/src/noise_key_store.cpp
-    ../app/src/main/cpp/modules/corep2p/crypto/src/noise_nk.cpp
-    ../app/src/main/cpp/modules/corep2p/crypto/src/noise_protocol.cpp
-    ../app/src/main/cpp/modules/corep2p/crypto/src/crypto_utils.cpp
-    ../app/src/main/cpp/modules/corep2p/crypto/src/sha1_md5.cpp
-    ../app/src/main/cpp/modules/corep2p/crypto/src/aes.c
+    ../litep2p-core/src/main/cpp/modules/corep2p/crypto/src/noise_key_store.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/crypto/src/noise_nk.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/crypto/src/noise_protocol.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/crypto/src/crypto_utils.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/crypto/src/sha1_md5.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/crypto/src/aes.c
 )
 
 set(SECURITY_SOURCES
-    ../app/src/main/cpp/modules/corep2p/security/src/secure_session.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/security/src/secure_session.cpp
 )
 
 # Reactor and event handling
 set(REACTOR_SOURCES
-    ../app/src/main/cpp/modules/corep2p/reactor/src/event_thread_pool.cpp
-    ../app/src/main/cpp/modules/corep2p/reactor/src/epoll_reactor.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/reactor/src/event_thread_pool.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/reactor/src/epoll_reactor.cpp
 )
 
 # Optimization/Routing plugins
 set(OPTIMIZATION_SOURCES
-    ../app/src/main/cpp/modules/plugins/optimization/src/battery_optimizer.cpp
-    ../app/src/main/cpp/modules/plugins/optimization/src/peer_index.cpp
-    ../app/src/main/cpp/modules/plugins/optimization/src/message_batcher.cpp
-    ../app/src/main/cpp/modules/plugins/optimization/src/adaptive_scaler.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/optimization/src/battery_optimizer.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/optimization/src/peer_index.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/optimization/src/message_batcher.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/optimization/src/adaptive_scaler.cpp
 )
 
 set(ROUTING_SOURCES
-    ../app/src/main/cpp/modules/plugins/routing/src/nat_traversal.cpp
-    ../app/src/main/cpp/modules/plugins/routing/src/nat_stun.cpp
-    ../app/src/main/cpp/modules/plugins/routing/src/peer_reconnect_policy.cpp
-    ../app/src/main/cpp/modules/plugins/routing/src/peer_tier_manager.cpp
-    ../app/src/main/cpp/modules/plugins/routing/src/tier_system_failsafe.cpp
-    ../app/src/main/cpp/modules/plugins/routing/src/upnp_controller.cpp
-    ../app/src/main/cpp/modules/plugins/routing/src/turn_client.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/routing/src/nat_traversal.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/routing/src/nat_stun.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/routing/src/peer_reconnect_policy.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/routing/src/peer_tier_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/routing/src/tier_system_failsafe.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/routing/src/upnp_controller.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/routing/src/turn_client.cpp
 )
 
 set(PROXY_SOURCES)
 if(ENABLE_PROXY_MODULE)
     set(PROXY_SOURCES
-        ../app/src/main/cpp/modules/plugins/proxy/src/proxy_endpoint.cpp
+        ../litep2p-core/src/main/cpp/modules/plugins/proxy/src/proxy_endpoint.cpp
+    )
+endif()
+
+# Multi-hop overlay (LPX2)
+set(OVERLAY_SOURCES)
+if(ENABLE_OVERLAY_MODULE)
+    set(OVERLAY_SOURCES
+        ../litep2p-core/src/main/cpp/modules/plugins/overlay/src/overlay_frame.cpp
+        ../litep2p-core/src/main/cpp/modules/plugins/overlay/src/overlay_mailbox.cpp
+        ../litep2p-core/src/main/cpp/modules/plugins/overlay/src/overlay_router.cpp
     )
 endif()
 
 # File transfer
 set(FILE_TRANSFER_SOURCES
-    ../app/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_manager.cpp
-    ../app/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_paths.cpp
-    ../app/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_congestion.cpp
-    ../app/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_chunks.cpp
-    ../app/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_checkpoint.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_paths.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_congestion.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_chunks.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_checkpoint.cpp
 )
 
 # Core P2P
 set(CORE_P2P_SOURCES
-    ../app/src/main/cpp/modules/corep2p/core/src/config_manager.cpp
-    ../app/src/main/cpp/modules/corep2p/core/src/telemetry.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/core/src/config_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/core/src/telemetry.cpp
 )
 
 # Discovery
 set(DISCOVERY_SOURCES
-    ../app/src/main/cpp/modules/plugins/discovery/src/broadcast_discovery_manager.cpp
-    ../app/src/main/cpp/modules/plugins/discovery/src/discovery.cpp
-    ../app/src/main/cpp/modules/plugins/discovery/src/signaling_client.cpp
-    ../app/src/main/cpp/modules/plugins/discovery/src/peer_cache_lru.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/discovery/src/broadcast_discovery_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/discovery/src/discovery.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/discovery/src/signaling_client.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/discovery/src/peer_cache_lru.cpp
 )
 
 set(ENGINE_SOURCES
@@ -207,8 +229,12 @@ set(ENGINE_SOURCES
     ${ROUTING_SOURCES}
     ${FILE_TRANSFER_SOURCES}
     ${PROXY_SOURCES}
+    ${OVERLAY_SOURCES}
     ${CORE_P2P_SOURCES}
     ${DISCOVERY_SOURCES}
+    # Public C ABI (litep2p.h) — compiled into the engine so desktop tests can
+    # exercise the exact contract integrators use.
+    ../litep2p-core/src/main/cpp/src/litep2p_c_api.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -220,19 +246,21 @@ add_library(litep2p_engine STATIC ${ENGINE_SOURCES})
 
 target_include_directories(litep2p_engine PUBLIC
     ${LIBSODIUM_INCLUDE_DIRS}
-    ../app/src/main/cpp/modules/plugins/discovery/include
-    ../app/src/main/cpp/modules/corep2p/core/include
-    ../app/src/main/cpp/modules/corep2p/transport/include
-    ../app/src/main/cpp/modules/corep2p/reactor/include
-    ../app/src/main/cpp/modules/corep2p/security/include
-    ../app/src/main/cpp/modules/corep2p/crypto/include
-    ../app/src/main/cpp/modules/corep2p/include
-    ../app/src/main/cpp/modules/plugins/session/include
-    ../app/src/main/cpp/modules/plugins/session/src
-    ../app/src/main/cpp/modules/plugins/optimization/include
-    ../app/src/main/cpp/modules/plugins/routing/include
-    ../app/src/main/cpp/modules/plugins/file_transfer/include
-    ../app/src/main/cpp/modules/plugins/proxy/include
+    ../litep2p-core/src/main/cpp/include
+    ../litep2p-core/src/main/cpp/modules/plugins/discovery/include
+    ../litep2p-core/src/main/cpp/modules/corep2p/core/include
+    ../litep2p-core/src/main/cpp/modules/corep2p/transport/include
+    ../litep2p-core/src/main/cpp/modules/corep2p/reactor/include
+    ../litep2p-core/src/main/cpp/modules/corep2p/security/include
+    ../litep2p-core/src/main/cpp/modules/corep2p/crypto/include
+    ../litep2p-core/src/main/cpp/modules/corep2p/include
+    ../litep2p-core/src/main/cpp/modules/plugins/session/include
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src
+    ../litep2p-core/src/main/cpp/modules/plugins/optimization/include
+    ../litep2p-core/src/main/cpp/modules/plugins/routing/include
+    ../litep2p-core/src/main/cpp/modules/plugins/file_transfer/include
+    ../litep2p-core/src/main/cpp/modules/plugins/proxy/include
+    ../litep2p-core/src/main/cpp/modules/plugins/overlay/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -328,6 +356,10 @@ add_executable(session_manager_test tests/session_manager_test.cpp)
 target_include_directories(session_manager_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(session_manager_test PRIVATE litep2p_engine)
 
+add_executable(c_api_test tests/c_api_test.cpp)
+target_include_directories(c_api_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(c_api_test PRIVATE litep2p_engine)
+
 add_executable(wan_integration_runner tests/wan_integration_runner.cpp)
 target_include_directories(wan_integration_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(wan_integration_runner PRIVATE litep2p_engine)
@@ -342,6 +374,12 @@ if(LITEP2P_ENABLE_REAL_QUIC)
     target_link_libraries(quic_test PRIVATE litep2p_engine)
 endif()
 
+if(ENABLE_OVERLAY_MODULE)
+    add_executable(overlay_test tests/overlay_test.cpp)
+    target_include_directories(overlay_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(overlay_test PRIVATE litep2p_engine)
+endif()
+
 if(ENABLE_PROXY_MODULE)
     add_executable(proxy_test tests/proxy_test.cpp)
     target_include_directories(proxy_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -349,18 +387,18 @@ if(ENABLE_PROXY_MODULE)
 
     add_executable(proxy_stdio
         tools/proxy_stdio.cpp
-        ../app/src/main/cpp/modules/plugins/proxy/src/proxy_endpoint.cpp
-        ../app/src/main/cpp/modules/plugins/session/src/wire_codec.cpp
-        ../app/src/main/cpp/modules/corep2p/core/src/logger.cpp
+        ../litep2p-core/src/main/cpp/modules/plugins/proxy/src/proxy_endpoint.cpp
+        ../litep2p-core/src/main/cpp/modules/plugins/session/src/wire_codec.cpp
+        ../litep2p-core/src/main/cpp/modules/corep2p/core/src/logger.cpp
     )
 
     target_include_directories(proxy_stdio PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${LIBSODIUM_INCLUDE_DIRS}
-        ../app/src/main/cpp/modules/corep2p/core/include
-        ../app/src/main/cpp/modules/plugins/session/include
-        ../app/src/main/cpp/modules/plugins/session/src
-        ../app/src/main/cpp/modules/plugins/proxy/include
+        ../litep2p-core/src/main/cpp/modules/corep2p/core/include
+        ../litep2p-core/src/main/cpp/modules/plugins/session/include
+        ../litep2p-core/src/main/cpp/modules/plugins/session/src
+        ../litep2p-core/src/main/cpp/modules/plugins/proxy/include
     )
 
     target_link_libraries(proxy_stdio PRIVATE

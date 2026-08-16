@@ -1,0 +1,23 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="com.zeengal.litep2p.core" >
+4
+5    <uses-sdk android:minSdkVersion="24" />
+6    <!--
+7        The engine needs network access. Consumers merge these permissions into their
+8        manifest automatically; declared here so the library is self-contained.
+9    -->
+10    <uses-permission android:name="android.permission.INTERNET" />
+10-->/Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:7:5-67
+10-->/Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:7:22-64
+11    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+11-->/Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:8:5-79
+11-->/Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:8:22-76
+12    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+12-->/Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:9:5-76
+12-->/Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:9:22-73
+13    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+13-->/Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:10:5-86
+13-->/Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:10:22-83
+14
+15</manifest>

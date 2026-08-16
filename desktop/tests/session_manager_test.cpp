@@ -874,6 +874,106 @@ bool test_maintenance_retries_disconnected_peer_even_when_another_connected() {
     return true;
 }
 
+bool test_user_disconnect_suppresses_auto_reconnect() {
+    std::cout << "Testing user disconnect suppresses auto-reconnect (network change + maintenance)..." << std::endl;
+
+    configure_unit_test_runtime();
+
+    auto session_manager = std::make_unique<SessionManager>();
+    const int port = get_free_tcp_port();
+    TEST_ASSERT(port != 0, "Failed to allocate free TCP port");
+    session_manager->start(port, mock_peer_callback, "TCP", "test-peer-id");
+
+    // Establish a stable network state so the subsequent call is a true transition.
+    session_manager->set_network_info(true, true);
+
+    // Use an unreachable endpoint (closed port) so the connect attempt fails deterministically.
+    int unreachable_port = get_free_tcp_port();
+    while (unreachable_port == port) unreachable_port = get_free_tcp_port();
+    TEST_ASSERT(unreachable_port != 0, "Failed to allocate unreachable port");
+
+    const std::string peer_id = "peer-suppress-reconnect";
+    session_manager->addPeer(peer_id, "127.0.0.1:" + std::to_string(unreachable_port));
+
+    // Make retries responsive so the maintenance scan would normally reconnect quickly.
+    PeerReconnectPolicy::getInstance().set_reconnect_mode_string("aggressive");
+
+    // Initiate a connect (will fail since endpoint is unreachable).
+    session_manager->connectToPeer(peer_id);
+
+    // Wait for the connect attempt to be processed and the peer to leave CONNECTING state.
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const std::string state = session_manager->getPeerFsmState(peer_id);
+            if (state == "DEGRADED" || state == "FAILED" || state == "DISCONNECTED") break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    // User explicitly disconnects the peer. This should suppress auto-reconnects.
+    const bool disconnect_ok = session_manager->disconnectFromPeer(peer_id);
+    TEST_ASSERT(disconnect_ok, "disconnectFromPeer should return true for a known peer");
+
+    // Wait for the disconnect to be fully processed (FSM -> DISCONNECTED).
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (session_manager->getPeerFsmState(peer_id) == "DISCONNECTED") break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    TEST_ASSERT(session_manager->getPeerFsmState(peer_id) == "DISCONNECTED",
+                "Peer FSM should be DISCONNECTED after disconnectFromPeer");
+
+    // Trigger a network type change (WiFi -> Mobile). This normally triggers
+    // immediate reconnects for all disconnected peers via "network_change_immediate",
+    // and the maintenance scan retries DISCONNECTED peers. With user-disconnect
+    // suppression active, THIS peer must not be re-attempted.
+    session_manager->set_network_info(false, true);
+
+    // Wait long enough for the network-change reconnect + maintenance scan to fire.
+    // The maintenance scan interval in aggressive mode is 250ms; timer tick is 500ms.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+
+    // Assert on the PER-PEER FSM state rather than the process-global
+    // connect_requested_total counter: LAN broadcast discovery may observe real
+    // peers on the host network and increment the global counter for OTHER peers.
+    // If suppression were broken, a reconnect attempt would move this peer out of
+    // DISCONNECTED (to CONNECTING, then DEGRADED after the unreachable endpoint fails).
+    // Staying DISCONNECTED proves no reconnect was attempted for this peer.
+    const std::string state_after_network_change = session_manager->getPeerFsmState(peer_id);
+    TEST_ASSERT(state_after_network_change == "DISCONNECTED",
+                "Peer should remain DISCONNECTED after network change (suppression active), got state=" +
+                state_after_network_change);
+
+    // Verify the peer is still not connected.
+    TEST_ASSERT(!session_manager->isPeerConnected(peer_id),
+                "Peer should remain disconnected after suppressed network-change reconnect");
+
+    // Now explicitly reconnect (user_api source). This should clear the suppression
+    // and drive the peer out of DISCONNECTED (to CONNECTING, then DEGRADED since the
+    // endpoint is unreachable).
+    session_manager->connectToPeer(peer_id);
+
+    // Wait for the explicit connect to be processed and move the peer out of DISCONNECTED.
+    bool left_disconnected = false;
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const std::string st = session_manager->getPeerFsmState(peer_id);
+            if (st != "DISCONNECTED") { left_disconnected = true; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    TEST_ASSERT(left_disconnected,
+                "Explicit user connectToPeer should clear suppression and move the peer out of DISCONNECTED");
+
+    session_manager->stop();
+    std::cout << "User disconnect suppression Passed!" << std::endl;
+    return true;
+}
+
 int main() {
     std::cout << "Running SessionManager Tests..." << std::endl;
     
@@ -888,6 +988,7 @@ int main() {
     test_connect_request_bypasses_reconnect_policy_suppression();
     test_network_change_resets_reconnect_policy_backoff();
     test_maintenance_retries_disconnected_peer_even_when_another_connected();
+    test_user_disconnect_suppresses_auto_reconnect();
     
     if (tests_failed == 0) {
         std::cout << "ALL SESSION MANAGER TESTS PASSED" << std::endl;

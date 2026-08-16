@@ -15,57 +15,21 @@ android {
         versionName = "0.2.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-        ndk {
-            abiFilters += "arm64-v8a"
-        }
-
-        externalNativeBuild {
-            cmake {
-                cppFlags += "-std=c++17"
-                cppFlags += "-fexceptions"
-                cppFlags += "-DHAVE_JNI"
-            }
-        }
     }
 
-    buildTypes {
-        debug {
-            externalNativeBuild {
-                cmake {
-                    arguments += "-DBUILD_TESTING=ON"
-                }
-            }
-        }
-        release {
-            externalNativeBuild {
-                cmake {
-                    arguments += "-DBUILD_TESTING=OFF"
-                }
-            }
-        }
-    }
-
-    // Build flavors for thread mode selection
+    // Build flavors for thread mode selection. The native engine (and its
+    // SINGLE_THREAD_MODE CMake toggle) now lives in :litep2p-core; these flavors
+    // mirror the library's `threadMode` dimension so Gradle matches variants
+    // (multiThread<->multiThread, singleThread<->singleThread).
     flavorDimensions += "threadMode"
     productFlavors {
         create("multiThread") {
             dimension = "threadMode"
             // Normal multi-threaded mode (default)
-            externalNativeBuild {
-                cmake {
-                    arguments += "-DSINGLE_THREAD_MODE=OFF"
-                }
-            }
         }
         create("singleThread") {
             dimension = "threadMode"
             // Single-thread mode for reduced resource usage
-            externalNativeBuild {
-                cmake {
-                    arguments += "-DSINGLE_THREAD_MODE=ON"
-                }
-            }
             // Optional: different app suffix for testing both versions
             applicationIdSuffix = ".st"
             versionNameSuffix = "-singlethread"
@@ -85,16 +49,12 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
-
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
-        }
-    }
 }
 
 dependencies {
+    // The P2P engine: native library + public Kotlin API (Phase 2 module split).
+    implementation(project(":litep2p-core"))
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
     implementation(libs.material)
@@ -107,10 +67,6 @@ dependencies {
 
     // Watchdog that restores the engine after aggressive OEM battery kills.
     implementation(libs.androidx.work.runtime.ktx)
-
-    // Use libsodium from Maven Central
-    implementation("com.goterl:lazysodium-java:5.1.4")
-    implementation("net.java.dev.jna:jna:5.13.0")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

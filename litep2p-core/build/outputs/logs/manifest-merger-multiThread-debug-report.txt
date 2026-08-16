@@ -1,0 +1,32 @@
+-- Merging decision tree log ---
+manifest
+ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:2:1-11:12
+INJECTED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:2:1-11:12
+	package
+		INJECTED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml
+	xmlns:android
+		ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:2:11-69
+uses-permission#android.permission.INTERNET
+ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:7:5-67
+	android:name
+		ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:7:22-64
+uses-permission#android.permission.ACCESS_NETWORK_STATE
+ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:8:5-79
+	android:name
+		ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:8:22-76
+uses-permission#android.permission.ACCESS_WIFI_STATE
+ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:9:5-76
+	android:name
+		ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:9:22-73
+uses-permission#android.permission.CHANGE_WIFI_MULTICAST_STATE
+ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:10:5-86
+	android:name
+		ADDED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml:10:22-83
+uses-sdk
+INJECTED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml
+INJECTED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from /Users/Shiva/StudioProjects/Litep2p/litep2p-core/src/main/AndroidManifest.xml
