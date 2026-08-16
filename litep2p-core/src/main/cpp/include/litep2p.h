@@ -29,14 +29,42 @@ extern "C" {
 /* ------------------------------------------------------------------------ */
 /* Versioning (§3.3)                                                         */
 /* ------------------------------------------------------------------------ */
+/* The version is derived from gradle.properties LITEP2P_VERSION at build     */
+/* time (CMake defines these macros); the values below are the fallback for   */
+/* consumers that compile the header without the build system.                */
+#ifndef LITEP2P_VERSION_MAJOR
 #define LITEP2P_VERSION_MAJOR 0
+#endif
+#ifndef LITEP2P_VERSION_MINOR
 #define LITEP2P_VERSION_MINOR 3
+#endif
+#ifndef LITEP2P_VERSION_PATCH
 #define LITEP2P_VERSION_PATCH 0
+#endif
+#ifndef LITEP2P_VERSION_STRING
+#define LITEP2P_VERSION_STRING "0.3.0"
+#endif
 
 /* Packed version: major<<16 | minor<<8 | patch. */
 uint32_t litep2p_version(void);
 /* Human-readable version string, e.g. "0.3.0". */
 const char* litep2p_version_string(void);
+
+/* ------------------------------------------------------------------------ */
+/* Feature detection (compile-time module availability)                      */
+/* ------------------------------------------------------------------------ */
+/* Flags returned by litep2p_get_feature_flags(); each reflects whether the  */
+/* corresponding module was compiled into this build. Safe to call before    */
+/* litep2p_init() — the value is fixed for the lifetime of the process.      */
+#define LITEP2P_FEATURE_FILE_TRANSFER (1u << 0)
+#define LITEP2P_FEATURE_OVERLAY       (1u << 1)
+#define LITEP2P_FEATURE_PROXY         (1u << 2)
+#define LITEP2P_FEATURE_ENCRYPTION    (1u << 3)
+#define LITEP2P_FEATURE_DISCOVERY     (1u << 4)
+#define LITEP2P_FEATURE_TELEMETRY     (1u << 5)
+
+/* Bitmask of LITEP2P_FEATURE_* for this build. */
+uint32_t litep2p_get_feature_flags(void);
 
 /* ------------------------------------------------------------------------ */
 /* Result codes (§3.2)                                                       */

@@ -52,4 +52,36 @@ interface LiteP2PListener {
      * [LiteP2P.sendOverlay].
      */
     fun onOverlayDelivery(frameId: String, delivered: Boolean) {}
+
+    /* ------------------------------------------------------------------ */
+    /* File transfer (offer/accept model)                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * An incoming file-transfer offer arrived. Nothing is written to disk
+     * until the receiver explicitly calls [LiteP2P.acceptFileTransfer] with a
+     * save path, or [LiteP2P.declineFileTransfer] to refuse it.
+     */
+    fun onFileTransferOffered(offer: FileTransferOffer) {}
+
+    /**
+     * Progress update for a transfer (sender side of an outgoing transfer, and
+     * receiver side of an accepted incoming transfer).
+     *
+     * @param transferId The transfer id returned by [LiteP2P.sendFile] or from
+     *   the original [FileTransferOffer].
+     * @param progressPercent 0..100 completed.
+     * @param bytesPerSec Current throughput in bytes per second.
+     */
+    fun onTransferProgress(transferId: String, progressPercent: Float, bytesPerSec: Float) {}
+
+    /**
+     * A transfer finished.
+     *
+     * @param transferId The transfer id.
+     * @param success True when the transfer completed, false when it failed or
+     *   was cancelled.
+     * @param error Human-readable error message when [success] is false, or null.
+     */
+    fun onTransferCompleted(transferId: String, success: Boolean, error: String?) {}
 }

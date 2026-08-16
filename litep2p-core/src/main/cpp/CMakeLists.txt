@@ -3,7 +3,26 @@
 cmake_minimum_required(VERSION 3.22.1)
 
 # Project name and version
-project(litep2p VERSION 0.2.0)
+if(NOT DEFINED LITEP2P_VERSION)
+    set(LITEP2P_VERSION "0.3.0")
+endif()
+project(litep2p VERSION ${LITEP2P_VERSION})
+
+# Derive the ABI version macros from the single LITEP2P_VERSION string so the
+# engine reports exactly the same version as the Maven publication.
+string(REPLACE "." ";" _litep2p_version_parts "${LITEP2P_VERSION}")
+list(LENGTH _litep2p_version_parts _litep2p_version_part_count)
+if(_litep2p_version_part_count EQUAL 3)
+    list(GET _litep2p_version_parts 0 LITEP2P_VERSION_MAJOR)
+    list(GET _litep2p_version_parts 1 LITEP2P_VERSION_MINOR)
+    list(GET _litep2p_version_parts 2 LITEP2P_VERSION_PATCH)
+    add_compile_definitions(
+        LITEP2P_VERSION_MAJOR=${LITEP2P_VERSION_MAJOR}
+        LITEP2P_VERSION_MINOR=${LITEP2P_VERSION_MINOR}
+        LITEP2P_VERSION_PATCH=${LITEP2P_VERSION_PATCH}
+        LITEP2P_VERSION_STRING="${LITEP2P_VERSION}"
+    )
+endif()
 
 # Module Configuration Options - Enable/Disable features
 option(LITEP2P_ENABLE_NETWORK_TRAVERSAL "Enable NAT traversal and network traversal features" ON)

@@ -129,6 +129,39 @@ internal object LiteP2PNative {
     external fun overlayStats(): String
 
     /* ------------------------------------------------------------------ */
+    /* File transfer (offer/accept model)                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Sends a file to a connected peer. On success returns the transfer id;
+     * returns "" on failure (e.g. peer not connected). Progress/completion are
+     * reported through NativeEvents.onTransferProgress / onTransferCompleted.
+     */
+    external fun sendFile(peerId: String, filePath: String, priority: Int): String
+
+    /** Accepts an incoming offer and writes the file to savePath. */
+    external fun acceptFileTransfer(transferId: String, savePath: String): Int
+
+    /** Declines an incoming offer. */
+    external fun declineFileTransfer(transferId: String): Int
+
+    /** Pauses an active transfer. */
+    external fun pauseTransfer(transferId: String): Int
+
+    /** Resumes a paused transfer. */
+    external fun resumeTransfer(transferId: String): Int
+
+    /** Cancels a transfer. */
+    external fun cancelTransfer(transferId: String): Int
+
+    /* ------------------------------------------------------------------ */
+    /* Feature detection                                                   */
+    /* ------------------------------------------------------------------ */
+
+    /** Bitmask of LITEP2P_FEATURE_* for this build (litep2p_get_feature_flags). */
+    external fun nativeGetFeatureFlags(): Int
+
+    /* ------------------------------------------------------------------ */
     /* Proxy / relay                                                        */
     /* ------------------------------------------------------------------ */
 

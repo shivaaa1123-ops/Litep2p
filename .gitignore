@@ -17,6 +17,7 @@ adb_*.txt
 .DS_Store
 /build
 /app/build
+/litep2p-core/build/
 /app/.cxx
 /app/.externalNativeBuild
 /app/src/main/cpp/build

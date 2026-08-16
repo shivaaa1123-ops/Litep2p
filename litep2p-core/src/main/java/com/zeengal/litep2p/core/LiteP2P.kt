@@ -1,10 +1,12 @@
 package com.zeengal.litep2p.core
 
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * LiteP2P engine — the public Kotlin API for Android (api-spec.md §4).
+ * LiteP2P engine — the public Kotlin API for Android (api-spec.md §5).
  *
  * This is a process-wide singleton mirroring the one-engine-per-process C ABI
  * (litep2p.h §3.5). There is no instance construction and no `close()`; call
@@ -23,25 +25,36 @@ import java.util.concurrent.atomic.AtomicReference
  * LiteP2P.start()               // completion via LiteP2PListener.onEngineStarted
  * ```
  *
+ * Reactive usage (requires the coroutines/Flow adapters):
+ * ```
+ * launch {
+ *     LiteP2P.messagesFlow.collect { println("${it.peerId}: ${it.data}") }
+ * }
+ * LiteP2P.startAndAwait()       // suspends until RUNNING or failure
+ * ```
+ *
  * Threading: safe to call from any thread. Listener callbacks are dispatched on
- * an internal engine thread and are NOT posted to the main thread (api-spec.md §4.1).
+ * an internal engine thread and are NOT posted to the main thread (api-spec.md §11).
  *
  * Phase 3 status: the JNI bridge is re-pointed onto the public C ABI
  * (litep2p.h). Every method here maps to a `litep2p_*` function; the engine is
- * owned by the C ABI layer, not the binding. [disconnect] still returns
- * [EngineResult.UNSUPPORTED] because the engine has no per-peer disconnect API
- * yet (tracked in litep2p_c_api.cpp); file transfer is not yet part of the
- * Kotlin surface.
+ * owned by the C ABI layer, not the binding. File transfer, overlay, proxy,
+ * telemetry, and environment hints are all exposed on the Kotlin surface.
  */
 object LiteP2P {
 
     private const val TAG = "LiteP2P"
 
-    /** Matches litep2p.h LITEP2P_VERSION (0.3.0). */
-    const val version: String = "0.3.0"
+    /**
+     * SDK version, e.g. "0.3.0". Single-sourced from `gradle.properties`
+     * (`LITEP2P_VERSION`) via [BuildConfig] and matches the C ABI
+     * `litep2p_version_string()`.
+     */
+    val version: String = BuildConfig.LITEP2P_VERSION
 
     private val listeners = CopyOnWriteArrayList<LiteP2PListener>()
-    private val stateRef = AtomicReference(EngineState.STOPPED)
+    private val _stateFlow = MutableStateFlow(EngineState.STOPPED)
+    private val stateFlowView: StateFlow<EngineState> = _stateFlow.asStateFlow()
 
     @Volatile
     private var config: LiteP2PConfig? = null
@@ -50,7 +63,37 @@ object LiteP2P {
     private var initialized: Boolean = false
 
     /** Current engine lifecycle state. */
-    val state: EngineState get() = stateRef.get()
+    val state: EngineState get() = _stateFlow.value
+
+    /**
+     * Observable engine lifecycle state.
+     *
+     * A [StateFlow]: collects the current value immediately and emits every
+     * subsequent transition (`STOPPED → STARTING → RUNNING → STOPPING → STOPPED`).
+     * Transitions are emitted from the engine thread that performs them; collect
+     * from any dispatcher. Useful with [startAndAwait] / [stopAndAwait].
+     */
+    val stateFlow: StateFlow<EngineState> get() = stateFlowView
+
+    /** Compile-time capabilities of the native build. Safe to query before [init]. */
+    val capabilities: LiteP2PCapabilities
+        get() {
+            val flags = runCatching { LiteP2PNative.nativeGetFeatureFlags() }
+                .getOrDefault(0)
+            return LiteP2PCapabilities.fromFlags(flags)
+        }
+
+    /** True when the file-transfer module is compiled into this build. */
+    fun supportsFileTransfer(): Boolean = capabilities.fileTransfer
+
+    /** True when the multi-hop overlay module is compiled into this build. */
+    fun supportsOverlay(): Boolean = capabilities.overlay
+
+    /** True when the proxy/relay module is compiled into this build. */
+    fun supportsProxy(): Boolean = capabilities.proxy
+
+    /** True when Noise NK encryption is compiled into this build. */
+    fun supportsEncryption(): Boolean = capabilities.encryption
 
     /**
      * The local peer id. Once the engine has started this returns the resolved id
@@ -79,7 +122,7 @@ object LiteP2P {
      */
     @Synchronized
     fun init(config: LiteP2PConfig): EngineResult {
-        val s = stateRef.get()
+        val s = _stateFlow.value
         if (s == EngineState.RUNNING || s == EngineState.STARTING) {
             return EngineResult.INVALID_STATE
         }
@@ -116,17 +159,17 @@ object LiteP2P {
         if (!initialized || cfg == null) {
             return EngineResult.INVALID_STATE
         }
-        val s = stateRef.get()
+        val s = _stateFlow.value
         if (s != EngineState.STOPPED) {
             return EngineResult.BUSY
         }
 
-        stateRef.set(EngineState.STARTING)
+        _stateFlow.value = EngineState.STARTING
         val rc = LiteP2PNative.nativeStart()
         val mapped = EngineResult.fromCode(rc)
         if (mapped != EngineResult.OK) {
             // Native refused; don't leave callers stuck in STARTING.
-            stateRef.set(EngineState.STOPPED)
+            _stateFlow.value = EngineState.STOPPED
         }
         return mapped
     }
@@ -139,11 +182,11 @@ object LiteP2P {
      */
     @Synchronized
     fun stop(): EngineResult {
-        val s = stateRef.get()
+        val s = _stateFlow.value
         if (s == EngineState.STOPPED || s == EngineState.STOPPING) {
             return EngineResult.OK
         }
-        stateRef.set(EngineState.STOPPING)
+        _stateFlow.value = EngineState.STOPPING
         LiteP2PNative.nativeStop()
         return EngineResult.OK
     }
@@ -154,7 +197,7 @@ object LiteP2P {
      */
     @Synchronized
     fun shutdown(): EngineResult {
-        val s = stateRef.get()
+        val s = _stateFlow.value
         if (s == EngineState.RUNNING || s == EngineState.STARTING) {
             stop()
         }
@@ -162,7 +205,7 @@ object LiteP2P {
         LiteP2PNative.nativeShutdown()
         initialized = false
         config = null
-        stateRef.set(EngineState.STOPPED)
+        _stateFlow.value = EngineState.STOPPED
         return EngineResult.OK
     }
 
@@ -197,9 +240,21 @@ object LiteP2P {
     /**
      * Disconnects a specific peer.
      *
-     * Returns [EngineResult.UNSUPPORTED]: the engine has no per-peer disconnect
-     * API yet (litep2p_c_api.cpp tracks this gap). The call is routed through the
-     * C ABI so it will start working once the engine grows the capability.
+     * Requests the engine to tear down the session with [peerId]: transport
+     * connections are closed best-effort, the peer FSM is driven to
+     * DISCONNECTED, and automatic reconnection for that peer is suppressed
+     * until it is explicitly re-connected via [connect] or it establishes an
+     * inbound connection. The peer's updated state is reported asynchronously
+     * through [LiteP2PListener.onPeersChanged].
+     *
+     * Wired through the C ABI (`litep2p_disconnect`).
+     *
+     * @param peerId the stable peer id to disconnect.
+     * @return [EngineResult.OK] when the peer is known to the engine and the
+     *         disconnect was accepted; [EngineResult.NOT_FOUND] when the peer
+     *         is not known to the engine; [EngineResult.INVALID_ARG] when
+     *         [peerId] is blank; [EngineResult.INVALID_STATE] when the engine
+     *         is not initialized or not running.
      */
     fun disconnect(peerId: String): EngineResult {
         if (peerId.isBlank()) return EngineResult.INVALID_ARG
@@ -237,6 +292,74 @@ object LiteP2P {
     fun registerPeerKey(peerId: String, publicKeyHex: String): EngineResult {
         if (peerId.isBlank() || publicKeyHex.isBlank()) return EngineResult.INVALID_ARG
         return EngineResult.fromCode(LiteP2PNative.registerPeerKey(peerId, publicKeyHex))
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* File transfer (offer/accept model)                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Sends a file to a connected peer.
+     *
+     * The receiver is notified via [LiteP2PListener.onFileTransferOffered] and
+     * nothing is written to disk until it calls [acceptFileTransfer]. Sender
+     * and receiver both receive progress/completion through
+     * [LiteP2PListener.onTransferProgress] / [LiteP2PListener.onTransferCompleted].
+     *
+     * Requires the file-transfer module (see [supportsFileTransfer]) and an
+     * established session with [peerId].
+     *
+     * @param peerId the connected peer to send to.
+     * @param filePath absolute path of the file to send (must be readable).
+     * @param priority scheduling priority of the transfer.
+     * @return the transfer id on success, or null when the request was refused
+     *   (blank args, unknown/not-connected peer, or module unavailable). The
+     *   detailed result code is available in the engine log.
+     */
+    fun sendFile(
+        peerId: String,
+        filePath: String,
+        priority: FileTransferPriority = FileTransferPriority.NORMAL
+    ): String? {
+        if (peerId.isBlank() || filePath.isBlank()) return null
+        val id = LiteP2PNative.sendFile(peerId, filePath, priority.wire)
+        return id.ifEmpty { null }
+    }
+
+    /**
+     * Accepts an incoming [FileTransferOffer] and writes the received file to
+     * [savePath]. Until this is called, nothing is written to disk.
+     *
+     * @return [EngineResult.OK] when accepted, [EngineResult.NOT_FOUND] for an
+     *   unknown/expired transfer id, [EngineResult.INVALID_ARG] for blank args.
+     */
+    fun acceptFileTransfer(transferId: String, savePath: String): EngineResult {
+        if (transferId.isBlank() || savePath.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.acceptFileTransfer(transferId, savePath))
+    }
+
+    /** Declines an incoming [FileTransferOffer]. */
+    fun declineFileTransfer(transferId: String): EngineResult {
+        if (transferId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.declineFileTransfer(transferId))
+    }
+
+    /** Pauses an active transfer. */
+    fun pauseTransfer(transferId: String): EngineResult {
+        if (transferId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.pauseTransfer(transferId))
+    }
+
+    /** Resumes a paused transfer. */
+    fun resumeTransfer(transferId: String): EngineResult {
+        if (transferId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.resumeTransfer(transferId))
+    }
+
+    /** Cancels a transfer (sender or receiver side). */
+    fun cancelTransfer(transferId: String): EngineResult {
+        if (transferId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.cancelTransfer(transferId))
     }
 
     /* ------------------------------------------------------------------ */
@@ -352,12 +475,12 @@ object LiteP2P {
     /* ------------------------------------------------------------------ */
 
     internal fun dispatchEngineStarted() {
-        stateRef.set(EngineState.RUNNING)
+        _stateFlow.value = EngineState.RUNNING
         for (l in listeners) runCatching { l.onEngineStarted() }
     }
 
     internal fun dispatchEngineStopped() {
-        stateRef.set(EngineState.STOPPED)
+        _stateFlow.value = EngineState.STOPPED
         for (l in listeners) runCatching { l.onEngineStopped() }
     }
 
@@ -383,5 +506,17 @@ object LiteP2P {
 
     internal fun dispatchOverlayDelivery(frameId: String, delivered: Boolean) {
         for (l in listeners) runCatching { l.onOverlayDelivery(frameId, delivered) }
+    }
+
+    internal fun dispatchFileTransferOffered(offer: FileTransferOffer) {
+        for (l in listeners) runCatching { l.onFileTransferOffered(offer) }
+    }
+
+    internal fun dispatchTransferProgress(transferId: String, progressPercent: Float, bytesPerSec: Float) {
+        for (l in listeners) runCatching { l.onTransferProgress(transferId, progressPercent, bytesPerSec) }
+    }
+
+    internal fun dispatchTransferCompleted(transferId: String, success: Boolean, error: String?) {
+        for (l in listeners) runCatching { l.onTransferCompleted(transferId, success, error) }
     }
 }

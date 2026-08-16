@@ -61,4 +61,24 @@ object NativeEvents {
     fun onOverlayDelivery(frameId: String, delivered: Boolean) {
         LiteP2P.dispatchOverlayDelivery(frameId, delivered)
     }
+
+    /** File-transfer offer arrived (transfer_id, peer_id, file_name, size_bytes). */
+    @JvmStatic
+    fun onFileTransferOffered(transferId: String, peerId: String, fileName: String, sizeBytes: Long) {
+        LiteP2P.dispatchFileTransferOffered(
+            FileTransferOffer(transferId, peerId, fileName, sizeBytes)
+        )
+    }
+
+    /** File-transfer progress (transfer_id, progress 0..100, bytes_per_sec). */
+    @JvmStatic
+    fun onTransferProgress(transferId: String, progressPercent: Float, bytesPerSec: Float) {
+        LiteP2P.dispatchTransferProgress(transferId, progressPercent, bytesPerSec)
+    }
+
+    /** File-transfer completion (transfer_id, success, error). */
+    @JvmStatic
+    fun onTransferCompleted(transferId: String, success: Boolean, error: String?) {
+        LiteP2P.dispatchTransferCompleted(transferId, success, error)
+    }
 }

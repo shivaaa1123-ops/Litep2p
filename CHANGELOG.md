@@ -1,0 +1,83 @@
+# Changelog
+
+All notable changes to LiteP2P are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
+adheres to [Semantic Versioning](https://semver.org/). The SDK version is
+single-sourced from `LITEP2P_VERSION` in `gradle.properties` and mirrored in
+`litep2p.h` (`LITEP2P_VERSION_*`) and `LiteP2P.version`.
+
+## [0.3.0] - Unreleased
+
+### Added
+- **Public C ABI** (`litep2p-core/src/main/cpp/include/litep2p.h`): the stable
+  contract between integrators and the engine — process-wide singleton (no
+  handles), `struct_size` versioned structs, enumerated result codes, feature
+  flags, fire-and-forget `litep2p_send`, callback-accepted file transfers.
+- **JNI bridge re-pointed onto the C ABI**: every Kotlin `LiteP2P` method now
+  maps 1:1 to a `litep2p_*` function; the engine is owned by the C ABI layer.
+- **Multi-hop overlay routing (LPX2)**: source-routed sealed relay hops,
+  stateless relays, offline mailboxes, bounded-reliable sends (`want_ack` +
+  `on_overlay_delivery`), frame-id dedup, TTL, replay protection.
+- **Censorship resistance (Phase B)**: OBF1 obfuscated transport (X25519 +
+  XChaCha20-Poly1305, length-bucketed padding), cover traffic, Ed25519 origin
+  authentication (payloads + ACKs), relay peer exchange.
+- **Overlay API surface**: C ABI `litep2p_send_overlay` / `pickup_mailbox` /
+  `register_relay` / `register_peer_signing_key` / `overlay_stats`; Kotlin
+  `sendOverlay`, `pickupMailbox`, `registerRelay`, `registerPeerSigningKey`,
+  `setOverlayRelayEnabled`, `overlayStats`.
+- **Maven publication** (`maven-publish`): `com.zeengal:litep2p-core` (+
+  `-singleThread` variant) with POM license/SCM/developer metadata, sources
+  jar, and Dokka KDoc javadoc jar; publish to Maven Local today, Maven
+  Central-ready.
+- **Version single-sourcing**: `LITEP2P_VERSION` in `gradle.properties` feeds
+  the POM, `BuildConfig` (`LiteP2P.version`), and the native engine
+  (`litep2p_version_string()`).
+- **Reproducible archives**: `android.enableReproducibleArchives=true`,
+  NDK pinned to `26.1.10909125`.
+- **CI**: `.github/workflows/build-and-publish.yml` — Android build (both
+  thread-mode flavors, all ABIs) + JVM unit tests + desktop C ABI test suite
+  on every push/PR; Maven artifacts attached to GitHub Releases on `v*` tags
+  with tag↔version verification.
+- **SDK reference**: `docs/api-spec.md` consolidated into a single 15-section
+  integration document (quickstart, architecture, C ABI + Kotlin reference,
+  messaging/overlay models, telemetry contract, config reference, threading
+  and lifecycle contract, worked examples, error codes).
+
+### Changed
+- `:app` is now explicitly a development/test harness; it consumes
+  `:litep2p-core` and must not leak into the library's public API.
+- Desktop build mirrors the Android version macros so tests exercise the same
+  version string.
+
+### Fixed
+- Desktop `ENABLE_OVERLAY_MODULE` option ordering (overlay was silently
+  compiled out of SessionManager).
+- `c_api_test` keystore isolation; overlay mailbox accounting, ACK
+  path/correlation, cover-hop parsing, envelope padding.
+
+## [0.2.0] - 2026-08-16
+
+### Added
+- Engine lifecycle overhaul: always-on Android service layer
+  (`LiteP2PService` foreground service, `EngineController` state machine,
+  `EngineWatchdogWorker`, `BootReceiver`, persisted desired state).
+- Homogeneous/heterogeneous communication modes (UDP+TCP listeners, per-peer
+  transport tracking).
+- Restart recovery: maintenance reconnect for stuck peers, stale Noise
+  session / transport-key cleanup on remote restart.
+- Public API specification (`docs/api-spec.md`): fire-and-forget send,
+  singleton engine, AAR-only distribution decisions finalized.
+- Phase 1 C ABI extraction (`litep2p.h` + `litep2p_c_api.cpp`).
+- Material 3 dark console UI for the harness app.
+- Harness tests: `e2e_messaging_test.py`, `rugged_soak_test.py`.
+
+### Changed
+- Proxy gateway disabled by default; secrets no longer tracked in git.
+
+## [0.1.0] - 2026-01-07
+
+### Added
+- Initial import: C++ P2P engine (discovery, NAT traversal, Noise NK
+  sessions, messaging, file transfer, proxy), Android harness app, desktop
+  build, signaling server, stress/WAN self-hosted CI workflows.
+- Vendored libsodium build tooling for Android ABIs.

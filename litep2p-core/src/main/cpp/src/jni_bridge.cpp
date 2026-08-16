@@ -78,6 +78,9 @@ static jmethodID g_addLogMethod = nullptr;
 static jmethodID g_addTelemetryJsonMethod = nullptr;
 static jmethodID g_onAckReceivedMethod = nullptr;
 static jmethodID g_onOverlayDeliveryMethod = nullptr;
+static jmethodID g_onFileTransferOfferedMethod = nullptr;
+static jmethodID g_onTransferProgressMethod = nullptr;
+static jmethodID g_onTransferCompletedMethod = nullptr;
 static jclass g_peerInfoClass = nullptr;
 static jmethodID g_peerInfoCtor = nullptr;
 
@@ -265,6 +268,88 @@ void cabi_on_overlay_delivery(void* /*user_data*/, const char* frame_id, int del
     env->DeleteLocalRef(jFrameId);
 }
 
+void cabi_on_file_transfer_offered(void* /*user_data*/, const litep2p_file_offer_t* offer) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onFileTransferOfferedMethod || !offer) return;
+
+    jstring jId = env->NewStringUTF(offer->transfer_id);
+    if (!jId) {
+        clear_any_exception(env);
+        return;
+    }
+    jstring jPeer = env->NewStringUTF(offer->peer_id);
+    if (!jPeer) {
+        env->DeleteLocalRef(jId);
+        clear_any_exception(env);
+        return;
+    }
+    jstring jName = env->NewStringUTF(offer->file_name);
+    if (!jName) {
+        env->DeleteLocalRef(jId);
+        env->DeleteLocalRef(jPeer);
+        clear_any_exception(env);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onFileTransferOfferedMethod,
+                              jId, jPeer, jName, static_cast<jlong>(offer->size_bytes));
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onFileTransferOffered");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jId);
+    env->DeleteLocalRef(jPeer);
+    env->DeleteLocalRef(jName);
+}
+
+void cabi_on_transfer_progress(void* /*user_data*/, const char* transfer_id,
+                               float progress_percent, float bytes_per_sec) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onTransferProgressMethod || !transfer_id) return;
+
+    jstring jId = env->NewStringUTF(transfer_id);
+    if (!jId) {
+        clear_any_exception(env);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onTransferProgressMethod,
+                              jId, static_cast<jfloat>(progress_percent),
+                              static_cast<jfloat>(bytes_per_sec));
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onTransferProgress");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jId);
+}
+
+void cabi_on_transfer_completed(void* /*user_data*/, const char* transfer_id,
+                                int success, const char* error) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onTransferCompletedMethod || !transfer_id) return;
+
+    jstring jId = env->NewStringUTF(transfer_id);
+    if (!jId) {
+        clear_any_exception(env);
+        return;
+    }
+    jstring jError = error ? env->NewStringUTF(error) : nullptr;
+    if (error && !jError) {
+        env->DeleteLocalRef(jId);
+        clear_any_exception(env);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onTransferCompletedMethod,
+                              jId, success ? JNI_TRUE : JNI_FALSE, jError);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onTransferCompleted");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    if (jError) env->DeleteLocalRef(jError);
+    env->DeleteLocalRef(jId);
+}
+
 void register_cabi_callbacks() {
     litep2p_callbacks_t cb{};
     cb.struct_size = sizeof(litep2p_callbacks_t);
@@ -281,6 +366,20 @@ void register_cabi_callbacks() {
     if (rc != LITEP2P_OK) {
         nativeLog("JNI_BRIDGE: litep2p_set_callbacks failed: " +
                   std::string(litep2p_result_string(rc)));
+    }
+
+    // File-transfer offer/progress/completion callbacks (offer/accept model).
+    litep2p_transfer_callbacks_t tc{};
+    tc.struct_size = sizeof(litep2p_transfer_callbacks_t);
+    tc.user_data = nullptr;
+    tc.on_file_transfer_offered = cabi_on_file_transfer_offered;
+    tc.on_progress = cabi_on_transfer_progress;
+    tc.on_completed = cabi_on_transfer_completed;
+
+    const litep2p_result_t trc = litep2p_set_transfer_callbacks(&tc);
+    if (trc != LITEP2P_OK) {
+        nativeLog("JNI_BRIDGE: litep2p_set_transfer_callbacks failed: " +
+                  std::string(litep2p_result_string(trc)));
     }
 }
 
@@ -608,6 +707,29 @@ bool jniBridgeInit(JNIEnv* env) {
         nativeLog("JNI_BRIDGE: NativeEvents.onOverlayDelivery not found (overlay ACK UI disabled)");
         clear_any_exception(env);
     }
+    // File-transfer callbacks are optional conveniences too; missing methods
+    // only disable the file-transfer UI, never the engine.
+    jmethodID newOnFileTransferOfferedMethod =
+        env->GetStaticMethodID(newEventsClass, "onFileTransferOffered",
+                               "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)V");
+    if (!newOnFileTransferOfferedMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onFileTransferOffered not found (file transfer UI disabled)");
+        clear_any_exception(env);
+    }
+    jmethodID newOnTransferProgressMethod =
+        env->GetStaticMethodID(newEventsClass, "onTransferProgress",
+                               "(Ljava/lang/String;FF)V");
+    if (!newOnTransferProgressMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onTransferProgress not found (file transfer UI disabled)");
+        clear_any_exception(env);
+    }
+    jmethodID newOnTransferCompletedMethod =
+        env->GetStaticMethodID(newEventsClass, "onTransferCompleted",
+                               "(Ljava/lang/String;ZLjava/lang/String;)V");
+    if (!newOnTransferCompletedMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onTransferCompleted not found (file transfer UI disabled)");
+        clear_any_exception(env);
+    }
 
     // PeerInfo class (required).
     jclass localPeerInfoClass = env->FindClass("com/zeengal/litep2p/core/PeerInfo");
@@ -651,6 +773,9 @@ bool jniBridgeInit(JNIEnv* env) {
     g_addTelemetryJsonMethod = newAddTelemetryJsonMethod;
     g_onAckReceivedMethod = newOnAckReceivedMethod;
     g_onOverlayDeliveryMethod = newOnOverlayDeliveryMethod;
+    g_onFileTransferOfferedMethod = newOnFileTransferOfferedMethod;
+    g_onTransferProgressMethod = newOnTransferProgressMethod;
+    g_onTransferCompletedMethod = newOnTransferCompletedMethod;
 
     g_jni_cache_initialized = true;
     nativeLog("JNI_BRIDGE: Initialization complete.");
@@ -677,6 +802,9 @@ void jniBridgeCleanup(JNIEnv* env) {
     g_addTelemetryJsonMethod = nullptr;
     g_onAckReceivedMethod = nullptr;
     g_onOverlayDeliveryMethod = nullptr;
+    g_onFileTransferOfferedMethod = nullptr;
+    g_onTransferProgressMethod = nullptr;
+    g_onTransferCompletedMethod = nullptr;
 
     g_jni_cache_initialized = false;
 }
@@ -815,6 +943,80 @@ Java_com_zeengal_litep2p_core_LiteP2PNative_overlayStats(JNIEnv* env, jobject /*
     jstring out = env->NewStringUTF(json);
     litep2p_free(json);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// JNI entry points — file transfer (offer/accept model, Phase C: Kotlin API).
+// ---------------------------------------------------------------------------
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_sendFile(
+    JNIEnv* env, jobject /*thiz*/, jstring peerId, jstring filePath, jint priority) {
+    const std::string peer_id = jstring_to_utf8(env, peerId);
+    const std::string file_path = jstring_to_utf8(env, filePath);
+    if (peer_id.empty() || file_path.empty()) return env->NewStringUTF("");
+
+    char transfer_id[64] = {0};
+    const litep2p_result_t rc = litep2p_send_file(
+        peer_id.c_str(), file_path.c_str(), static_cast<int>(priority),
+        transfer_id, sizeof(transfer_id));
+    if (rc != LITEP2P_OK) {
+        nativeLog("JNI_BRIDGE: sendFile failed: " + std::string(litep2p_result_string(rc)));
+        return env->NewStringUTF("");
+    }
+    return env->NewStringUTF(transfer_id);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_acceptFileTransfer(
+    JNIEnv* env, jobject /*thiz*/, jstring transferId, jstring savePath) {
+    const std::string transfer_id = jstring_to_utf8(env, transferId);
+    const std::string save_path = jstring_to_utf8(env, savePath);
+    if (transfer_id.empty() || save_path.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_accept_file_transfer(transfer_id.c_str(), save_path.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_declineFileTransfer(
+    JNIEnv* env, jobject /*thiz*/, jstring transferId) {
+    const std::string transfer_id = jstring_to_utf8(env, transferId);
+    if (transfer_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_decline_file_transfer(transfer_id.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_pauseTransfer(
+    JNIEnv* env, jobject /*thiz*/, jstring transferId) {
+    const std::string transfer_id = jstring_to_utf8(env, transferId);
+    if (transfer_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_pause_transfer(transfer_id.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_resumeTransfer(
+    JNIEnv* env, jobject /*thiz*/, jstring transferId) {
+    const std::string transfer_id = jstring_to_utf8(env, transferId);
+    if (transfer_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_resume_transfer(transfer_id.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_cancelTransfer(
+    JNIEnv* env, jobject /*thiz*/, jstring transferId) {
+    const std::string transfer_id = jstring_to_utf8(env, transferId);
+    if (transfer_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_cancel_transfer(transfer_id.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// JNI entry point — feature detection.
+// ---------------------------------------------------------------------------
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nativeGetFeatureFlags(
+    JNIEnv* env, jobject /*thiz*/) {
+    (void)env;
+    return (jint)litep2p_get_feature_flags();
 }
 
 

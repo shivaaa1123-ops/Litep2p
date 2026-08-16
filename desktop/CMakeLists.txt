@@ -1,6 +1,28 @@
 cmake_minimum_required(VERSION 3.16)
 project(LiteP2P_Desktop C CXX)
 
+# Single source of truth for the SDK version (mirrors gradle.properties
+# LITEP2P_VERSION). Override with: cmake -DLITEP2P_VERSION=x.y.z ..
+if(NOT DEFINED LITEP2P_VERSION)
+    set(LITEP2P_VERSION "0.3.0")
+endif()
+
+# Derive the ABI version macros so desktop tests exercise the same version
+# string/macros as the Android build.
+string(REPLACE "." ";" _litep2p_version_parts "${LITEP2P_VERSION}")
+list(LENGTH _litep2p_version_parts _litep2p_version_part_count)
+if(_litep2p_version_part_count EQUAL 3)
+    list(GET _litep2p_version_parts 0 LITEP2P_VERSION_MAJOR)
+    list(GET _litep2p_version_parts 1 LITEP2P_VERSION_MINOR)
+    list(GET _litep2p_version_parts 2 LITEP2P_VERSION_PATCH)
+    add_compile_definitions(
+        LITEP2P_VERSION_MAJOR=${LITEP2P_VERSION_MAJOR}
+        LITEP2P_VERSION_MINOR=${LITEP2P_VERSION_MINOR}
+        LITEP2P_VERSION_PATCH=${LITEP2P_VERSION_PATCH}
+        LITEP2P_VERSION_STRING="${LITEP2P_VERSION}"
+    )
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -62,6 +84,7 @@ add_compile_definitions(
     BUILD_TARGET_DESKTOP=1
     HAVE_JNI=0
     HAVE_NOISE_PROTOCOL=1
+    HAVE_FILE_TRANSFER=1
 )
 
 if(SINGLE_THREAD_MODE)

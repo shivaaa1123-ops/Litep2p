@@ -251,7 +251,28 @@ uint32_t litep2p_version(void) {
 }
 
 const char* litep2p_version_string(void) {
-    return "0.3.0";
+    return LITEP2P_VERSION_STRING;
+}
+
+uint32_t litep2p_get_feature_flags(void) {
+    uint32_t flags = 0u;
+#ifdef HAVE_FILE_TRANSFER
+    flags |= LITEP2P_FEATURE_FILE_TRANSFER;
+#endif
+#if ENABLE_OVERLAY_MODULE
+    flags |= LITEP2P_FEATURE_OVERLAY;
+#endif
+#if ENABLE_PROXY_MODULE
+    flags |= LITEP2P_FEATURE_PROXY;
+#endif
+#ifdef HAVE_NOISE_PROTOCOL
+    flags |= LITEP2P_FEATURE_ENCRYPTION;
+#endif
+#ifdef HAVE_DISCOVERY
+    flags |= LITEP2P_FEATURE_DISCOVERY;
+#endif
+    flags |= LITEP2P_FEATURE_TELEMETRY;
+    return flags;
 }
 
 const char* litep2p_result_string(litep2p_result_t result) {

@@ -1,0 +1,211 @@
+name: Build, test & publish
+
+# Standard-runner CI: Android build + JVM unit tests + desktop C ABI tests on
+# every push/PR, and Maven artifact production + GitHub Release upload on tags
+# (`v<version>`, e.g. `v0.3.0`). The self-hosted stress/WAN workflows remain
+# scheduled/nightly separately.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # allows the tag job to create/attach a GitHub Release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ANDROID_COMPILE_SDK: 36
+  ANDROID_BUILD_TOOLS: 36.0.0
+  # Must match `ndkVersion` in litep2p-core/build.gradle.kts.
+  ANDROID_NDK: 26.1.10909125
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Android: JVM unit tests + release AAR for both thread-mode flavors.
+  # Compiles every ABI in litep2p-core's abiFilters and uploads the AARs.
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android (${{ matrix.flavor }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [ multiThread, singleThread ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK platform, build-tools, NDK and CMake
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-${ANDROID_COMPILE_SDK}" \
+                     "build-tools;${ANDROID_BUILD_TOOLS}" \
+                     "ndk;${ANDROID_NDK}" \
+                     "cmake;3.22.1"
+
+      - name: Set up Gradle (cached)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Unit tests + assemble release
+        run: |
+          ./gradlew \
+            ":litep2p-core:test${MAIN_FLAVOR}DebugUnitTest" \
+            ":litep2p-core:assemble${MAIN_FLAVOR}Release"
+        env:
+          MAIN_FLAVOR: ${{ matrix.flavor }}
+
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: litep2p-core-${{ matrix.flavor }}
+          path: litep2p-core/build/outputs/aar/litep2p-core-${{ matrix.flavor }}-release.aar
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Desktop: build + run the hermetic C++ test suites (same engine +
+  # litep2p.h contract as Android). Runs on ubuntu (epoll reactor path).
+  #
+  # Included suites are all loopback/in-memory (no external network):
+  #   c_api_test            — public C ABI conformance (lifecycle, config,
+  #                           disconnect suppression, file-transfer errors,
+  #                           overlay end-to-end)
+  #   crypto_test           — Noise NK / transport-key primitives
+  #   nat_traversal_test    — STUN parsing, reconnect policy (local sockets)
+  #   file_transfer_test    — chunking/resume round-trips on local files
+  #   overlay_test          — LPX2 onion routing, mailboxes, replay/TTL
+  #   proxy_test            — LPX1 tunnel framing over loopback
+  #
+  # Excluded (deliberately):
+  #   session_manager_test  — known test-isolation failure on single-host
+  #                           runs (shared LAN broadcast Discovery singleton
+  #                           lets peers connect around the stale-endpoint
+  #                           assertion); re-enable once isolated.
+  #   wan_integration_runner, message_size_runner — require real networks;
+  #                           covered by the self-hosted SG/US workflows.
+  #   quic_test             — requires vendored picoquic/picotls builds not
+  #                           present on standard runners.
+  # -------------------------------------------------------------------------
+  desktop-c-test:
+    name: Desktop C ABI tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config libsodium-dev nlohmann-json3-dev
+
+      - name: Configure
+        run: cmake -S desktop -B desktop/build-ci -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build test suites
+        run: |
+          cmake --build desktop/build-ci -j"$(nproc)" --target \
+            c_api_test \
+            crypto_test \
+            nat_traversal_test \
+            file_transfer_test \
+            overlay_test \
+            proxy_test
+
+      - name: Run C ABI conformance tests
+        run: ./desktop/build-ci/bin/c_api_test
+
+      - name: Run crypto tests
+        run: ./desktop/build-ci/bin/crypto_test
+
+      - name: Run NAT traversal tests
+        run: ./desktop/build-ci/bin/nat_traversal_test
+
+      - name: Run file transfer tests
+        run: ./desktop/build-ci/bin/file_transfer_test
+
+      - name: Run overlay tests
+        run: ./desktop/build-ci/bin/overlay_test
+
+      - name: Run proxy tests
+        run: ./desktop/build-ci/bin/proxy_test
+
+  # ---------------------------------------------------------------------------
+  # Publish: only on tags `v*`. Produces the Maven artifacts (AAR + POM +
+  # sources + KDoc) for both flavors via publishToMavenLocal and attaches them
+  # to the GitHub Release. Guard: tag must match gradle.properties version.
+  # (Maven Central publishing can be added by wiring mavenCentral() + signing;
+  # see docs/api-spec.md §2.1.)
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish Maven artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android, desktop-c-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform, build-tools, NDK and CMake
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-${ANDROID_COMPILE_SDK}" \
+                     "build-tools;${ANDROID_BUILD_TOOLS}" \
+                     "ndk;${ANDROID_NDK}" \
+                     "cmake;3.22.1"
+
+      - name: Set up Gradle (cached)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Verify tag matches LITEP2P_VERSION
+        run: |
+          SDK_VERSION="$(grep -m1 '^LITEP2P_VERSION=' gradle.properties | cut -d= -f2)"
+          if [ "${GITHUB_REF_NAME#v}" != "${SDK_VERSION}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match LITEP2P_VERSION=${SDK_VERSION} in gradle.properties"
+            exit 1
+          fi
+          echo "Publishing version ${SDK_VERSION}"
+
+      - name: Build + publish to Maven Local (validates and produces artifacts)
+        run: |
+          ./gradlew \
+            :litep2p-core:publishMultiThreadReleasePublicationToMavenLocal \
+            :litep2p-core:publishSingleThreadReleasePublicationToMavenLocal
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p release-artifacts
+          cp -rv "$HOME/.m2/repository/com/zeengal/litep2p-core/"* release-artifacts/
+
+      - name: Attach artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

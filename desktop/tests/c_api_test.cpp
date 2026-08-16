@@ -541,6 +541,37 @@ static bool test_overlay_api(const std::filesystem::path& workdir) {
 }
 
 // ---------------------------------------------------------------------------
+// Test: feature flags (compile-time module availability)
+// ---------------------------------------------------------------------------
+static bool test_feature_flags() {
+    std::cout << "Testing feature flags..." << std::endl;
+
+    const uint32_t flags = litep2p_get_feature_flags();
+    // Telemetry is always compiled in.
+    TEST_ASSERT((flags & LITEP2P_FEATURE_TELEMETRY) != 0,
+                "telemetry feature flag should be set");
+
+    // The desktop build compiles file transfer, overlay, proxy and noise.
+    TEST_ASSERT((flags & LITEP2P_FEATURE_FILE_TRANSFER) != 0,
+                "file-transfer feature flag should be set");
+    TEST_ASSERT((flags & LITEP2P_FEATURE_OVERLAY) != 0,
+                "overlay feature flag should be set");
+    TEST_ASSERT((flags & LITEP2P_FEATURE_PROXY) != 0,
+                "proxy feature flag should be set");
+    TEST_ASSERT((flags & LITEP2P_FEATURE_ENCRYPTION) != 0,
+                "encryption feature flag should be set");
+
+    // No reserved/unknown bits set.
+    TEST_ASSERT((flags & ~(LITEP2P_FEATURE_FILE_TRANSFER | LITEP2P_FEATURE_OVERLAY |
+                           LITEP2P_FEATURE_PROXY | LITEP2P_FEATURE_ENCRYPTION |
+                           LITEP2P_FEATURE_DISCOVERY | LITEP2P_FEATURE_TELEMETRY)) == 0,
+                "no unknown feature bits should be set");
+
+    std::cout << "Feature flags Passed!" << std::endl;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -553,6 +584,7 @@ int main() {
     std::filesystem::create_directories(workdir, ec);
 
     test_version_and_result_strings();
+    test_feature_flags();
     test_config_init_and_invalid_args();
     test_lifecycle(workdir / "lifecycle");
     test_disconnect_suppression_via_c_api(workdir / "suppress");

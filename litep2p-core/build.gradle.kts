@@ -1,7 +1,13 @@
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.dokka)
+    `maven-publish`
 }
+
+// Single source of truth for the release version (see gradle.properties).
+val litep2pVersion: String =
+    providers.gradleProperty("LITEP2P_VERSION").get()
 
 android {
     namespace = "com.zeengal.litep2p.core"
@@ -12,8 +18,13 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
+        // Package the standard production ABI set. Prebuilt libsodium exists
+        // for each (see cpp/libsodium/<abi>/); the engine has no arch-specific
+        // code. `x86` (32-bit) is excluded: its vendored libsodium.a is not
+        // -fPIC and cannot be linked into a shared .so; x86_64 covers all
+        // modern emulators. Reducing the list shrinks the AAR.
         ndk {
-            abiFilters += "arm64-v8a"
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
 
         externalNativeBuild {
@@ -21,10 +32,23 @@ android {
                 cppFlags += "-std=c++17"
                 cppFlags += "-fexceptions"
                 cppFlags += "-DHAVE_JNI"
+                // Feed the single version source into the native build so
+                // litep2p_version_string() matches the POM version.
+                arguments += "-DLITEP2P_VERSION=${litep2pVersion}"
             }
         }
 
         consumerProguardFiles("consumer-rules.pro")
+
+        // Expose the SDK version to the Kotlin API (LiteP2P.version).
+        buildConfigField("String", "LITEP2P_VERSION", "\"${litep2pVersion}\"")
+    }
+
+    // Pinned NDK for reproducible builds (matches the version CI installs).
+    ndkVersion = "26.1.10909125"
+
+    buildFeatures {
+        buildConfig = true
     }
 
     buildTypes {
@@ -90,5 +114,84 @@ dependencies {
     // The core library deliberately avoids AndroidX UI dependencies; only annotations.
     implementation(libs.androidx.annotation)
 
+    // Exposed in the public API (Flow / StateFlow / suspend helpers), so it is
+    // declared with `api` to propagate transitively to consumers.
+    api(libs.kotlinx.coroutines.core)
+
     testImplementation(libs.junit)
+}
+
+/* ------------------------------------------------------------------ */
+/* Publication (Maven Local first; same block publishes to Central)    */
+/* ------------------------------------------------------------------ */
+
+// KDoc jar — packages the Dokka HTML output as the "javadoc" artifact. (The
+// sources jar is published by the AGP component automatically.)
+val dokkaJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("javadoc")
+    dependsOn(tasks.named("dokkaHtml"))
+    from(layout.buildDirectory.dir("dokka/html"))
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
+// AGP registers a MavenPublication per release variant (multiThreadRelease,
+// singleThreadRelease). The multiThread variant is the canonical artifact;
+// singleThread is published under a distinct artifact id.
+androidComponents {
+    onVariants(selector().withBuildType("release")) { variant ->
+        publishing {
+            publications {
+                register<MavenPublication>(variant.name) {
+                    groupId = "com.zeengal"
+                    artifactId = if (variant.flavorName == "singleThread") {
+                        "litep2p-core-singleThread"
+                    } else {
+                        "litep2p-core"
+                    }
+                    version = litep2pVersion
+
+                    afterEvaluate {
+                        from(components.findByName(variant.name))
+                    }
+                    // The AGP component already publishes the sources jar; only
+                    // the KDoc jar is added explicitly.
+                    artifact(dokkaJar)
+
+                    pom {
+                        name.set("LiteP2P Core")
+                        description.set("LiteP2P peer-to-peer networking SDK — native engine + Kotlin API for Android")
+                        url.set("https://github.com/zeengal/Litep2p")
+                        licenses {
+                            license {
+                                name.set("Apache License 2.0")
+                                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                                distribution.set("repo")
+                            }
+                        }
+                        developers {
+                            developer {
+                                id.set("zeengal")
+                                name.set("Zeengal")
+                            }
+                        }
+                        scm {
+                            connection.set("scm:git:https://github.com/zeengal/Litep2p.git")
+                            developerConnection.set("scm:git:ssh://git@github.com/zeengal/Litep2p.git")
+                            url.set("https://github.com/zeengal/Litep2p")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Repository targets for the publications above.
+publishing {
+    repositories {
+        // Maven Local — immediate consumable milestone with zero external
+        // accounts. For Maven Central, replace/extend with mavenCentral()
+        // (requires signing credentials; see docs/api-spec.md §2.1 Option C).
+        mavenLocal()
+    }
 }

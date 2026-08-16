@@ -14,6 +14,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "My Application"
+rootProject.name = "LiteP2P"
 include(":app")
 include(":litep2p-core")
