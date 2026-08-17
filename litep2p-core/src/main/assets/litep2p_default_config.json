@@ -1,10 +1,11 @@
 {
-    "_comment": "LiteP2P SDK default config (bundled in the AAR assets). Extracted to filesDir/litep2p_default_config.json on first run when no config.json exists. Override any value by placing your own config.json in filesDir or passing LiteP2PConfig.Builder().configPath(...).",
+    "_comment": "LiteP2P SDK default config (bundled in the AAR assets). Extracted to filesDir/litep2p_default_config.json on first run when no config.json exists, and re-extracted automatically whenever this bundled copy changes (content-hash stamped). Override any value by placing your own config.json in filesDir or passing LiteP2PConfig.Builder().configPath(...) — the integrator file always wins and is never overwritten. security.transport_key is the SHARED network key: every app/deployment that must interoperate uses the SAME value (this key matches the desktop repo-root config.json).",
     "network": {
         "default_server_port": 30001,
         "discovery_port": 30000,
         "listen_backlog": 5,
-        "select_max_retries": 3
+        "select_max_retries": 3,
+        "port_range": [31000, 32000]
     },
     "communication": {
         "default_protocol": "UDP",
@@ -41,7 +42,7 @@
         "broadcast_interval_sec": 5
     },
     "security": {
-        "transport_key": "e8fefcbd7ee7fe24fa62cc4bb5a788363647398c44c446cd9e4364e0b269f3ab",
+        "transport_key": "61dd960e7968e3f290fba01634fe9031c99d09c4bd0a788f1597b7f6405ff96e",
         "noise_nk_protocol": {
             "enabled": true,
             "mandatory": true,

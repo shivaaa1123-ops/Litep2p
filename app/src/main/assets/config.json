@@ -14,7 +14,8 @@
         "default_server_port": 30001,
         "discovery_port": 30000,
         "listen_backlog": 5,
-        "select_max_retries": 3
+        "select_max_retries": 3,
+        "port_range": [31000, 32000]
     },
     "communication": {
         "default_protocol": "UDP",

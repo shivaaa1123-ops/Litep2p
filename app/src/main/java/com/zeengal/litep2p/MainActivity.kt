@@ -35,6 +35,7 @@ import com.zeengal.litep2p.hook.P2P
 import com.zeengal.litep2p.core.LiteP2P
 import java.io.File
 import java.io.IOException
+import org.json.JSONArray
 import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
@@ -513,6 +514,10 @@ class MainActivity : AppCompatActivity() {
             // Migrate existing installs: provision the shared transport key so Android
             // peers can decrypt CONTROL_CONNECT sent by the desktop (and vice-versa).
             patchSharedTransportKeyIfMissing(target)
+            // Migrate existing installs: add network.port_range so this app picks a
+            // random data port (same-device multi-app coexistence + censorship
+            // resistance) instead of fighting every other SDK app for fixed port 30001.
+            patchPortRangeIfMissing(target)
             return
         }
 
@@ -525,6 +530,7 @@ class MainActivity : AppCompatActivity() {
             android.util.Log.i("MainActivity", "Installed default config.json to ${target.absolutePath}")
             patchTelemetryDefaultsIfMissing(target)
             patchSharedTransportKeyIfMissing(target)
+            patchPortRangeIfMissing(target)
         } catch (ioe: IOException) {
             android.util.Log.w("MainActivity", "Failed to install default config.json: ${ioe.message}")
         } catch (t: Throwable) {
@@ -579,6 +585,41 @@ class MainActivity : AppCompatActivity() {
             android.util.Log.i("MainActivity", "Patched shared transport_key into config.json")
         } catch (t: Throwable) {
             android.util.Log.w("MainActivity", "Failed to patch shared transport key: ${t.message}")
+        }
+    }
+
+    /**
+     * Existing installations keep the config.json baked into their first APK,
+     * which predates `network.port_range`. Without it every SDK app binds the
+     * fixed data port 30001; on the SAME device the second app would bind the
+     * same port (SO_REUSEPORT) and the kernel then load-balances inbound
+     * handshake datagrams between the two apps' sockets — so neither reliably
+     * completes a connection.
+     *
+     * This migrates an existing on-device config by adding
+     * `network.port_range: [31000, 32000]`, so this app picks a random free
+     * data port at startup and advertises the real port via discovery.
+     */
+    private fun patchPortRangeIfMissing(configFile: File) {
+        try {
+            val root = JSONObject(configFile.readText())
+
+            val network = if (root.has("network")) {
+                root.optJSONObject("network")
+                    ?: JSONObject().also { root.put("network", it) }
+            } else {
+                JSONObject().also { root.put("network", it) }
+            }
+
+            if (network.has("port_range")) {
+                return // Already provisioned.
+            }
+
+            network.put("port_range", JSONArray(listOf(31000, 32000)))
+            configFile.writeText(root.toString(2))
+            android.util.Log.i("MainActivity", "Patched network.port_range into config.json")
+        } catch (t: Throwable) {
+            android.util.Log.w("MainActivity", "Failed to patch port_range: ${t.message}")
         }
     }
 

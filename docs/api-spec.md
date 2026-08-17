@@ -1880,7 +1880,12 @@ LiteP2PRuntime.stop(context)
   restart re-inits with it),
 - creates first-run defaults: a stable per-device peer id and a bundled
   default `config.json` extracted from the AAR assets (an integrator-supplied
-  `filesDir/config.json` or explicit `configPath` always wins),
+  `filesDir/config.json` or explicit `configPath` always wins, and is never
+  overwritten). The SDK-managed copy is **content-hash stamped**: when the
+  bundled default changes in a new SDK build, the stale extracted copy is
+  replaced automatically on the next start — so devices installed with an
+  older AAR still receive updated defaults (e.g. a new shared
+  `security.transport_key` or `network.port_range`),
 - contributes its permissions and service declaration via manifest merging —
   the app doesn't need any manifest edits (but should request the
   `POST_NOTIFICATIONS` runtime permission on API 33+ to make the engine

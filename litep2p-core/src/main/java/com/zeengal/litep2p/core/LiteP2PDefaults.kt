@@ -16,6 +16,12 @@ import java.util.UUID
  *     the config path. An integrator-supplied `config.json` (or an explicit
  *     [LiteP2PConfig.configPath]) always wins; the SDK never overwrites either.
  *
+ *     Unlike a naive extract-once scheme, the extracted copy is **content-hash
+ *     stamped**: whenever the bundled default changes in a new SDK build (e.g.
+ *     a new shared transport key or a new network.port_range), the stale
+ *     extracted copy is replaced automatically on the next start. This keeps
+ *     long-lived installs from pinning first-install defaults forever.
+ *
  *  2. **Stable peer id** — generated once and persisted in the SDK's own
  *     SharedPreferences so the device keeps the same identity across restarts
  *     (mirrors the harness [PeerIdManager] pattern without depending on it).
@@ -32,6 +38,7 @@ internal object LiteP2PDefaults {
 
     private const val ASSET_CONFIG = "litep2p_default_config.json"
     private const val EXTRACTED_CONFIG = "litep2p_default_config.json"
+    private const val EXTRACTED_HASH_FILE = "litep2p_default_config.sha256"
     private const val USER_CONFIG = "config.json"
 
     private const val PREFS_NAME = "litep2p_sdk_prefs"
@@ -56,8 +63,10 @@ internal object LiteP2PDefaults {
      * Priority:
      *  1. [explicitPath] when non-null and readable (integrator override).
      *  2. `filesDir/config.json` when present (integrator-provided default).
-     *  3. The bundled SDK default, extracted once to
-     *     `filesDir/litep2p_default_config.json`.
+     *  3. The bundled SDK default, extracted to
+     *     `filesDir/litep2p_default_config.json` and content-hash refreshed
+     *     whenever the bundled copy changes (so SDK upgrades reach devices
+     *     whose first install was an older AAR).
      *
      * Returns null only when the asset extraction fails; the engine then runs
      * on its compiled-in defaults.
@@ -73,22 +82,42 @@ internal object LiteP2PDefaults {
             return userConfig.absolutePath
         }
 
+        // (Re)extract the SDK-managed default only when it is missing or when
+        // its stored content hash differs from the bundled asset (stale copy
+        // from an older AAR). The integrator's own files never get touched.
         val extracted = File(filesDir, EXTRACTED_CONFIG)
-        if (extracted.canRead()) {
-            return extracted.absolutePath
+        val hashFile = File(filesDir, EXTRACTED_HASH_FILE)
+        val bundledHash = try { sha256(context.assets.open(ASSET_CONFIG).use { it.readBytes() }) } catch (t: Throwable) { null }
+        if (bundledHash == null) {
+            // Asset unreadable; fall back to whatever is on disk.
+            return if (extracted.canRead()) extracted.absolutePath else null
         }
 
-        return try {
-            context.assets.open(ASSET_CONFIG).use { input ->
-                extracted.outputStream().use { output ->
-                    input.copyTo(output)
+        val stale = !extracted.canRead() ||
+            (hashFile.canRead() && hashFile.readText().trim() != bundledHash) ||
+            (!hashFile.canRead() && extracted.length() > 0 && extracted.readText().trim() != assetConfigOrNull(context))
+        if (stale) {
+            try {
+                context.assets.open(ASSET_CONFIG).use { input ->
+                    extracted.outputStream().use { output -> input.copyTo(output) }
                 }
+                hashFile.writeText(bundledHash)
+                Log.i(TAG, "Extracted/refreshed default config to ${extracted.absolutePath}")
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to (re)extract default config: ${t.message}")
             }
-            Log.i(TAG, "Extracted default config to ${extracted.absolutePath}")
-            extracted.absolutePath
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to extract default config: ${t.message}")
-            null
         }
+        return if (extracted.canRead()) extracted.absolutePath else null
+    }
+
+    private fun assetConfigOrNull(context: Context): String? = try {
+        context.assets.open(ASSET_CONFIG).use { it.bufferedReader().readText() }
+    } catch (t: Throwable) {
+        null
+    }
+
+    private fun sha256(bytes: ByteArray): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+        return digest.joinToString("") { "%02x".format(it) }
     }
 }

@@ -114,15 +114,18 @@ inline bool is_single_thread_mode() {
 // socket. This is how we detect same-device multi-app coexistence: with
 // SO_REUSEPORT a second bind() on the same port succeeds and the kernel then
 // load-balances inbound unicast datagrams between the two sockets, so neither
-// app reliably receives its handshake/message traffic. The probe deliberately
-// binds WITHOUT SO_REUSEPORT, so it fails with EADDRINUSE whenever another
-// process owns the port (our own sockets bind with SO_REUSEPORT afterwards).
+// app reliably receives its handshake/message traffic.
+//
+// The probe deliberately binds WITHOUT SO_REUSEADDR/SO_REUSEPORT so it is
+// rejected (EADDRINUSE) whenever ANY other socket already holds the port.
+// (Binding with SO_REUSEADDR here would be wrong: on Linux two UDP sockets can
+// share an addr:port when BOTH set SO_REUSEADDR — the engine's own data socket
+// binds with SO_REUSEADDR+SO_REUSEPORT, so a reuseaddr probe would silently
+// succeed against it and the coexistence fallback below would never engage.)
 bool udp_port_held_by_other_process(int port) {
     if (port <= 0 || port > 65535) return false;
     int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return false;
-    int opt = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
