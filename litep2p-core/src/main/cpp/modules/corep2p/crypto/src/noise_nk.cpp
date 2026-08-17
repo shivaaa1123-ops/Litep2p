@@ -345,6 +345,7 @@ std::vector<uint8_t> NoiseNKSession::process_handshake(const std::vector<uint8_t
 }
 
 std::vector<uint8_t> NoiseNKSession::encrypt(const std::vector<uint8_t>& plaintext) {
+    std::lock_guard<std::mutex> lock(m_op_mutex);
     if (!is_ready()) {
         LOG_ERROR("ERROR: NK: Cannot encrypt - handshake not complete");
         return {};
@@ -352,24 +353,106 @@ std::vector<uint8_t> NoiseNKSession::encrypt(const std::vector<uint8_t>& plainte
 
     auto ciphertext = chacha20poly1305_encrypt(m_send_key, m_send_nonce, plaintext);
     if (!ciphertext.empty()) {
+        // v2 wire format: nonce[12] || ciphertext||tag. The receiver reads the
+        // nonce from the frame instead of guessing a synchronized counter, so a
+        // single lost/reordered datagram no longer desyncs the stream (v1 bug:
+        // one UDP loss permanently broke decryption for the rest of the session).
+        std::vector<uint8_t> framed;
+        framed.reserve(m_send_nonce.size() + ciphertext.size());
+        framed.insert(framed.end(), m_send_nonce.begin(), m_send_nonce.end());
+        framed.insert(framed.end(), ciphertext.begin(), ciphertext.end());
         increment_nonce(m_send_nonce);
         m_send_counter++;
+        return framed;
     }
     return ciphertext;
 }
 
-std::vector<uint8_t> NoiseNKSession::decrypt(const std::vector<uint8_t>& ciphertext) {
+std::vector<uint8_t> NoiseNKSession::decrypt(const std::vector<uint8_t>& ciphertext,
+                                             bool* replay_drop) {
+    std::lock_guard<std::mutex> lock(m_op_mutex);
+    if (replay_drop) *replay_drop = false;
     if (!is_ready()) {
         LOG_ERROR("ERROR: NK: Cannot decrypt - handshake not complete");
         return {};
     }
 
+    static constexpr size_t kNonceLen = 12;
+    static constexpr size_t kTagLen = 16;  // Poly1305 tag
+    static constexpr size_t kMinV2 = kNonceLen + kTagLen;
+
+    if (ciphertext.size() >= kMinV2) {
+        // v2 frame: explicit nonce prefix + replay window check.
+        const std::vector<uint8_t> explicit_nonce(ciphertext.begin(),
+                                                  ciphertext.begin() + kNonceLen);
+        const std::vector<uint8_t> body(ciphertext.begin() + kNonceLen,
+                                        ciphertext.end());
+        const uint64_t seq = nonce_counter_le64(explicit_nonce);
+        if (accept_recv_seq(seq)) {
+            auto plaintext = chacha20poly1305_decrypt(m_recv_key, explicit_nonce, body);
+            if (!plaintext.empty()) {
+                m_recv_counter++;
+                return plaintext;
+            }
+            // Authenticated decryption failed -> this is a REAL auth failure,
+            // not a replay; fall through to the v1 attempt (interop) below.
+        } else {
+            // The anti-replay window rejected this counter: a duplicate or
+            // replay. Tentatively mark so that if no v1 fallback succeeds we
+            // report it as a benign drop rather than an auth failure.
+            if (replay_drop) *replay_drop = true;
+        }
+        // Fall through to the v1 attempt so mixed-version peers interoperate.
+    }
+
+    // v1 legacy frame: implicit synchronized counter nonce.
     auto plaintext = chacha20poly1305_decrypt(m_recv_key, m_recv_nonce, ciphertext);
     if (!plaintext.empty()) {
         increment_nonce(m_recv_nonce);
         m_recv_counter++;
+        if (replay_drop) *replay_drop = false;
     }
     return plaintext;
+}
+
+uint64_t NoiseNKSession::nonce_counter_le64(const std::vector<uint8_t>& nonce) {
+    // increment_nonce() treats the 96-bit nonce as little-endian starting at
+    // byte 0; the low 64 bits dominate for any realistic message volume.
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) {
+        if (i < static_cast<int>(nonce.size())) {
+            v = (v << 8) | nonce[i];
+        }
+    }
+    return v;
+}
+
+bool NoiseNKSession::accept_recv_seq(uint64_t seq) {
+    // RFC-6347-style anti-replay window: accept a counter if it is newer than
+    // everything seen, or within 64 counters below the newest and not yet used.
+    if (!m_seen_any_seq || seq > m_highest_recv_seq) {
+        const uint64_t advance = m_seen_any_seq ? (seq - m_highest_recv_seq) : 0;
+        if (!m_seen_any_seq) {
+            m_recv_window = 0;              // first v2 frame on this session
+        } else if (advance >= 64) {
+            m_recv_window = 0;              // window slid entirely past old seqs
+        } else {
+            m_recv_window <<= advance;      // shift bits up, dropping oldest
+        }
+        m_highest_recv_seq = seq;
+        m_recv_window |= 1ULL;              // mark current highest as seen
+        m_seen_any_seq = true;
+        return true;
+    }
+    if (seq + 64 <= m_highest_recv_seq) {
+        return false;                       // too old — outside the window
+    }
+    const uint64_t bit = 1ULL << (m_highest_recv_seq - seq);
+    if (m_recv_window & bit) {
+        return false;                       // duplicate within window
+    }
+    m_recv_window |= bit;
+    return true;
 }
 
 // ============================================================================

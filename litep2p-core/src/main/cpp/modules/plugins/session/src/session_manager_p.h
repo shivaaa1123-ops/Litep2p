@@ -528,6 +528,21 @@ private:
     std::atomic<int> m_pending_sends{0};
     int pending_send_count() const;
 
+    // Per-peer timestamp of the last message WE actually handed to the
+    // transport (send_message_to_peer). Used to gate the "stale peer while
+    // CONNECTED -> force reconnect" path: during a dense outbound burst the
+    // local node is too busy flushing sends to refresh last_seen from inbound
+    // ACKs in time, so it can look "stale" to itself and force a destructive
+    // reconnect mid-burst. If we are actively sending, a peer is clearly alive
+    // enough to keep writing to.
+    // Guarded by m_peers_mutex.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_last_outbound_ts;
+    void note_outbound(const std::string& peer_id);
+    // True if we handed a message to the transport for `peer_id` within the
+    // last `window`. Acquires m_peers_mutex internally.
+    bool recently_sent_to(const std::string& peer_id,
+                          std::chrono::milliseconds window) const;
+
     // ---------------------------------------------------------------------
     // v0.4: reliable messaging, presence, identity directory
     // ---------------------------------------------------------------------

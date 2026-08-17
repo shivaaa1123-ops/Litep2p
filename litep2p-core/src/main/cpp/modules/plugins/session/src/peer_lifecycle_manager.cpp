@@ -311,7 +311,24 @@ namespace detail {
                     // - We only do it when the new endpoint is a valid private IPv4 ip:port
                     // - It unblocks the common "LTE->WiFi" or "WAN->LAN" recovery path.
                     // - It also enables LAN-preferred initial connections during bootstrap.
-                    if ((is_ephemeral || cur_is_public) && new_is_private && prior_state == PeerState::CONNECTING && allow_private_endpoints) {
+                    // EXTENDED (restart recovery): apply the LAN upgrade not only while
+                    // CONNECTING but for ANY non-connected state (DEGRADED, DISCONNECTED,
+                    // FAILED). After a full fleet restart the stored active endpoint can be
+                    // the WAN/STUN IP from the previous session ("advertised endpoint for
+                    // future reconnect"), which is unreachable from the same LAN (no NAT
+                    // hairpin). A fresh LAN broadcast is then the authoritative, cheap path
+                    // back — without this, reconnect attempts keep dialing the WAN IP,
+                    // accrue backoff, and get suppressed by the reconnect policy, leaving
+                    // the peer stuck until backoff expires (observed as "Android can't
+                    // connect to the desktop after restart; resolves after repeated
+                    // retries").
+                    const bool peer_not_connected_state =
+                        (prior_state == PeerState::CONNECTING ||
+                         prior_state == PeerState::DEGRADED ||
+                         prior_state == PeerState::DISCONNECTED ||
+                         prior_state == PeerState::FAILED);
+                    if ((is_ephemeral || cur_is_public) && new_is_private &&
+                        peer_not_connected_state && allow_private_endpoints) {
                         bool collision = false;
                         std::string owner;
                         auto it2 = m_sm->m_network_id_to_peer_id.find(event.networkId);
@@ -344,6 +361,11 @@ namespace detail {
 
                         // Best-effort: cancel any WAN hole-punch work now that we have a direct LAN path.
                         should_unregister_nat = true;
+
+                        // A fresh local endpoint invalidates whatever backoff was accrued
+                        // against the unreachable WAN endpoint; otherwise the reconnect
+                        // policy keeps suppressing subsequent discovery-driven connects.
+                        PeerReconnectPolicy::getInstance().reset_peer_stats(event.peerId);
 
                         // Trigger a new connect attempt; debouncer will allow it because target changed.
                         should_trigger_connect = true;

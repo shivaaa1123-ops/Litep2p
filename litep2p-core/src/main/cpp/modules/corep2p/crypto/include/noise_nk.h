@@ -75,8 +75,15 @@ public:
      * Decrypt application data (after handshake complete)
      * ciphertext: data to decrypt (with authentication tag)
      * Returns: plaintext (empty on authentication failure)
+     *
+     * When a v2 frame is rejected by the anti-replay window (replay/duplicate),
+     * returns empty AND sets *replay_drop=true so callers can distinguish a
+     * benign replayed frame from a real authentication/decryption failure. A
+     * false drop must NOT tear down the session (one repeated/out-of-order
+     * datagram in a burst is normal on UDP and must not cascade).
      */
-    std::vector<uint8_t> decrypt(const std::vector<uint8_t>& ciphertext);
+    std::vector<uint8_t> decrypt(const std::vector<uint8_t>& ciphertext,
+                                 bool* replay_drop = nullptr);
 
     /**
      * Check if handshake is complete and session is ready
@@ -144,6 +151,24 @@ private:
     uint32_t m_send_counter;
     uint32_t m_recv_counter;
 
+    // Loss-tolerant receive path (v2 explicit-nonce frames).
+    //
+    // v1 wire format encrypted with an IMPLICIT synchronized counter nonce
+    // (not transmitted). A single lost or reordered UDP datagram desynced the
+    // counters permanently — every subsequent frame failed AEAD authentication
+    // and the peer had to be torn down. v2 frames carry the 12-byte nonce
+    // explicitly; replay is filtered with a 64-entry sliding window on the
+    // little-endian counter embedded in it (standard RFC-6347-style window).
+    bool m_seen_any_seq = false;      // no v2 frame accepted yet
+    uint64_t m_highest_recv_seq = 0;  // highest counter accepted so far
+    uint64_t m_recv_window = 0;       // bitmask of recently accepted counters
+
+    // Serializes encrypt/decrypt counter/window updates. App data is normally
+    // funneled through the engine event loop, but ACK echoes and handshake
+    // prompts can originate from other threads; counter races would corrupt
+    // the nonce sequence.
+    mutable std::mutex m_op_mutex;
+
     // Handshake state machine
     int m_handshake_step;  // 0, 1, 2, 3
 
@@ -152,6 +177,8 @@ private:
     void perform_dh(const std::vector<uint8_t>& secret_key, const std::vector<uint8_t>& public_key, std::vector<uint8_t>& result);
     void derive_keys();
     void increment_nonce(std::vector<uint8_t>& nonce);
+    static uint64_t nonce_counter_le64(const std::vector<uint8_t>& nonce);
+    bool accept_recv_seq(uint64_t seq);
 
     // Noise protocol helpers
     std::vector<uint8_t> chacha20poly1305_encrypt(const std::vector<uint8_t>& key, const std::vector<uint8_t>& nonce, const std::vector<uint8_t>& plaintext);

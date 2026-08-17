@@ -7,6 +7,7 @@ import android.content.res.ColorStateList
 import android.text.SpannableString
 import android.text.Spanned
 import android.text.style.ForegroundColorSpan
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -19,6 +20,8 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.chip.Chip
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.zeengal.litep2p.core.EngineResult
+import com.zeengal.litep2p.core.LiteP2P
 import com.zeengal.litep2p.core.PeerInfo
 import com.zeengal.litep2p.R
 import com.zeengal.litep2p.hook.P2P
@@ -35,6 +38,10 @@ import com.zeengal.litep2p.hook.P2P
  */
 class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
     RecyclerView.Adapter<PeersAdapter.Holder>() {
+
+    companion object {
+        private const val TAG = "PeersAdapter"
+    }
 
     class Holder(view: View) : RecyclerView.ViewHolder(view) {
         val dot: View = view.findViewById(R.id.peerStatusDot)
@@ -142,10 +149,10 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
                 val repeat = (repeatEdit.text.toString().toIntOrNull() ?: 1).coerceIn(1, 10_000)
                 if (message.isNotEmpty()) {
                     val bytes = message.toByteArray(Charsets.UTF_8)
-                    repeat(repeat) { P2P.sendMessageTracked(p.id, bytes) }
+                    sendBulk(p.id, bytes, repeat)
                     Toast.makeText(
                         context,
-                        "Queued $repeat × ${formatBytes(bytes.size.toLong())}",
+                        "Sending $repeat × ${formatBytes(bytes.size.toLong())} in background",
                         Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -153,6 +160,50 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
             }
             .setNegativeButton("Cancel") { dialog, _ -> dialog.cancel() }
             .show()
+    }
+
+    /**
+     * Sends [times] copies of [bytes] to [peerId] without blocking the UI thread and
+     * without flooding the engine's single-threaded event loop.
+     *
+     * The engine caps in-flight plain sends at `peer_management.max_pending_sends`
+     * (default 1000); past that, `litep2p_send()` returns
+     * [EngineResult.QUEUE_FULL]. A burst that ignores this and hammers the queue
+     * from the main thread can starve heartbeats/control/ACK traffic and wedge the
+     * node until it is restarted. So we:
+     *  - run the burst on a background thread (the SDK API is thread-safe), and
+     *  - pace against [LiteP2P.pendingSendCount] and back off + retry on
+     *    [EngineResult.QUEUE_FULL] so every message is delivered at the engine's
+     *    natural drain rate instead of being dropped.
+     */
+    private fun sendBulk(peerId: String, bytes: ByteArray, times: Int) {
+        Thread {
+            // Keep headroom under the default 1000 cap — tune for your config.
+            val pacingLimit = 600
+            var backoffMs = 5L
+            var sent = 0
+            var failed = 0
+            repeat(times) {
+                // Wait while the engine is backed up so we never overrun the queue.
+                var spins = 0
+                while (LiteP2P.pendingSendCount() >= pacingLimit && spins < 50_000) {
+                    Thread.sleep(backoffMs)
+                    spins++
+                }
+                var rc = P2P.sendMessageTracked(peerId, bytes)
+                if (rc == EngineResult.QUEUE_FULL) {
+                    // Engine is temporarily at capacity — back off and retry once rather
+                    // than dropping the message.
+                    backoffMs = (backoffMs * 2).coerceAtMost(250L)
+                    Thread.sleep(backoffMs)
+                    rc = P2P.sendMessageTracked(peerId, bytes)
+                }
+                if (rc == EngineResult.OK) sent++ else failed++
+            }
+            if (failed > 0) {
+                Log.w(TAG, "Bulk send: $sent delivered, $failed rejected by engine")
+            }
+        }.start()
     }
 
     private fun copyToClipboard(context: Context, id: String) {

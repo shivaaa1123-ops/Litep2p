@@ -790,18 +790,48 @@ namespace detail {
                     }
                     if (session && session->is_ready()) {
                         LOG_INFO("MH: Secure session ready, decrypting message");
-                        std::string decrypted_message = session->receive_message(payload);
-                        LOG_INFO("MH: Decryption complete, decrypted_length=" + std::to_string(decrypted_message.length()));
+                        bool replay_drop = false;
+                        std::string decrypted_message = session->receive_message(payload, &replay_drop);
+                        LOG_INFO("MH: Decryption complete, decrypted_length=" + std::to_string(decrypted_message.length())
+                                 + (replay_drop ? " (replay/duplicate)" : ""));
                         if (!decrypted_message.empty()) {
                             LOG_INFO("MH: Recursively processing decrypted message");
+                            m_consecutive_decrypt_fail.erase(peer_id);  // healthy again
                             DataReceivedEvent decrypted_event{event.network_id, decrypted_message, std::chrono::steady_clock::now()};
                             handleDataReceived(decrypted_event); // Recursive call with decrypted data
+                        } else if (replay_drop) {
+                            // A benign replay/duplicate (common on UDP bursts): the
+                            // anti-replay window rejected the counter. Drop it silently.
+                            // It is NOT a real auth failure and MUST NOT tear down the
+                            // session — otherwise a single re-ordered/duplicated
+                            // datagram would invalidate the session and lose the rest
+                            // of the burst (observed as: burst of N delivered only the
+                            // first ~65, everything after dropped as "no ready session").
+                            Telemetry::getInstance().inc_counter("noise_replay_drop_total");
+                            LOG_DEBUG("MH: Dropping replay/duplicate frame from " + peer_id);
                         } else {
-                            LOG_WARN("SM: Failed to decrypt message from " + peer_id + " (stale key/session?)");
+                            // Count CONSECUTIVE real decryption failures. A single
+                            // corrupt/reordered frame is normal on UDP and must not
+                            // destroy the session — nuking it on any one auth failure
+                            // loses the rest of the burst as "no ready session"
+                            // (observed: a 600-message burst delivered only ~65).
+                            // Only when several frames fail in a row do we treat it
+                            // as stale keys / session desync and force a fresh
+                            // handshake.
+                            int& de_fails = m_consecutive_decrypt_fail[peer_id];
+                            de_fails++;
                             Telemetry::getInstance().inc_counter("noise_decrypt_fail_total");
-
-                            // Recovery path: likely stale keys (peer restart) or session desync.
-                            // Clear READY session and trigger a fresh handshake/reconnect.
+                            constexpr int kDecryptFailThreshold = 3;
+                            if (de_fails < kDecryptFailThreshold) {
+                                LOG_WARN("SM: Transient decrypt failure (" +
+                                         std::to_string(de_fails) + "/" +
+                                         std::to_string(kDecryptFailThreshold) +
+                                         ") for " + peer_id + " - keeping session");
+                                break;
+                            }
+                            de_fails = 0;
+                            LOG_WARN("SM: Consecutive decrypt failures for " + peer_id +
+                                     " - forcing session reset (stale keys/session desync)");
                             {
                                 std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
                                 m_sm->m_secure_session_manager->remove_session(peer_id);
@@ -856,6 +886,20 @@ namespace detail {
             case MessageType::APPLICATION_DATA:
                 Telemetry::getInstance().inc_counter("rx_app_messages_total");
                 Telemetry::getInstance().inc_counter("rx_app_bytes_total", static_cast<int64_t>(payload.size()));
+
+                // Traffic is liveness. Previously only PING/PONG/CONNECT refreshed
+                // peer->last_seen, so a peer actively streaming a large burst could
+                // still be expired by the heartbeat/liveness watchdog and torn down
+                // mid-conversation (receiver drops exactly that peer). Refreshing
+                // here also covers the encrypted path, which recurses into this
+                // case after a successful decrypt.
+                {
+                    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+                    Peer* liveness_peer = m_sm->find_peer_by_id(peer_id);
+                    if (liveness_peer) {
+                        liveness_peer->last_seen = std::chrono::steady_clock::now();
+                    }
+                }
 
                 // ------------------------------------------------------------
                 // ------------------------------------------------------------
@@ -936,6 +980,7 @@ namespace detail {
                                     ack["recv_ts_ms"] = now_epoch_ms();
                                     const std::string ack_payload = ack.dump();
                                     const std::string ack_msg = wire::encode_message(MessageType::APPLICATION_ACK, ack_payload);
+                                    LOG_INFO("MH: SENDING app ACK for msg_id " + msg_id + " to peer " + peer_id);
                                     m_sm->send_message_to_peer(event.network_id, ack_msg);
                                     Telemetry::getInstance().inc_counter("tx_app_acks_total");
                                 }
@@ -1014,6 +1059,7 @@ namespace detail {
 
 #if defined(__ANDROID__)
                                 if (!msg_id.empty()) {
+                                    LOG_INFO("MH: Received app ACK for msg_id " + msg_id);
                                     sendMessageAckToUI(msg_id, sent_ts_ms, recv_ts_ms);
                                 }
 #endif
@@ -1174,6 +1220,16 @@ namespace detail {
             // avoid sending application data into a black hole. This happens commonly when
             // the remote process is killed and restarts with new sockets/keys.
             // Instead, force a disconnect + reconnect and queue the message.
+            //
+            // Guard: if we are OUR OWN last client of this peer within the liveness window
+            // (i.e. mid-burst), do NOT force-reconnect. A dense outbound burst keeps the
+            // local event loop busy flushing sends, so inbound ACKs/PONGs queue up behind
+            // it and the peer can look "stale" to ourselves purely because we are the ones
+            // flooding it. Forcing a reconnect then drops queued messages (per-peer pending
+            // is capped at MAX_QUEUED_MESSAGES) and starts a reconnect storm that tears the
+            // link down. Since UDP is connectionless, writing to an idle peer is harmless;
+            // a genuinely dead peer is caught by heartbeat expiry + the restart/decrypt
+            // recovery paths instead.
             if (!is_control && peer_connected &&
                 (peer_state == PeerState::READY || peer_state == PeerState::CONNECTED ||
                  peer_state == PeerState::HANDSHAKING || peer_state == PeerState::DEGRADED)) {
@@ -1182,7 +1238,10 @@ namespace detail {
                 const auto silent_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - peer_last_seen).count();
                 const auto discovery_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - peer_last_discovery_seen).count();
 
-                if (silent_ms > heartbeat_liveness_ms) {
+                const bool actively_sending =
+                    m_sm->recently_sent_to(event.peerId,
+                                           std::chrono::milliseconds(heartbeat_liveness_ms));
+                if (silent_ms > heartbeat_liveness_ms && !actively_sending) {
                     LOG_WARN("MH: Peer " + event.peerId + " appears stale while CONNECTED (silent_ms=" +
                              std::to_string(silent_ms) + ", discovery_ms=" + std::to_string(discovery_ms) +
                              ") - forcing reconnect and queueing message");

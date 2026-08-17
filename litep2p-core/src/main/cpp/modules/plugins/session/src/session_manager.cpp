@@ -3155,7 +3155,14 @@ void SessionManager::Impl::handleSendMessageWithRetry(const std::string& peer_id
         LOG_WARN("SM: Cannot send to " + peer_id + " - network_id is empty");
         return;
     }
-    
+
+    // Record that we are actively writing to this peer. Used to gate the
+    // "stale peer while CONNECTED -> force reconnect" path so a dense outbound
+    // burst (which occupies the local event loop and delays inbound ACK/PONG
+    // processing, making the peer look stale to ourselves) does not trigger a
+    // destructive reconnect mid-burst. See handleSendMessage.
+    note_outbound(peer_id);
+
     LOG_INFO("SM: Calling send_message_to_peer for network_id " + network_id);
     send_message_to_peer(network_id, message);
     LOG_INFO("SM: send_message_to_peer completed for network_id " + network_id);
@@ -4908,6 +4915,19 @@ void SessionManager::Impl::pushEvent(SessionEvent event) {
 int SessionManager::Impl::pending_send_count() const {
     const int n = m_pending_sends.load(std::memory_order_relaxed);
     return n > 0 ? n : 0;
+}
+
+void SessionManager::Impl::note_outbound(const std::string& peer_id) {
+    std::lock_guard<std::mutex> lock(m_peers_mutex);
+    m_last_outbound_ts[peer_id] = std::chrono::steady_clock::now();
+}
+
+bool SessionManager::Impl::recently_sent_to(const std::string& peer_id,
+                                            std::chrono::milliseconds window) const {
+    std::lock_guard<std::mutex> lock(m_peers_mutex);
+    auto it = m_last_outbound_ts.find(peer_id);
+    if (it == m_last_outbound_ts.end()) return false;
+    return std::chrono::steady_clock::now() - it->second < window;
 }
 
 bool SessionManager::Impl::isPeerConnected(const std::string& peer_id) const {

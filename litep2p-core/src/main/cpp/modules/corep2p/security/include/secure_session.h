@@ -38,7 +38,9 @@ public:
     std::string send_message(const std::string& plaintext);
 
     // Receive a message (automatically decrypted)
-    std::string receive_message(const std::string& ciphertext);
+    // When the underlying frame is rejected as a replay/duplicate (not an auth
+    // failure), returns empty and sets *replay_drop=true.
+    std::string receive_message(const std::string& ciphertext, bool* replay_drop = nullptr);
 
     // Get peer ID
     const std::string& get_peer_id() const { return m_peer_id; }

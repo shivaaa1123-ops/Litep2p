@@ -128,15 +128,17 @@ std::string SecureSession::send_message(const std::string& plaintext) {
     return vector_to_string(ciphertext);
 }
 
-std::string SecureSession::receive_message(const std::string& ciphertext) {
+std::string SecureSession::receive_message(const std::string& ciphertext, bool* replay_drop) {
     auto session = ensure_session();
     if (!session || !session->is_ready()) {
         nativeLog("SecureSession ERROR: Session not ready for receive from " + m_peer_id);
         return {};
     }
 
-    auto plaintext = session->decrypt(string_to_vector(ciphertext));
-    if (plaintext.empty() && !ciphertext.empty()) {
+    bool drop = false;
+    auto plaintext = session->decrypt(string_to_vector(ciphertext), &drop);
+    if (replay_drop) *replay_drop = drop;
+    if (plaintext.empty() && !ciphertext.empty() && !drop) {
         nativeLog("SecureSession ERROR: Failed to decrypt message from " + m_peer_id);
         return {};
     }

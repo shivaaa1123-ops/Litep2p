@@ -5,6 +5,7 @@ import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import com.zeengal.litep2p.MessageTraceStore
 import com.zeengal.litep2p.core.CommsMode
+import com.zeengal.litep2p.core.EngineResult
 import com.zeengal.litep2p.core.LiteP2P
 import com.zeengal.litep2p.core.LogLevel
 import com.zeengal.litep2p.core.PeerInfo
@@ -59,20 +60,25 @@ object P2P {
         LiteP2P.connect(peerId)
     }
 
-    /** Fire-and-forget send (delegates to the core engine). */
+    /** Fire-and-forget send (delegates to the core engine); returns the engine result. */
     @JvmStatic
-    fun sendMessage(peerId: String, message: ByteArray) {
-        LiteP2P.send(peerId, message)
+    fun sendMessage(peerId: String, message: ByteArray): EngineResult {
+        return LiteP2P.send(peerId, message)
     }
 
     /**
-     * UI should call this instead of [sendMessage] so we can show outgoing messages in the Messages tab.
+     * UI should call this instead of [sendMessage] so we can show outgoing messages
+     * in the Messages tab.
+     *
+     * Returns the underlying engine result so burst senders can honor backpressure:
+     * when the engine's send queue is at capacity this returns
+     * [EngineResult.QUEUE_FULL] instead of silently dropping the message.
      */
     @JvmStatic
-    fun sendMessageTracked(peerId: String, message: ByteArray) {
+    fun sendMessageTracked(peerId: String, message: ByteArray): EngineResult {
         val messageId = MessageTraceStore.generateMessageId()
         val preview: String
-        try {
+        return try {
             val body = String(message, Charsets.UTF_8)
             preview = body.take(200)
 
@@ -91,20 +97,54 @@ object P2P {
             MessageTraceStore.recordEvent(messageId, MessageTraceStore.EventType.TX_SENT, "Sent (requires_ack=true)")
 
             sendMessage(peerId, envelope.toByteArray(Charsets.UTF_8))
-            return
         } catch (_: Throwable) {
             val fallback = "<binary ${message.size} bytes>"
             addMessageEvent(MessageEvent(MessageDirection.OUT, peerId, fallback, messageId = messageId))
             MessageTraceStore.trackOutgoing(messageId, peerId, currentConnectionType, message.size, fallback)
             MessageTraceStore.recordEvent(messageId, MessageTraceStore.EventType.TX_SENT, "Sent (requires_ack=false; non-UTF8)")
             sendMessage(peerId, message)
-            return
         }
     }
 
     @JvmStatic
     fun setLogLevel(level: Int) {
         LiteP2P.setLogLevel(LogLevel.fromLevel(level))
+    }
+
+    /**
+     * Sends [times] copies of [message] to [peerId] from a background thread,
+     * pacing against the engine's send-queue headroom and backing off on
+     * [EngineResult.QUEUE_FULL].
+     *
+     * This is the same paced-burst path the harness GUI "repeat" control uses.
+     * It also gives adb/automation a dense-burst stress hook without tying up
+     * the UI thread or overrunning the engine's single-threaded event loop.
+     */
+    @JvmStatic
+    fun sendBurst(peerId: String, message: ByteArray, times: Int) {
+        if (times <= 0) return
+        val pacingLimit = 600 // headroom under the default 1000 in-flight cap
+        Thread {
+            var backoffMs = 5L
+            var sent = 0
+            var failed = 0
+            repeat(times) {
+                // Wait while the engine is backed up so we never overrun the queue.
+                var spins = 0
+                while (LiteP2P.pendingSendCount() >= pacingLimit && spins < 50_000) {
+                    Thread.sleep(backoffMs)
+                    spins++
+                }
+                var rc = sendMessageTracked(peerId, message)
+                if (rc == EngineResult.QUEUE_FULL) {
+                    backoffMs = (backoffMs * 2).coerceAtMost(250L)
+                    Thread.sleep(backoffMs)
+                    rc = sendMessageTracked(peerId, message)
+                }
+                if (rc == EngineResult.OK) sent++ else failed++
+            }
+            Log.i(TAG, "Burst done: $sent sent, $failed failed for peer $peerId (times=$times)")
+        }.start()
     }
 
     // System network state callbacks (drives signaling/NAT recovery in native engine)

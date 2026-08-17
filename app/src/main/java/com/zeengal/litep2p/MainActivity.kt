@@ -439,16 +439,23 @@ class MainActivity : AppCompatActivity() {
                 }, 500)
             }
 
-            // Handle message sending via intent (for automated testing)
+            // Handle message sending via intent (for automated testing).
+            // Optional LITEP2P_SEND_REPEAT=<n> fires a dense paced burst of n
+            // copies from a background thread (same path as the GUI "repeat").
             val sendToPeer = intent.getStringExtra(EXTRA_SEND_TO_PEER)
             val sendMessage = intent.getStringExtra(EXTRA_SEND_MESSAGE)
             if (!sendToPeer.isNullOrBlank() && !sendMessage.isNullOrBlank()) {
-                android.util.Log.i("MainActivity", "EXTRA_SEND_MESSAGE: sending '${sendMessage}' to peer '${sendToPeer}'")
+                val repeat = intent.getIntExtra(EXTRA_SEND_REPEAT, 1).coerceIn(1, 10_000)
+                android.util.Log.i("MainActivity", "EXTRA_SEND_MESSAGE: sending '${sendMessage}' to peer '${sendToPeer}' (repeat=$repeat)")
                 // Use handler.post to ensure engine is ready (small delay)
                 handler.postDelayed({
                     try {
-                        P2P.sendMessageTracked(sendToPeer, sendMessage.toByteArray(Charsets.UTF_8))
-                        android.util.Log.i("MainActivity", "Message sent successfully to peer: $sendToPeer")
+                        if (repeat > 1) {
+                            P2P.sendBurst(sendToPeer, sendMessage.toByteArray(Charsets.UTF_8), repeat)
+                        } else {
+                            P2P.sendMessageTracked(sendToPeer, sendMessage.toByteArray(Charsets.UTF_8))
+                        }
+                        android.util.Log.i("MainActivity", "Message send requested to peer: $sendToPeer (repeat=$repeat)")
                     } catch (e: Exception) {
                         android.util.Log.e("MainActivity", "Failed to send message to peer $sendToPeer: ${e.message}", e)
                     }
@@ -456,6 +463,7 @@ class MainActivity : AppCompatActivity() {
                 // Clear the extras to avoid re-sending on activity recreation
                 intent.removeExtra(EXTRA_SEND_MESSAGE)
                 intent.removeExtra(EXTRA_SEND_TO_PEER)
+                intent.removeExtra(EXTRA_SEND_REPEAT)
             }
 
             // Handle explicit connect-to-peer via intent (for automated testing):
@@ -985,6 +993,8 @@ class MainActivity : AppCompatActivity() {
         //     --es LITEP2P_SEND_TO_PEER "desktop-1" --es LITEP2P_SEND_MESSAGE "Hello!"
         private const val EXTRA_SEND_MESSAGE = "LITEP2P_SEND_MESSAGE"
         private const val EXTRA_SEND_TO_PEER = "LITEP2P_SEND_TO_PEER"
+        // Optional dense-burst repeat count (1 = single send): LITEP2P_SEND_REPEAT=<n>
+        private const val EXTRA_SEND_REPEAT = "LITEP2P_SEND_REPEAT"
         // Explicit connect-to-peer via adb for automated testing:
         //   adb shell am start -n com.zeengal.litep2p/.MainActivity --es LITEP2P_CONNECT_TO_PEER "<peer_id>"
         private const val EXTRA_CONNECT_TO_PEER = "LITEP2P_CONNECT_TO_PEER"
