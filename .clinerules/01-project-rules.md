@@ -16,7 +16,9 @@ v0.4 adds censorship resistance: dynamic ports, obfuscated discovery,
 - `desktop/` — desktop CLI peer + tests (`desktop/tests/`)
 - `tools/signaling_server/` — Python WebSocket signaling server
 - `docs/api-spec.md` — the authoritative API contract; update it when the API changes
-- `config.example.json` — documented config template (also the desktop reference)
+- `config.json` — the desktop reference the desktop peer actually reads; keep it in
+  sync with the new keys (e.g. `network.port_range`)
+- `config.example.json` — documented config template (source of truth for docs)
 
 ## Build & test
 - **Desktop**: `cmake -S desktop -B desktop/build_fixcheck && cmake --build desktop/build_fixcheck`
