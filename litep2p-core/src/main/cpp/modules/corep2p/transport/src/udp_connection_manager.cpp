@@ -22,6 +22,29 @@ public:
     UdpImpl() : m_running(false), m_sock(-1), m_bound_port(-1), m_event_loop_recv_buf(UDP_BUFFER_SIZE) {}
     ~UdpImpl() { stop(); }
 
+    // Records the port the kernel actually assigned to the bound socket.
+    // Necessary when the requested port was 0 (ephemeral fallback) so the caller
+    // can advertise the real endpoint via discovery/signaling.
+    void refreshBoundPort() {
+        if (m_sock < 0) {
+            m_bound_port = -1;
+            return;
+        }
+        sockaddr_storage ss{};
+        socklen_t slen = sizeof(ss);
+        if (::getsockname(m_sock, reinterpret_cast<sockaddr*>(&ss), &slen) == 0) {
+            if (ss.ss_family == AF_INET6) {
+                m_bound_port = ntohs(reinterpret_cast<sockaddr_in6*>(&ss)->sin6_port);
+            } else {
+                m_bound_port = ntohs(reinterpret_cast<sockaddr_in*>(&ss)->sin_port);
+            }
+        } else {
+            m_bound_port = -1;
+        }
+    }
+
+    int boundPort() const { return m_bound_port; }
+
     bool startServer(int port, OnDataCallback on_data, OnDisconnectCallback on_disconnect) {
         if (m_running) return false;
         std::lock_guard<std::mutex> lock(m_sock_mutex);
@@ -107,6 +130,8 @@ public:
             }
         }
 
+        refreshBoundPort();
+
         m_running = true;
         m_event_loop_mode = false;
         m_listenThread = std::thread(&UdpImpl::listenLoop, this);
@@ -158,6 +183,8 @@ public:
             m_sock = -1;
             return false;
         }
+
+        refreshBoundPort();
 
         m_running = true;
         m_event_loop_mode = true;
@@ -290,7 +317,7 @@ public:
             }
         }
         
-        m_bound_port = port;
+        refreshBoundPort();  // preserves the real port across a socket restart
         m_on_data = saved_on_data;
         m_on_disconnect = saved_on_disconnect;
         
@@ -563,3 +590,4 @@ void UdpConnectionManager::sendRawPacket(const std::string& ip, int port, const 
 void UdpConnectionManager::setStunPacketCallback(OnStunPacketCallback callback) { m_impl->setStunPacketCallback(callback); }
 int UdpConnectionManager::getSocketFd() const { return m_impl->getSocket(); }
 void UdpConnectionManager::processIncomingData() { m_impl->processOnePacket(); }
+int UdpConnectionManager::getBoundPort() const { return m_impl->boundPort(); }

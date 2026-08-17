@@ -30,7 +30,7 @@
 
 class ConnectionManager::Impl {
 public:
-    Impl() : m_running(false), m_server_sock(-1), m_buffer_pool(std::make_unique<BufferPool>()) {}
+    Impl() : m_running(false), m_server_sock(-1), m_bound_port(-1), m_buffer_pool(std::make_unique<BufferPool>()) {}
     ~Impl() { 
         LOG_DEBUG("TCP_DEBUG: Impl destructor called for " + std::to_string((uintptr_t)this));
         stop(); 
@@ -78,6 +78,17 @@ public:
             close(m_server_sock);
             m_server_sock = -1;
             return false;
+        }
+
+        // Record the real bound port (differs from `port` when the caller asked
+        // for an ephemeral port because the configured one was contended).
+        m_bound_port = -1;
+        {
+            sockaddr_in bound{};
+            socklen_t blen = sizeof(bound);
+            if (::getsockname(m_server_sock, reinterpret_cast<sockaddr*>(&bound), &blen) == 0) {
+                m_bound_port = ntohs(bound.sin_port);
+            }
         }
 
         setRunning(true);
@@ -435,6 +446,7 @@ private:
 
 private:
     std::atomic<bool> m_running;
+    int m_bound_port;
 public:
     int m_server_sock;
     std::thread m_acceptThread;
@@ -447,6 +459,8 @@ public:
 
     OnDataCallback m_on_data;
     OnDisconnectCallback m_on_disconnect;
+
+    int boundPort() const { return m_bound_port; }
 };
 
 ConnectionManager::ConnectionManager() : m_impl(std::make_unique<Impl>()) {}
@@ -456,3 +470,4 @@ void ConnectionManager::stop() { m_impl->stop(); }
 bool ConnectionManager::connectToPeer(const std::string& ip, int port) { return m_impl->connectToPeer(ip, port); }
 void ConnectionManager::sendMessageToPeer(const std::string& nid, const std::string& msg) { m_impl->sendMessageToPeer(nid, msg); }
 bool ConnectionManager::disconnectPeer(const std::string& nid) { return m_impl->disconnectPeer(nid); }
+int ConnectionManager::getBoundPort() const { return m_impl->boundPort(); }

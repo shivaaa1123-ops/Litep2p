@@ -22,6 +22,11 @@ public:
     void sendMessageToPeer(const std::string& network_id, const std::string& message);
     bool disconnectPeer(const std::string& network_id) override;
 
+    // Actual port the TCP listener bound to. -1 when not running. Used to
+    // advertise a real endpoint when the configured port was contended by
+    // another process on the same device (ephemeral-port fallback).
+    int getBoundPort() const override;
+
 private:
     class Impl;
     std::unique_ptr<Impl> m_impl;

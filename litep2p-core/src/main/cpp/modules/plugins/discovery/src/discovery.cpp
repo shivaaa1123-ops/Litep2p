@@ -1,6 +1,8 @@
 #include "discovery.h"
 #include "logger.h"
 #include "constants.h"
+#include "config_manager.h"
+#include <sodium.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -231,7 +233,7 @@ public:
     void sendBroadcast() override {
         if (m_sock < 0 || !m_running) return;
 
-        std::string msg = std::string(DISCOVERY_MESSAGE_PREFIX) + ":" + m_peer_id + ":" + std::to_string(m_connection_port);
+        std::string msg = buildAnnouncement();
         const auto targets = get_ipv4_broadcast_targets(static_cast<uint16_t>(DISCOVERY_PORT));
 
         bool any_sent = false;
@@ -269,41 +271,29 @@ public:
         if (n > 0) {
             buf[n] = 0;
             std::string msg(buf);
-            if (msg.rfind(DISCOVERY_MESSAGE_PREFIX, 0) == 0) {
-                char sender_ip[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &from_addr.sin_addr, sender_ip, sizeof(sender_ip));
-                
-                std::string msg_without_prefix = msg.substr(strlen(DISCOVERY_MESSAGE_PREFIX) + 1);
-                size_t colon_pos = msg_without_prefix.find(':');
-                
-                std::string peer_id;
-                int connection_port = ntohs(from_addr.sin_port);
-                
-                if (colon_pos != std::string::npos) {
-                    peer_id = msg_without_prefix.substr(0, colon_pos);
-                    try {
-                        connection_port = std::stoi(msg_without_prefix.substr(colon_pos + 1));
-                    } catch (...) {
-                        connection_port = ntohs(from_addr.sin_port);
-                    }
-                } else {
-                    peer_id = msg_without_prefix;
-                }
 
-                if (!m_peer_id.empty() && peer_id == m_peer_id) {
-                    return; // Skip self-discovery
-                }
+            char sender_ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &from_addr.sin_addr, sender_ip, sizeof(sender_ip));
 
-                // Drop duplicates that can occur when peers broadcast to multiple targets
-                // (e.g., per-interface broadcast + limited broadcast).
-                if (is_recent_duplicate(sender_ip, connection_port, peer_id)) {
-                    return;
-                }
-                
-                if (m_callback) {
-                    std::string network_id = std::string(sender_ip) + ":" + std::to_string(connection_port);
-                    m_callback(network_id, peer_id);
-                }
+            std::string peer_id;
+            int connection_port = 0;
+            if (!parseAnnouncement(msg, peer_id, connection_port)) {
+                return;  // not a valid discovery announcement (or wrong key)
+            }
+
+            if (!m_peer_id.empty() && peer_id == m_peer_id) {
+                return; // Skip self-discovery
+            }
+
+            // Drop duplicates that can occur when peers broadcast to multiple targets
+            // (e.g., per-interface broadcast + limited broadcast).
+            if (is_recent_duplicate(sender_ip, connection_port, peer_id)) {
+                return;
+            }
+            
+            if (m_callback) {
+                std::string network_id = std::string(sender_ip) + ":" + std::to_string(connection_port);
+                m_callback(network_id, peer_id);
             }
         }
     }
@@ -320,7 +310,7 @@ public:
         
         // Send discovery message directly to the specified IP:port on the discovery port
         // This bypasses AP isolation that may block broadcasts
-        std::string msg = std::string(DISCOVERY_MESSAGE_PREFIX) + ":" + m_peer_id + ":" + std::to_string(m_connection_port);
+        std::string msg = buildAnnouncement();
         
         sockaddr_in dst{};
         dst.sin_family = AF_INET;
@@ -392,12 +382,103 @@ public:
         m_use_central_discovery = enable;
     }
 
+    void setConnectionPort(int port) override {
+        m_connection_port = port;
+    }
+
+    // ------------------------------------------------------------------
+    // Censorship-resistant discovery packets (v0.4)
+    // ------------------------------------------------------------------
+    // Legacy format:      <magic>:<peer_id>:<port>          (plaintext)
+    // Obfuscated format:  <magic> || nonce(12) || AEAD_ct   (when a shared
+    //                     key is configured; plaintext is padded to a fixed
+    //                     size so datagram length doesn't leak peer info).
+    // The magic is config-driven (network.discovery_magic), so a deployment
+    // can use an arbitrary random prefix that is NOT recognizable as
+    // "LITEP2P_DISCOVERY" by a DPI box. Defaults preserve legacy behavior.
+    std::string buildAnnouncement() const {
+        const std::string magic = ConfigManager::getInstance().getDiscoveryMagic();
+        std::vector<uint8_t> key;
+        const bool encrypted = ConfigManager::getInstance().getDiscoverySharedKey(key);
+        std::string plain = m_peer_id + ":" + std::to_string(m_connection_port);
+        if (encrypted && key.size() == 32) {
+            static constexpr size_t kPadLen = 96;
+            std::string padded = plain;
+            if (padded.size() > kPadLen) padded.resize(kPadLen);
+            padded.resize(kPadLen, ' ');
+
+            std::vector<uint8_t> nonce(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+            randombytes_buf(nonce.data(), nonce.size());
+            std::vector<uint8_t> ct(padded.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
+            unsigned long long clen = 0;
+            crypto_aead_xchacha20poly1305_ietf_encrypt(
+                ct.data(), &clen,
+                reinterpret_cast<const uint8_t*>(padded.data()), padded.size(),
+                nullptr, 0, nullptr, nonce.data(), key.data());
+            ct.resize(clen);
+
+            std::string out = magic;
+            out.append(reinterpret_cast<const char*>(nonce.data()), nonce.size());
+            out.append(reinterpret_cast<const char*>(ct.data()), ct.size());
+            return out;
+        }
+        return magic + ":" + plain;
+    }
+
+    bool parseAnnouncement(const std::string& raw,
+                           std::string& out_peer_id, int& out_port) const {
+        const std::string magic = ConfigManager::getInstance().getDiscoveryMagic();
+        std::vector<uint8_t> key;
+        const bool encrypted = ConfigManager::getInstance().getDiscoverySharedKey(key);
+
+        std::string body;
+        if (encrypted && key.size() == 32 &&
+            raw.size() > magic.size() + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
+                                    crypto_aead_xchacha20poly1305_ietf_ABYTES &&
+            raw.compare(0, magic.size(), magic) == 0) {
+            const size_t off = magic.size();
+            std::vector<uint8_t> nonce(raw.begin() + off,
+                                       raw.begin() + off + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+            std::vector<uint8_t> ct(raw.begin() + off + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
+                                    raw.end());
+            std::vector<uint8_t> pt(ct.size());
+            unsigned long long plen = 0;
+            if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+                    pt.data(), &plen, nullptr,
+                    ct.data(), ct.size(), nullptr, 0, nonce.data(), key.data()) != 0) {
+                return false;  // not encrypted by our key -> drop
+            }
+            pt.resize(plen);
+            body.assign(reinterpret_cast<const char*>(pt.data()), pt.size());
+            while (!body.empty() && body.back() == ' ') body.pop_back();
+        } else if (raw.compare(0, magic.size(), magic) == 0) {
+            body = raw.substr(magic.size());
+            if (!body.empty() && body[0] == ':') body = body.substr(1);
+        } else {
+            // Legacy interop: default-magic peers.
+            const std::string legacy = DISCOVERY_MESSAGE_PREFIX;
+            if (raw.compare(0, legacy.size(), legacy) != 0) return false;
+            body = raw.substr(legacy.size());
+            if (!body.empty() && body[0] == ':') body = body.substr(1);
+        }
+
+        const size_t colon = body.find(':');
+        if (colon == std::string::npos) return false;
+        out_peer_id = body.substr(0, colon);
+        try {
+            out_port = std::stoi(body.substr(colon + 1));
+        } catch (...) {
+            return false;
+        }
+        return !out_peer_id.empty() && out_port > 0 && out_port <= 65535;
+    }
+
 private:
     void broadcastLoop() {
         while (m_running) {
             // Include connection port in the discovery message
-            // Format: "DISCOVER:<peer_id>:<connection_port>"
-            std::string msg = std::string(DISCOVERY_MESSAGE_PREFIX) + ":" + m_peer_id + ":" + std::to_string(m_connection_port);
+            // Format: obfuscated (see buildAnnouncement)
+            std::string msg = buildAnnouncement();
             const auto targets = get_ipv4_broadcast_targets(static_cast<uint16_t>(DISCOVERY_PORT));
 
             nativeLog("Discovery broadcastLoop: Sending to " + std::to_string(targets.size()) + " broadcast targets");
@@ -444,27 +525,10 @@ private:
                 char sender_ip[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &from_addr.sin_addr, sender_ip, sizeof(sender_ip));
                 nativeLog("Discovery listenLoop: Received " + std::to_string(n) + " bytes from " + std::string(sender_ip) + " msg=" + msg.substr(0, 50));
-                
-                if (msg.rfind(DISCOVERY_MESSAGE_PREFIX, 0) == 0) {
-                    // Parse message format: "DISCOVER:<peer_id>:<connection_port>"
-                    std::string msg_without_prefix = msg.substr(strlen(DISCOVERY_MESSAGE_PREFIX) + 1);
-                    size_t colon_pos = msg_without_prefix.find(':');
-                    
-                    std::string peer_id;
-                    int connection_port = ntohs(from_addr.sin_port);  // Default to sender's UDP port if not specified
-                    
-                    if (colon_pos != std::string::npos) {
-                        peer_id = msg_without_prefix.substr(0, colon_pos);
-                        try {
-                            connection_port = std::stoi(msg_without_prefix.substr(colon_pos + 1));
-                        } catch (...) {
-                            nativeLog("Discovery Warning: Failed to parse connection port from message");
-                            connection_port = ntohs(from_addr.sin_port);
-                        }
-                    } else {
-                        peer_id = msg_without_prefix;
-                    }
 
+                std::string peer_id;
+                int connection_port = 0;
+                if (parseAnnouncement(msg, peer_id, connection_port)) {
                     // Avoid self-discovery (we hear our own broadcast on some networks).
                     if (!m_peer_id.empty() && peer_id == m_peer_id) {
                         nativeLog("Discovery listenLoop: Ignoring self-discovery for peer_id=" + peer_id);

@@ -31,6 +31,11 @@ public:
     
     // Get the local LAN IP address (first private IP found on a non-loopback interface)
     virtual std::string getLocalLanIP() const = 0;
+
+    // Update the connection port advertised in discovery broadcasts. Used when
+    // the listener bound to an ephemeral port (configured port was contended by
+    // another process on the same device) so peers learn the real endpoint.
+    virtual void setConnectionPort(int port) = 0;
 };
 
 Discovery* getGlobalDiscoveryInstance();

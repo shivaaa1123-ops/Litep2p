@@ -294,6 +294,18 @@ target_link_libraries(litep2p_engine PUBLIC
     ${CMAKE_DL_LIBS}
 )
 
+# wss:// signaling TLS support (optional). Enabled when OpenSSL is available;
+# the Android AAR build does not link OpenSSL and compiles the wss:// code path
+# out (a wss URL is then rejected with a clear log).
+find_package(OpenSSL)
+if(OPENSSL_FOUND)
+    target_compile_definitions(litep2p_engine PUBLIC HAVE_OPENSSL=1)
+    target_link_libraries(litep2p_engine PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    message(STATUS "wss:// signaling: ENABLED (OpenSSL found)")
+else()
+    message(STATUS "wss:// signaling: DISABLED (OpenSSL not found)")
+endif()
+
 # ---------------------------------------------------------------------------
 # Real QUIC (RFC 9000) via picoquic + picotls (minicrypto).
 # Enabled automatically when third_party/picoquic has been built

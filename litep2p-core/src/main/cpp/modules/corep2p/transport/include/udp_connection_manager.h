@@ -50,6 +50,10 @@ public:
     // Single-threaded mode: process one incoming packet (call when socket is readable)
     void processIncomingData();
 
+    // Actual port the listener bound to (may differ from the requested port when
+    // an ephemeral port was used). -1 when not running.
+    int getBoundPort() const override;
+
 private:
     class UdpImpl;
     std::unique_ptr<UdpImpl> m_impl;

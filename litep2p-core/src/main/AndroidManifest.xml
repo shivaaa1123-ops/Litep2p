@@ -19,6 +19,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+        Lets the runtime ask the user to put the app on the battery-optimization
+        allowlist (LiteP2PBatteryOptimization). Doze would otherwise batch/defer
+        the engine's sockets while the device is idle, delaying or dropping
+        messages even with the foreground service. The exemption is always
+        user-granted; the SDK only surfaces the request once per install.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application>
         <!--

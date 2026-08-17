@@ -18,6 +18,11 @@
 #include <algorithm>
 #include <chrono>
 
+#if defined(HAVE_OPENSSL)
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
+
 namespace {
 
 std::string errno_string(int err) {
@@ -197,6 +202,124 @@ bool recvExactWithSelect(int fd, void* out, size_t len, const std::atomic<bool>&
     return true;
 }
 
+#if defined(HAVE_OPENSSL)
+
+// --- TLS-aware I/O variants used by the wss:// path ---------------------------
+
+bool send_all_tls(SSL* ssl, const void* buf, size_t len) {
+    const uint8_t* p = static_cast<const uint8_t*>(buf);
+    size_t total = 0;
+    while (total < len) {
+        const int n = SSL_write(ssl, p + total, static_cast<int>(len - total));
+        if (n > 0) {
+            total += static_cast<size_t>(n);
+            continue;
+        }
+        const int e = SSL_get_error(ssl, n);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+            continue;  // retry; non-blocking under the hood
+        }
+        return false;
+    }
+    return true;
+}
+
+// Reads exactly len bytes. On WANT_READ/WANT_WRITE (no data available yet on a
+// non-blocking socket) sets *would_block=true and returns false so the caller
+// can distinguish "try later" from a fatal error.
+bool recv_exact_tls(SSL* ssl, void* out, size_t len, bool* would_block) {
+    uint8_t* p = static_cast<uint8_t*>(out);
+    size_t total = 0;
+    while (total < len) {
+        const int n = SSL_read(ssl, p + total, static_cast<int>(len - total));
+        if (n > 0) {
+            total += static_cast<size_t>(n);
+            continue;
+        }
+        const int e = SSL_get_error(ssl, n);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+            if (would_block) *would_block = true;
+            return false;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool recv_exact_with_select_tls(SSL* ssl, void* out, size_t len,
+                                const std::atomic<bool>& running) {
+    const int fd = SSL_get_fd(ssl);
+    uint8_t* p = static_cast<uint8_t*>(out);
+    size_t total = 0;
+    while (total < len) {
+        if (!running.load(std::memory_order_acquire)) {
+            return false;
+        }
+        // Try a read first: TLS may already have buffered decrypted bytes.
+        {
+            const int n = SSL_read(ssl, p + total, static_cast<int>(len - total));
+            if (n > 0) {
+                total += static_cast<size_t>(n);
+                continue;
+            }
+            const int e = SSL_get_error(ssl, n);
+            if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
+                return false;
+            }
+        }
+
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(fd, &read_fds);
+        timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        const int ready = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+        if (ready == 0) {
+            continue;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        // readable -> loop back to SSL_read
+    }
+    return true;
+}
+
+// Establishes a TLS session over an already-connected TCP socket.
+// Verification is disabled so self-signed test/relay endpoints work; production
+// deployments should enable peer verification / pinning.
+bool tls_connect_over_fd(int fd, const std::string& host, SSL_CTX** ctx_out, SSL** ssl_out) {
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return false;
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    SSL* ssl = SSL_new(ctx);
+    if (!ssl) {
+        SSL_CTX_free(ctx);
+        return false;
+    }
+    if (SSL_set_fd(ssl, fd) != 1) {
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return false;
+    }
+    if (!host.empty()) {
+        SSL_set_tlsext_host_name(ssl, host.c_str());
+    }
+    if (SSL_connect(ssl) != 1) {
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        return false;
+    }
+    *ctx_out = ctx;
+    *ssl_out = ssl;
+    return true;
+}
+#endif  // HAVE_OPENSSL
+
 } // namespace
 
 // Simple JSON construction to avoid dependency on nlohmann/json in this low-level file if desired,
@@ -210,16 +333,43 @@ SignalingClient::~SignalingClient() {
     disconnect();
 }
 
+bool SignalingClient::ioSendAll(const void* buf, size_t len) {
+#if defined(HAVE_OPENSSL)
+    if (m_tls && m_ssl) return send_all_tls(m_ssl, buf, len);
+#endif
+    return send_all(m_socket, buf, len);
+}
+
+bool SignalingClient::ioRecvExact(void* out, size_t len, bool* would_block) {
+#if defined(HAVE_OPENSSL)
+    if (m_tls && m_ssl) return recv_exact_tls(m_ssl, out, len, would_block);
+#endif
+    if (would_block) *would_block = false;
+    return recvExact(m_socket, out, len);
+}
+
+bool SignalingClient::ioRecvExactWithSelect(void* out, size_t len) {
+#if defined(HAVE_OPENSSL)
+    if (m_tls && m_ssl) return recv_exact_with_select_tls(m_ssl, out, len, m_running);
+#endif
+    return recvExactWithSelect(m_socket, out, len, m_running);
+}
+
 bool SignalingClient::connect(const std::string& url) {
     if (m_connected) return true;
 
-    // Parse URL (ws://ip:port)
+    // Parse URL (ws:// or wss://)
+    m_tls = false;
     std::string host;
     int port = 80;
     std::string path = "/";
     
     std::string clean_url = url;
-    if (clean_url.find("ws://") == 0) {
+    if (clean_url.find("wss://") == 0) {
+        m_tls = true;
+        port = 443;
+        clean_url = clean_url.substr(6);
+    } else if (clean_url.find("ws://") == 0) {
         clean_url = clean_url.substr(5);
     }
     
@@ -246,7 +396,8 @@ bool SignalingClient::connect(const std::string& url) {
     m_host = host;
     m_port = port;
 
-    LOG_INFO("Signaling: Connecting to " + host + ":" + std::to_string(port) + " path=" + path);
+    LOG_INFO("Signaling: Connecting to " + host + ":" + std::to_string(port) + " path=" + path +
+             (m_tls ? " (wss)" : " (ws)"));
 
     // Resolve using getaddrinfo (handles IPv4/IPv6 and numeric hosts reliably on Android).
     addrinfo hints;
@@ -292,6 +443,26 @@ bool SignalingClient::connect(const std::string& url) {
 
     m_socket = connected_fd;
 
+    // TLS handshake for wss:// URLs (if supported by this build).
+#if defined(HAVE_OPENSSL)
+    if (m_tls) {
+        if (!tls_connect_over_fd(m_socket, host, &m_ssl_ctx, &m_ssl)) {
+            LOG_ERROR("Signaling: TLS handshake failed (host=" + host + ")");
+            close(m_socket);
+            m_socket = -1;
+            return false;
+        }
+        LOG_INFO("Signaling: TLS established with " + host);
+    }
+#else
+    if (m_tls) {
+        LOG_ERROR("Signaling: wss:// requires TLS support; this build was compiled without OpenSSL (HAVE_OPENSSL)");
+        close(m_socket);
+        m_socket = -1;
+        return false;
+    }
+#endif
+
     // 4. WebSocket Handshake
     if (!performHandshake(host, port, path)) {
         LOG_ERROR("Signaling: Handshake failed (host=" + host + " port=" + std::to_string(port) + " path=" + path + ")");
@@ -311,13 +482,18 @@ bool SignalingClient::connect(const std::string& url) {
 int SignalingClient::connectEventLoop(const std::string& url) {
     if (m_connected) return m_socket;
 
-    // Parse URL (ws://ip:port)
+    // Parse URL (ws:// or wss://)
+    m_tls = false;
     std::string host;
     int port = 80;
     std::string path = "/";
     
     std::string clean_url = url;
-    if (clean_url.find("ws://") == 0) {
+    if (clean_url.find("wss://") == 0) {
+        m_tls = true;
+        port = 443;
+        clean_url = clean_url.substr(6);
+    } else if (clean_url.find("ws://") == 0) {
         clean_url = clean_url.substr(5);
     }
     
@@ -344,7 +520,8 @@ int SignalingClient::connectEventLoop(const std::string& url) {
     m_host = host;
     m_port = port;
 
-    LOG_INFO("Signaling: Connecting (event-loop mode) to " + host + ":" + std::to_string(port) + " path=" + path);
+    LOG_INFO("Signaling: Connecting (event-loop mode) to " + host + ":" + std::to_string(port) + " path=" + path +
+             (m_tls ? " (wss)" : " (ws)"));
 
     addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));
@@ -389,6 +566,26 @@ int SignalingClient::connectEventLoop(const std::string& url) {
 
     m_socket = connected_fd;
 
+    // TLS handshake for wss:// URLs (if supported by this build).
+#if defined(HAVE_OPENSSL)
+    if (m_tls) {
+        if (!tls_connect_over_fd(m_socket, host, &m_ssl_ctx, &m_ssl)) {
+            LOG_ERROR("Signaling: TLS handshake failed (event-loop mode, host=" + host + ")");
+            close(m_socket);
+            m_socket = -1;
+            return -1;
+        }
+        LOG_INFO("Signaling: TLS established with " + host);
+    }
+#else
+    if (m_tls) {
+        LOG_ERROR("Signaling: wss:// requires TLS support; this build was compiled without OpenSSL (HAVE_OPENSSL)");
+        close(m_socket);
+        m_socket = -1;
+        return -1;
+    }
+#endif
+
     // WebSocket Handshake (blocking, but should be fast after connect)
     if (!performHandshake(host, port, path)) {
         LOG_ERROR("Signaling: Handshake failed (event-loop mode)");
@@ -418,6 +615,17 @@ int SignalingClient::connectEventLoop(const std::string& url) {
 
 void SignalingClient::disconnect() {
     m_running = false;
+#if defined(HAVE_OPENSSL)
+    if (m_ssl) {
+        SSL_shutdown(m_ssl);
+        SSL_free(m_ssl);
+        m_ssl = nullptr;
+    }
+    if (m_ssl_ctx) {
+        SSL_CTX_free(m_ssl_ctx);
+        m_ssl_ctx = nullptr;
+    }
+#endif
     if (m_socket >= 0) {
         ::shutdown(m_socket, SHUT_RDWR);
         close(m_socket);
@@ -427,6 +635,7 @@ void SignalingClient::disconnect() {
         m_thread.join();
     }
     m_connected = false;
+    m_tls = false;
 }
 
 bool SignalingClient::performHandshake(const std::string& host, int port, const std::string& path) {
@@ -442,7 +651,7 @@ bool SignalingClient::performHandshake(const std::string& host, int port, const 
     ss << "\r\n";
     
     std::string request = ss.str();
-    if (!send_all(m_socket, request.data(), request.size())) {
+    if (!ioSendAll(request.data(), request.size())) {
         LOG_ERROR("Signaling: Handshake send failed: " + errno_string(errno));
         return false;
     }
@@ -485,20 +694,36 @@ bool SignalingClient::performHandshake(const std::string& host, int port, const 
         }
 
         char buffer[1024];
-        const int n = ::recv(m_socket, buffer, sizeof(buffer) - 1, 0);
-        if (n == 0) {
-            LOG_ERROR("Signaling: Handshake recv EOF");
-            return false;
-        }
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
+        int n;
+#if defined(HAVE_OPENSSL)
+        if (m_tls && m_ssl) {
+            n = SSL_read(m_ssl, buffer, sizeof(buffer) - 1);
+            if (n <= 0) {
+                const int e = SSL_get_error(m_ssl, n);
+                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                    continue;  // select again
+                }
+                LOG_ERROR("Signaling: TLS handshake recv error");
+                return false;
             }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;
+        } else
+#endif
+        {
+            n = ::recv(m_socket, buffer, sizeof(buffer) - 1, 0);
+            if (n == 0) {
+                LOG_ERROR("Signaling: Handshake recv EOF");
+                return false;
             }
-            LOG_ERROR("Signaling: Handshake recv failed: " + errno_string(errno));
-            return false;
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                LOG_ERROR("Signaling: Handshake recv failed: " + errno_string(errno));
+                return false;
+            }
         }
 
         buffer[n] = '\0';
@@ -630,7 +855,7 @@ bool SignalingClient::sendFrame(const std::string& data, uint8_t opcode) {
     }
     
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (send(m_socket, frame.data(), frame.size(), send_flags_no_sigpipe()) < 0) {
+    if (!ioSendAll(frame.data(), frame.size())) {
         LOG_ERROR("Signaling: Send failed: " + errno_string(errno));
         m_connected = false;
         m_running = false;
@@ -648,20 +873,32 @@ void SignalingClient::processIncoming() {
     
     // Read one WebSocket frame (non-blocking)
     uint8_t header[2];
-    ssize_t n = recv(m_socket, header, sizeof(header), MSG_PEEK);
-    if (n <= 0) {
-        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+#if defined(HAVE_OPENSSL)
+    if (m_tls && m_ssl) {
+        bool would_block = false;
+        if (!recv_exact_tls(m_ssl, header, sizeof(header), &would_block)) {
+            if (would_block) return;  // no data yet; poll again later
             m_connected = false;
             m_running = false;
+            return;
         }
-        return;
-    }
-    
-    // Have data, read the frame
-    if (!recvExact(m_socket, header, sizeof(header))) {
-        m_connected = false;
-        m_running = false;
-        return;
+    } else
+#endif
+    {
+        ssize_t n = recv(m_socket, header, sizeof(header), MSG_PEEK);
+        if (n <= 0) {
+            if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                m_connected = false;
+                m_running = false;
+            }
+            return;
+        }
+        // Have data, read the frame
+        if (!recvExact(m_socket, header, sizeof(header))) {
+            m_connected = false;
+            m_running = false;
+            return;
+        }
     }
 
     const bool fin = (header[0] & 0x80) != 0;
@@ -671,11 +908,11 @@ void SignalingClient::processIncoming() {
 
     if (payload_len == 126) {
         uint8_t len_bytes[2];
-        if (!recvExact(m_socket, len_bytes, sizeof(len_bytes))) return;
+        if (!ioRecvExact(len_bytes, sizeof(len_bytes))) return;
         payload_len = (static_cast<uint64_t>(len_bytes[0]) << 8) | static_cast<uint64_t>(len_bytes[1]);
     } else if (payload_len == 127) {
         uint8_t len_bytes[8];
-        if (!recvExact(m_socket, len_bytes, sizeof(len_bytes))) return;
+        if (!ioRecvExact(len_bytes, sizeof(len_bytes))) return;
         payload_len = 0;
         for (int i = 0; i < 8; i++) {
             payload_len = (payload_len << 8) | static_cast<uint64_t>(len_bytes[i]);
@@ -684,7 +921,7 @@ void SignalingClient::processIncoming() {
 
     uint8_t mask_key[4] = {0, 0, 0, 0};
     if (masked) {
-        if (!recvExact(m_socket, mask_key, sizeof(mask_key))) return;
+        if (!ioRecvExact(mask_key, sizeof(mask_key))) return;
     }
 
     if (payload_len > (64ULL * 1024ULL * 1024ULL)) {
@@ -694,7 +931,7 @@ void SignalingClient::processIncoming() {
 
     std::vector<uint8_t> payload(static_cast<size_t>(payload_len));
     if (payload_len > 0) {
-        if (!recvExact(m_socket, payload.data(), static_cast<size_t>(payload_len))) return;
+        if (!ioRecvExact(payload.data(), static_cast<size_t>(payload_len))) return;
     }
 
     if (masked) {
@@ -760,7 +997,7 @@ void SignalingClient::receiveLoop() {
         }
 
         uint8_t header[2];
-        if (!recvExactWithSelect(m_socket, header, sizeof(header), m_running)) {
+        if (!ioRecvExactWithSelect(header, sizeof(header))) {
             break;
         }
 
@@ -773,13 +1010,13 @@ void SignalingClient::receiveLoop() {
 
         if (payload_len == 126) {
             uint8_t len_bytes[2];
-            if (!recvExactWithSelect(m_socket, len_bytes, sizeof(len_bytes), m_running)) {
+            if (!ioRecvExactWithSelect(len_bytes, sizeof(len_bytes))) {
                 break;
             }
             payload_len = (static_cast<uint64_t>(len_bytes[0]) << 8) | static_cast<uint64_t>(len_bytes[1]);
         } else if (payload_len == 127) {
             uint8_t len_bytes[8];
-            if (!recvExactWithSelect(m_socket, len_bytes, sizeof(len_bytes), m_running)) {
+            if (!ioRecvExactWithSelect(len_bytes, sizeof(len_bytes))) {
                 break;
             }
             payload_len = 0;
@@ -791,7 +1028,7 @@ void SignalingClient::receiveLoop() {
         // If server sends masked frames (non-compliant, but handle defensively)
         uint8_t mask_key[4] = {0, 0, 0, 0};
         if (masked) {
-            if (!recvExactWithSelect(m_socket, mask_key, sizeof(mask_key), m_running)) {
+            if (!ioRecvExactWithSelect(mask_key, sizeof(mask_key))) {
                 break;
             }
         }
@@ -805,7 +1042,7 @@ void SignalingClient::receiveLoop() {
 
         std::vector<uint8_t> payload(static_cast<size_t>(payload_len));
         if (payload_len > 0) {
-            if (!recvExactWithSelect(m_socket, payload.data(), static_cast<size_t>(payload_len), m_running)) {
+            if (!ioRecvExactWithSelect(payload.data(), static_cast<size_t>(payload_len))) {
                 break;
             }
         }

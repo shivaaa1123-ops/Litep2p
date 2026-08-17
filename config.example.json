@@ -12,7 +12,25 @@
         "default_server_port": 30001,
         "discovery_port": 30000,
         "listen_backlog": 5,
-        "select_max_retries": 3
+        "select_max_retries": 3,
+
+        /* v0.4 censorship resistance.
+           - port_range: when set to [min, max], the engine picks a RANDOM free
+             port in this range for its data listener at startup (instead of a
+             fixed port), so a static port blocklist cannot pin it down. The
+             real port is advertised via discovery/signaling, so peers still
+             find this node. Omit/disable to keep the fixed default port.
+           - discovery_magic: prefix bytes on LAN discovery announcements.
+             Set a random per-deployment string so packets are NOT recognizable
+             as "LITEP2P_DISCOVERY". Keep the default for interoperability with
+             unmodified deployments.
+           - discovery_shared_key: 64-hex-char AEAD key. When set, discovery
+             announcements are encrypted (XChaCha20-Poly1305) and padded, so
+             peer ids/ports are opaque to passive observers. ALL nodes in a
+             deployment must use the SAME magic + key. */
+        "port_range": [31000, 32000],
+        "discovery_magic": "LITEP2P_DISCOVERY",
+        "discovery_shared_key": ""
     },
     "communication": {
         "default_protocol": "UDP",
@@ -162,7 +180,11 @@
     },
     "signaling": {
         "enabled": true,
-        "url": "ws://SIGNALING_HOST:8765",
+        /* Use wss:// URLs for TLS-encrypted signaling (desktop build links
+           OpenSSL; the Android AAR currently requires ws:// until a TLS stack
+           is vendored). Serving signaling over wss://:443 makes it look like
+           ordinary HTTPS traffic and defeats IP/port-level blocking. */
+        "url": "wss://SIGNALING_HOST",
         "reconnect_interval_ms": 5000
     },
     "proxy": {

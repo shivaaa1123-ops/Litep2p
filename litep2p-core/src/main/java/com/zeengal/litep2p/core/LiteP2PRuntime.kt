@@ -1,5 +1,6 @@
 package com.zeengal.litep2p.core
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.util.Log
@@ -84,6 +85,16 @@ object LiteP2PRuntime {
     @Volatile
     var notificationCustomizer: ((NotificationCompat.Builder) -> Unit)? = null
 
+    /**
+     * Whether [start] automatically asks the user (once per install) to put the
+     * app on the battery-optimization allowlist, so Doze doesn't defer the
+     * engine's sockets while the device is idle. The request is always
+     * user-granted; set this to `false` to never surface it (and use
+     * [LiteP2PBatteryOptimization.requestExemption] from your own UI instead).
+     */
+    @Volatile
+    var autoRequestBatteryExemption: Boolean = true
+
     /* ------------------------------------------------------------------ */
     /* Lifecycle                                                            */
     /* ------------------------------------------------------------------ */
@@ -107,8 +118,11 @@ object LiteP2PRuntime {
      *
      * Must be called while the app is in the foreground (Android restricts
      * background foreground-service starts on API 31+).
+     *
+     * @param activity optional Activity used to present the one-shot battery-
+     *        optimization exemption dialog (see [autoRequestBatteryExemption]).
      */
-    fun start(context: Context, config: LiteP2PConfig? = null) {
+    fun start(context: Context, config: LiteP2PConfig? = null, activity: Activity? = null) {
         val app = context.applicationContext
         if (config == null && desiredRunning(app) &&
             (LiteP2P.state == EngineState.RUNNING || LiteP2P.state == EngineState.STARTING)
@@ -123,6 +137,14 @@ object LiteP2PRuntime {
         ContextCompat.startForegroundService(app, Intent(app, LiteP2PService::class.java).apply {
             action = ACTION_START
         })
+
+        // Doze defers the engine's sockets while idle even with the foreground
+        // service. Ask the user once per install to exempt the app (never if
+        // already exempt, never a second time, and never when the integrator
+        // disabled autoRequestBatteryExemption).
+        if (autoRequestBatteryExemption) {
+            LiteP2PBatteryOptimization.requestExemptionIfNeeded(app, activity)
+        }
     }
 
     /* ------------------------------------------------------------------ */

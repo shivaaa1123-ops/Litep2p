@@ -419,6 +419,17 @@ async def main() -> None:
     except ValueError:
         logging.warning("Invalid SIGNALING_PING_INTERVAL/SIGNALING_PING_TIMEOUT; using defaults")
 
+    # Optional wss:// TLS: set SIGNALING_SSL_CERT + SIGNALING_SSL_KEY to a
+    # PEM cert/key pair (self-signed is fine for test deployments).
+    ssl_cert = os.environ.get("SIGNALING_SSL_CERT")
+    ssl_key = os.environ.get("SIGNALING_SSL_KEY")
+    if ssl_cert and ssl_key:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(ssl_cert, ssl_key)
+        serve_kwargs["ssl"] = ctx
+        logging.info("Signaling TLS enabled (wss) using %s", ssl_cert)
+
     async with websockets.serve(handler, host, port, **serve_kwargs):
         logging.info("Signaling server started on %s:%s", host, port)
         await asyncio.Future()  # run forever

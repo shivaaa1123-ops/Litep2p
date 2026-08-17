@@ -245,6 +245,51 @@ std::string ConfigManager::getTransportKeyHex() const {
     return jsonGetOr<std::string>(m_config, {"security", "transport_key"}, "");
 }
 
+bool ConfigManager::getDataPortRange(int& lo, int& hi) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return false;
+    const auto it = m_config.find("network");
+    if (it == m_config.end() || !it->is_object()) return false;
+    const auto r = it->find("port_range");
+    if (r == it->end() || !r->is_array() || r->size() != 2) return false;
+    try {
+        lo = (*r)[0].get<int>();
+        hi = (*r)[1].get<int>();
+    } catch (...) {
+        return false;
+    }
+    return lo > 0 && hi >= lo && hi <= 65535;
+}
+
+std::string ConfigManager::getDiscoveryMagic() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return "LITEP2P_DISCOVERY";
+    std::string magic = jsonGetOr<std::string>(m_config, {"network", "discovery_magic"}, "LITEP2P_DISCOVERY");
+    if (magic.empty()) magic = "LITEP2P_DISCOVERY";
+    return magic;
+}
+
+bool ConfigManager::getDiscoverySharedKey(std::vector<uint8_t>& key_out) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return false;
+    const std::string hex = jsonGetOr<std::string>(m_config, {"network", "discovery_shared_key"}, "");
+    if (hex.size() != 64) return false;
+    key_out.resize(32);
+    for (size_t i = 0; i < 32; ++i) {
+        auto nib = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        const int hi_n = nib(hex[i * 2]);
+        const int lo_n = nib(hex[i * 2 + 1]);
+        if (hi_n < 0 || lo_n < 0) return false;
+        key_out[i] = static_cast<uint8_t>((hi_n << 4) | lo_n);
+    }
+    return true;
+}
+
 bool ConfigManager::isBatchManagerEnabled() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return true;

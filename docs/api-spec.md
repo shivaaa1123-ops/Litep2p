@@ -1644,6 +1644,9 @@ chat application is most likely to care about:
 |---|---|---|
 | `network.default_server_port` | `30001` | Main listener port |
 | `network.discovery_port` | `30000` | LAN broadcast discovery port |
+| `network.port_range` | *(unset)* | v0.4 censorship resistance: `[min,max]` → the engine binds a **random free port** from this range at startup (a static port blocklist cannot pin it down). The real port is advertised via discovery/signaling. |
+| `network.discovery_magic` | `"LITEP2P_DISCOVERY"` | v0.4: prefix bytes on discovery announcements. Set a random per-deployment string so packets aren't recognizable by DPI. |
+| `network.discovery_shared_key` | *(empty)* | v0.4: 64-hex AEAD key; when set, discovery announcements are encrypted + padded so peer ids/ports are opaque. All nodes must share the same magic + key. |
 | `communication.default_protocol` | `"UDP"` | `"TCP"`, `"UDP"`, `"QUIC"` |
 | `communication.tcp/udp/quic.enabled` | `true` | Per-transport toggles |
 | `communication.*.port` | `30001` | Per-transport listen ports |
@@ -1661,7 +1664,7 @@ chat application is most likely to care about:
 | `nat_traversal.turn_config` | *(see config)* | TURN server address/credentials |
 | `nat_traversal.hole_punching_enabled` | `true` | UDP hole punching |
 | `signaling.enabled` | `true` | Central signaling rendezvous |
-| `signaling.url` | `"ws://<host>:8765"` | Signaling server WebSocket URL |
+| `signaling.url` | `"ws://<host>:8765"` | Signaling server WebSocket URL. v0.4: `wss://` is supported on TLS-capable builds (desktop links OpenSSL); serve signaling on 443 so it looks like ordinary HTTPS traffic. |
 | `offline_queue.enabled` | `true` | v0.4 store-and-forward: reliable sends to offline peers are held by the signaling server |
 | `offline_queue.max_messages` | `500` | Durable-outbox/mailbox capacity; `sendReliable` returns `QUEUE_FULL` beyond it |
 | `offline_queue.ttl_ms` | `604800000` (7 days) | Message TTL; expiry fires `onDeliveryStatus(FAILED, "TTL_EXPIRED")` |
@@ -1881,7 +1884,14 @@ LiteP2PRuntime.stop(context)
 - contributes its permissions and service declaration via manifest merging —
   the app doesn't need any manifest edits (but should request the
   `POST_NOTIFICATIONS` runtime permission on API 33+ to make the engine
-  notification visible).
+  notification visible),
+- asks the user **once per install** to put the app on the battery-optimization
+  allowlist (`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`) so Doze doesn't defer the
+  engine's sockets while the device is idle. The request is always user-granted
+  and never re-shown once answered; disable it with
+  `LiteP2PRuntime.autoRequestBatteryExemption = false` and re-ask any time from
+  your own UI via `LiteP2PBatteryOptimization.requestExemption(context,
+  activity)`.
 
 The notification is customizable before `start()`:
 `notificationSmallIconResId`, `notificationTitle`, `notificationText`,

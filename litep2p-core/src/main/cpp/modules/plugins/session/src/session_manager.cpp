@@ -22,6 +22,9 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include <limits.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -105,6 +108,28 @@ inline bool is_single_thread_mode() {
 #endif
     }();
     return enabled;
+}
+
+// True when some OTHER process on this host already holds `port` on a UDP
+// socket. This is how we detect same-device multi-app coexistence: with
+// SO_REUSEPORT a second bind() on the same port succeeds and the kernel then
+// load-balances inbound unicast datagrams between the two sockets, so neither
+// app reliably receives its handshake/message traffic. The probe deliberately
+// binds WITHOUT SO_REUSEPORT, so it fails with EADDRINUSE whenever another
+// process owns the port (our own sockets bind with SO_REUSEPORT afterwards).
+bool udp_port_held_by_other_process(int port) {
+    if (port <= 0 || port > 65535) return false;
+    int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return false;
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    const bool held = (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0);
+    ::close(fd);
+    return held;
 }
 } // namespace
 
@@ -817,6 +842,45 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
     m_localPeerId = peer_id;
     m_network_available.store(true, std::memory_order_release);
 
+    // Same-device coexistence (v0.4): when another process on this host — e.g. a
+    // second app built on this SDK, or a desktop node — already holds the
+    // configured UDP port, a second bind() succeeds thanks to SO_REUSEPORT, but
+    // the kernel then load-balances inbound unicast datagrams between the two
+    // sockets, so neither engine reliably receives its handshake/message traffic
+    // and connections never complete (peers still show up via broadcast).
+    //
+    // Censorship resistance (v0.4): when network.port_range is configured, we
+    // pick a random free port in that range at startup, so a static port
+    // blocklist cannot pin us to a fixed listener port.
+    //
+    // Either way the real bound port is advertised through discovery +
+    // signaling so the mesh still reaches this node; if everything is held we
+    // fall back to an OS-assigned ephemeral port.
+    int resolved_port = port;
+    {
+        int lo = 0, hi = 0;
+        const bool range_configured = ConfigManager::getInstance().getDataPortRange(lo, hi);
+        if (range_configured) {
+            std::mt19937 rng(std::random_device{}());
+            std::uniform_int_distribution<int> dist(lo, hi);
+            resolved_port = 0;
+            for (int attempt = 0; attempt < 24; ++attempt) {
+                const int candidate = dist(rng);
+                if (!udp_port_held_by_other_process(candidate)) {
+                    resolved_port = candidate;
+                    break;
+                }
+            }
+            LOG_INFO("SM: Dynamic data port selected " + std::to_string(resolved_port) +
+                     " from range [" + std::to_string(lo) + "," + std::to_string(hi) + "]");
+        } else if (port != 0 && udp_port_held_by_other_process(port)) {
+            resolved_port = 0;
+            LOG_WARN("SM: Port " + std::to_string(port) +
+                     " is already held by another process on this device; falling back "
+                     "to an ephemeral port (same-device multi-app coexistence)");
+        }
+    }
+
     // Telemetry (local-only, no network). Safe to call multiple times.
     {
         auto& cfg = ConfigManager::getInstance();
@@ -1094,13 +1158,8 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
         // SINGLE-THREADED MODE: Use event-loop for all I/O
         // ================================================================
         
-        // Start Discovery in event-loop mode
-        single_thread_discovery_fd = discovery->startEventLoop(port, peer_id);
-        if (single_thread_discovery_fd < 0) {
-            LOG_WARN("SM: Failed to start discovery in event-loop mode");
-        } else {
-            LOG_INFO("SM: Discovery started in event-loop mode, fd=" + std::to_string(single_thread_discovery_fd));
-        }
+        // Discovery is started after the listeners bind (below) so it can
+        // advertise the real (possibly ephemeral) listener port.
         
         // Start UDP in event-loop mode (no listener thread)
         // Start UDP in event-loop mode (no listener thread). In heterogeneous mode we
@@ -1109,7 +1168,7 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
             // Cast to concrete type to access event-loop methods
             single_thread_udp_mgr = dynamic_cast<UdpConnectionManager*>(m_udpConnectionManager.get());
             if (single_thread_udp_mgr) {
-                single_thread_udp_mgr->startServerEventLoop(port,
+                single_thread_udp_mgr->startServerEventLoop(resolved_port,
                     [this](const std::string& id, const std::string& data) {
                         note_inbound_transport(id, "UDP");
                         onData(id, data);
@@ -1120,7 +1179,7 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
             }
         } else {
             // TCP not supported in single-thread mode yet
-            m_tcpConnectionManager->startServer(port, 
+            m_tcpConnectionManager->startServer(resolved_port, 
                 [this](const std::string& id, const std::string& data) {
                     note_inbound_transport(id, "TCP");
                     onData(id, data);
@@ -1130,7 +1189,7 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
 
         // Heterogeneous mode: also accept TCP connections alongside the UDP socket.
         if (m_comms_heterogeneous) {
-            m_tcpConnectionManager->startServer(port,
+            m_tcpConnectionManager->startServer(resolved_port,
                 [this](const std::string& id, const std::string& data) {
                     note_inbound_transport(id, "TCP");
                     onData(id, data);
@@ -1138,11 +1197,31 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
                 [this](const std::string& id) { onDisconnect(id); });
             LOG_INFO("SM: TCP listener started additionally (heterogeneous mode)");
         }
+
+        // Resolve the real bound port (ephemeral when the configured port was
+        // contended by another process on this device) and advertise it via
+        // discovery so peers connect to the actual listener.
+        int actual_port = resolved_port;
+        if (single_thread_udp_mgr) {
+            const int p = single_thread_udp_mgr->getBoundPort();
+            if (p > 0) actual_port = p;
+        }
+        m_listen_port = actual_port;
+        if (resolved_port == 0) {
+            LOG_WARN("SM: Using ephemeral listener port " + std::to_string(actual_port) + " (same-device coexistence)");
+        }
+        discovery->setConnectionPort(actual_port);
+        single_thread_discovery_fd = discovery->startEventLoop(actual_port, peer_id);
+        if (single_thread_discovery_fd < 0) {
+            LOG_WARN("SM: Failed to start discovery in event-loop mode");
+        } else {
+            LOG_INFO("SM: Discovery started in event-loop mode, fd=" + std::to_string(single_thread_discovery_fd));
+        }
         
         // Do NAT detection synchronously at startup (no thread)
         if (comms_mode != "TCP") {
             NATTraversal& nat = NATTraversal::getInstance();
-            nat.initialize(static_cast<uint16_t>(port));
+            nat.initialize(static_cast<uint16_t>(actual_port));
 
             // Single-thread mode: NATTraversal's bound-socket STUN path relies on STUN responses
             // being processed by the UDP transport while detectNATType() is blocked waiting.
@@ -1208,7 +1287,8 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
         // MULTI-THREADED MODE (Legacy)
         // ================================================================
         
-        discovery->start(port, peer_id);
+        // Discovery is started after the listeners bind (below) so it can
+        // advertise the real (possibly ephemeral) listener port.
 
         // Per-transport inbound data callbacks. In heterogeneous mode both UDP and
         // TCP listeners feed the same message pipeline, so we first record which
@@ -1228,11 +1308,11 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
         if (comms_mode == "TCP") {
             if (comms_hetero) {
                 // Heterogeneous: accept TCP and UDP connections.
-                m_tcpConnectionManager->startServer(port, tcp_on_data, on_disc);
-                m_udpConnectionManager->startServer(port, udp_on_data, on_disc);
+                m_tcpConnectionManager->startServer(resolved_port, tcp_on_data, on_disc);
+                m_udpConnectionManager->startServer(resolved_port, udp_on_data, on_disc);
             } else {
                 // Homogeneous TCP: only accept TCP connections.
-                m_tcpConnectionManager->startServer(port, tcp_on_data, on_disc);
+                m_tcpConnectionManager->startServer(resolved_port, tcp_on_data, on_disc);
             }
         } else if (comms_mode == "QUIC") {
             LOG_INFO("SM: Switching to QUIC protocol");
@@ -1240,14 +1320,29 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
             auto ptr = std::make_unique<QuicConnectionManager>();
             m_udpConnectionManager = std::move(ptr);
             NATTraversal::getInstance().setConnectionManager(m_udpConnectionManager.get());
-            m_udpConnectionManager->startServer(port, udp_on_data, on_disc);
+            m_udpConnectionManager->startServer(resolved_port, udp_on_data, on_disc);
         } else {
             // UDP (homogeneous UDP, or the UDP half of heterogeneous mode).
-            m_udpConnectionManager->startServer(port, udp_on_data, on_disc);
+            m_udpConnectionManager->startServer(resolved_port, udp_on_data, on_disc);
             if (comms_hetero) {
-                m_tcpConnectionManager->startServer(port, tcp_on_data, on_disc);
+                m_tcpConnectionManager->startServer(resolved_port, tcp_on_data, on_disc);
             }
         }
+
+        // Resolve the real bound port (ephemeral when the configured port was
+        // contended by another process on this device) and advertise it via
+        // discovery so peers connect to the actual listener.
+        int actual_port = resolved_port;
+        if (m_udpConnectionManager) {
+            const int p = m_udpConnectionManager->getBoundPort();
+            if (p > 0) actual_port = p;
+        }
+        m_listen_port = actual_port;
+        if (resolved_port == 0) {
+            LOG_WARN("SM: Using ephemeral listener port " + std::to_string(actual_port) + " (same-device coexistence)");
+        }
+        discovery->setConnectionPort(actual_port);
+        discovery->start(actual_port, peer_id);
 
         // NAT detection in separate thread (multi-threaded mode)
         if (comms_mode != "TCP") {
@@ -1255,7 +1350,7 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
                 m_nat_detect_thread.join();
             }
             m_nat_detect_in_progress.store(true, std::memory_order_release);
-            m_nat_detect_thread = std::thread([this, port]() {
+            m_nat_detect_thread = std::thread([this, actual_port]() {
                 struct Guard {
                     std::atomic<bool>& flag;
                     ~Guard() { flag.store(false, std::memory_order_release); }
@@ -1266,7 +1361,7 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
                 }
 
                 NATTraversal& nat = NATTraversal::getInstance();
-                nat.initialize(static_cast<uint16_t>(port));
+                nat.initialize(static_cast<uint16_t>(actual_port));
                 NATInfo info = nat.detectNATType();
 
                 if (m_shutting_down.load(std::memory_order_acquire)) {

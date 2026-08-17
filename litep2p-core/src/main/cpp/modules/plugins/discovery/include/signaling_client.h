@@ -8,6 +8,10 @@
 #include <vector>
 #include <queue>
 
+#if defined(HAVE_OPENSSL)
+#include <openssl/ssl.h>
+#endif
+
 class SignalingClient {
 public:
     using MessageCallback = std::function<void(const std::string&)>;
@@ -52,7 +56,13 @@ private:
     bool performHandshake(const std::string& host, int port, const std::string& path);
     bool sendFrame(const std::string& data, uint8_t opcode = 0x1); // 0x1 = Text
     bool readOneFrame(std::string& out_message);
-    
+
+    // TLS-aware I/O (wss://). These dispatch to OpenSSL when m_tls is set,
+    // otherwise to the plain-socket helpers.
+    bool ioSendAll(const void* buf, size_t len);
+    bool ioRecvExact(void* out, size_t len, bool* would_block = nullptr);
+    bool ioRecvExactWithSelect(void* out, size_t len);
+
     // Helpers
     std::string generateWebSocketKey();
     std::string base64Encode(const std::vector<uint8_t>& data);
@@ -67,4 +77,11 @@ private:
     
     std::string m_host;
     int m_port;
+
+    // wss:// TLS state (only used when compiled with HAVE_OPENSSL).
+    bool m_tls{false};
+#if defined(HAVE_OPENSSL)
+    SSL_CTX* m_ssl_ctx{nullptr};
+    SSL* m_ssl{nullptr};
+#endif
 };

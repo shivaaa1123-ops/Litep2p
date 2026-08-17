@@ -47,6 +47,21 @@ public:
     // Optional shared transport key (64 hex chars). When set, all peers use it
     // for transport-layer encryption instead of their device-local key.
     std::string getTransportKeyHex() const;
+
+    // Dynamic data-listener port range (network.port_range = [min, max]).
+    // When configured, the engine picks a random free port in the range at
+    // startup (censorship resistance: a static port blocklist cannot pin a
+    // fixed port). Returns false when unset/malformed.
+    bool getDataPortRange(int& lo, int& hi) const;
+
+    // Discovery fingerprint controls (network.discovery_magic + network.discovery_shared_key).
+    // - magic: prefix bytes on discovery announcements; set to a random string
+    //   per deployment so packets are not recognizable as "LITEP2P_DISCOVERY".
+    // - shared_key: 64-hex-char AEAD key; when set, discovery announcements are
+    //   encrypted (XChaCha20-Poly1305) and padded, so even the peer id/port are
+    //   opaque to passive observers.
+    std::string getDiscoveryMagic() const;
+    bool getDiscoverySharedKey(std::vector<uint8_t>& key_out) const;
     
     // Batch Connection Manager
     bool isBatchManagerEnabled() const;
