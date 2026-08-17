@@ -12,6 +12,7 @@ add_library(litep2p_session OBJECT
     src/nat_traversal_manager.cpp
     src/tier_manager.cpp
     src/rugged_recovery_manager.cpp
+    src/reliable_send_manager.cpp
 )
 
 # Expose include directories with proper scope propagation

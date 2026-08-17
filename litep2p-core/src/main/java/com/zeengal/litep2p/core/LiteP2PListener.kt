@@ -84,4 +84,55 @@ interface LiteP2PListener {
      * @param error Human-readable error message when [success] is false, or null.
      */
     fun onTransferCompleted(transferId: String, success: Boolean, error: String?) {}
+
+    /* ------------------------------------------------------------------ */
+    /* v0.4: reliable messaging / presence / directory / invites            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Reliable-send delivery receipt for a message sent with [LiteP2P.sendReliable].
+     *
+     * @param messageId The caller-supplied message id.
+     * @param status [DeliveryStatus] of the message.
+     * @param reason Machine-readable detail: "OK" | "NO_ROUTE" | "PEER_OFFLINE"
+     *   | "QUEUE_FULL" | "TIMEOUT" | "TTL_EXPIRED" | "CANCELLED".
+     */
+    fun onDeliveryStatus(messageId: String, status: DeliveryStatus, reason: String) {}
+
+    /**
+     * Presence update for a peer subscribed via [LiteP2P.subscribePresence].
+     *
+     * @param peerId The peer.
+     * @param online Current online state.
+     * @param lastSeenMs Epoch ms when the peer was last observed online, or 0
+     *   when unknown.
+     */
+    fun onPresence(peerId: String, online: Boolean, lastSeenMs: Long) {}
+
+    /**
+     * Result of a [LiteP2P.ping] probe.
+     *
+     * @param peerId The probed peer.
+     * @param rttMs Round-trip time in ms (>= 0), or -1 when the peer was
+     *   unreachable within the timeout.
+     */
+    fun onPingResult(peerId: String, rttMs: Long) {}
+
+    /**
+     * Result of a [LiteP2P.lookupPeer] alias resolution.
+     *
+     * @param alias The requested alias hash.
+     * @param peerId The resolved peer id, or "" when the alias is unregistered.
+     * @param online Server-side presence knowledge for the resolved peer.
+     * @param lastSeenMs Epoch ms when the peer was last observed online, or 0
+     *   when unknown.
+     */
+    fun onLookupResult(alias: String, peerId: String, online: Boolean, lastSeenMs: Long) {}
+
+    /**
+     * An invite arrived: [fromPeerId] wants this device to connect (sent via
+     * [LiteP2P.invitePeer] on the other side). Typical response is
+     * [LiteP2P.connect].
+     */
+    fun onInviteReceived(fromPeerId: String) {}
 }

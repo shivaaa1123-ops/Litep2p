@@ -1,6 +1,6 @@
 # LiteP2P SDK Reference
 
-**Version:** 0.3.0 (matches `LITEP2P_VERSION_*` in `litep2p.h` and `LiteP2P.version`)
+**Version:** 0.4.0 (matches `LITEP2P_VERSION_*` in `litep2p.h` and `LiteP2P.version`)
 **Status:** Implemented and exercised by the in-repo harness (`:app`) and desktop C ABI tests
 **Audience:** Application developers integrating the LiteP2P peer-to-peer SDK
 **Primary API for Android:** Kotlin (`com.zeengal.litep2p.core`) — wraps the C ABI via JNI
@@ -87,7 +87,7 @@ accounts). Maven Central requires only adding credentials + signing (see below).
 
 **Option C — Maven local publication (recommended).** The SDK coordinates are
 `com.zeengal:litep2p-core:<version>` (version is single-sourced from
-`LITEP2P_VERSION` in `gradle.properties`, currently `0.3.0`). Publish and depend:
+`LITEP2P_VERSION` in `gradle.properties`, currently `0.4.0`). Publish and depend:
 
 ```bash
 cd /path/to/Litep2p
@@ -112,7 +112,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.zeengal:litep2p-core:0.3.0")
+    implementation("com.zeengal:litep2p-core:0.4.0")
 }
 ```
 
@@ -120,7 +120,7 @@ Notes:
 
 - A separate publication exists for the single-thread flavor:
   `./gradlew :litep2p-core:publishSingleThreadReleasePublicationToMavenLocal` →
-  coordinate `com.zeengal:litep2p-core-singleThread:0.3.0`.
+  coordinate `com.zeengal:litep2p-core-singleThread:0.4.0`.
 - **For Maven Central:** add `mavenCentral()` to the `publishing.repositories`
   block in `litep2p-core/build.gradle.kts`, add the `signing` plugin, and supply
   a GPG key + Sonatype credentials (`~/.gradle/gradle.properties`). The POM
@@ -202,6 +202,13 @@ LiteP2P.stop()         // async; completion via onEngineStopped
 LiteP2P.shutdown()     // release all native state; idempotent
 ```
 
+> **v0.4 one-liner alternative:** if you don't need fine-grained control, the
+> turnkey runtime does all of the above inside a foreground service —
+> `LiteP2PRuntime.start(context)` (config, permissions, wakelocks, and
+> network/battery/Doze hints included). See
+> [§13.3](#133-android-service-integration). The manual sequence above remains
+> the right choice when you host the engine in your own service or process.
+
 ### 2.3 Threading rule of thumb
 
 `LiteP2P` is safe to call from any thread. All listener callbacks arrive on
@@ -281,6 +288,7 @@ typedef enum litep2p_result {
     LITEP2P_ERR_TIMEOUT       =  -6,
     LITEP2P_ERR_UNSUPPORTED   =  -7,  /* feature compiled out / not wired yet */
     LITEP2P_ERR_NO_ROUTE      =  -8,  /* overlay: no relay path available */
+    LITEP2P_ERR_QUEUE_FULL    = -10,  /* send queue / reliable outbox at capacity */
     LITEP2P_ERR_INTERNAL      = -99,
 } litep2p_result_t;
 
@@ -294,11 +302,11 @@ const char* litep2p_result_string(litep2p_result_t result);
 
 ```c
 #define LITEP2P_VERSION_MAJOR 0
-#define LITEP2P_VERSION_MINOR 3
+#define LITEP2P_VERSION_MINOR 4
 #define LITEP2P_VERSION_PATCH 0
 
 uint32_t litep2p_version(void);           /* packed major<<16 | minor<<8 | patch */
-const char* litep2p_version_string(void); /* "0.3.0" */
+const char* litep2p_version_string(void); /* "0.4.0" */
 ```
 
 ABI stability rules: additive changes bump MINOR; breaking changes bump MAJOR.
@@ -440,6 +448,28 @@ typedef struct litep2p_callbacks {
      * want_ack overlay sends when the destination ACKs (delivered=1) or the
      * bounded retry budget is exhausted (delivered=0). */
     void (*on_overlay_delivery)(void* user_data, const char* frame_id, int delivered);
+
+    /* Reliable-send delivery receipts (v0.4). msg_id is the caller-supplied id
+     * passed to litep2p_send_reliable(). status: 0=QUEUED 1=SENT 2=DELIVERED
+     * 3=FAILED. reason is machine-readable (see §4.8). */
+    void (*on_delivery_status)(void* user_data, const char* msg_id,
+                               int status, const char* reason);
+
+    /* Presence updates (v0.4). Fires for peers subscribed via
+     * litep2p_subscribe_presence() on online/offline transitions. */
+    void (*on_presence)(void* user_data, const char* peer_id, int online,
+                        int64_t last_seen_ms);
+
+    /* Ping result (v0.4). rtt_ms >= 0 on success, -1 when unreachable. */
+    void (*on_ping_result)(void* user_data, const char* peer_id, int64_t rtt_ms);
+
+    /* Alias lookup result (v0.4). peer_id is "" when the alias is
+     * unregistered; resolves even when the target peer is offline. */
+    void (*on_lookup_result)(void* user_data, const char* alias, const char* peer_id,
+                             int online, int64_t last_seen_ms);
+
+    /* Invite received (v0.4): from_peer_id wants this device to connect. */
+    void (*on_invite_received)(void* user_data, const char* from_peer_id);
 } litep2p_callbacks_t;
 
 litep2p_result_t litep2p_set_callbacks(const litep2p_callbacks_t* callbacks);
@@ -452,6 +482,11 @@ Notes:
 - The `on_message_received` buffer is valid only for the duration of the call;
   copy it if you need it later.
 - The engine does not guarantee callback ordering across categories.
+- (v0.4) `on_delivery_status` is **terminal** once it reports `DELIVERED` or
+  `FAILED`; a message id never transitions again after a terminal state.
+- (v0.4) `on_presence` fires only for peers you subscribed to via
+  `litep2p_subscribe_presence`; `last_seen_ms` is 0 when the server has never
+  seen the peer online.
 
 ### 4.7 Peer operations
 
@@ -483,14 +518,75 @@ litep2p_result_t litep2p_peer_get_connection_path(const char* peer_id,
   (usually `"ip:port"`). It can be empty when unknown.
 - All peer functions return `LITEP2P_ERR_INVALID_STATE` before `litep2p_start`.
 
+**Reachability & presence (v0.4):**
+
+```c
+/* Cheap liveness probe without holding a full session open. Result arrives
+ * via on_ping_result: rtt_ms >= 0 on success, -1 after the timeout. */
+litep2p_result_t litep2p_ping(const char* peer_id, uint32_t timeout_ms);
+
+/* Subscribe to server-assisted presence for a set of peers. The engine asks
+ * the signaling server for current state and then receives transition
+ * updates via on_presence. Works without holding an open session. */
+litep2p_result_t litep2p_subscribe_presence(const char* const* peer_ids, uint32_t count);
+```
+
+**Identity directory & invites (v0.4):**
+
+```c
+/* Register a stable lookup alias for this peer on the signaling server
+ * (e.g. SHA-256 of a normalized phone number — opaque hashes only).
+ * Persisted server-side across server restarts. */
+litep2p_result_t litep2p_register_alias(const char* alias_hash);
+
+/* Resolve an alias hash to a peer id (+ presence). Result arrives via
+ * on_lookup_result; resolves even when the target peer is offline
+ * (peer_id is "" when the alias is unregistered). */
+litep2p_result_t litep2p_lookup_peer(const char* alias_hash);
+
+/* Nudge a remote/offline peer to connect via a signaling push. The target
+ * receives on_invite_received and typically responds with litep2p_connect(). */
+litep2p_result_t litep2p_invite_peer(const char* peer_id);
+```
+
+- These three call the signaling server; they require `signaling.enabled`
+  (default on) and return `INVALID_STATE` before `litep2p_start`.
+- Alias values are **opaque to the server** — hash any human identifier
+  (phone number, email) client-side before registering.
+- `litep2p_invite_peer` is fire-and-forget for the caller: the target peer
+  gets `on_invite_received` only while it is online; offline targets are
+  dropped server-side (use reliable-send's offline store for data).
+
 ### 4.8 Messaging
 
 ```c
-/* Fire-and-forget send. Returns LITEP2P_OK when the message was accepted into
- * the send path, not when (or whether) it was delivered. There is no
- * engine-level delivery notification by design; applications that need
- * delivery confirmation implement app-layer ACKs (see §6). */
+/* Fire-and-forget send. LITEP2P_OK means "accepted into the send path", not
+ * "delivered". Failure reasons (v0.4):
+ *   LITEP2P_ERR_INVALID_STATE  engine not initialized / not RUNNING
+ *   LITEP2P_ERR_NOT_FOUND      peer unknown (never discovered/added)
+ *   LITEP2P_ERR_QUEUE_FULL     engine send queue at capacity — back off and
+ *                              retry, or use litep2p_send_reliable() */
 litep2p_result_t litep2p_send(const char* peer_id, const uint8_t* data, uint32_t len);
+
+/* Reliable send (v0.4): at-least-once delivery with engine-level receipts.
+ * msg_id is caller-supplied and must be unique per message (the receiver
+ * dedupes on it). The engine:
+ *   1. persists the payload into a durable outbox under files_dir,
+ *   2. retries every retry_timeout_ms until the peer ACKs or max_retries
+ *      is exhausted,
+ *   3. when the offline queue is enabled and the peer has no session, stores
+ *      the message on the signaling server for delivery on the peer's next
+ *      connect (fire-once fallback; direct retries continue in parallel).
+ * Lifecycle via on_delivery_status: QUEUED -> SENT -> DELIVERED | FAILED.
+ * Returns LITEP2P_OK when accepted into the persistent outbox (survives
+ * engine restarts and process death). */
+litep2p_result_t litep2p_send_reliable(const char* peer_id, const char* msg_id,
+                                       const uint8_t* data, uint32_t len,
+                                       int max_retries, uint32_t retry_timeout_ms);
+
+/* Cancel a pending reliable send (no further retries / offline store).
+ * Fires on_delivery_status(FAILED, "CANCELLED") when the id was known. */
+litep2p_result_t litep2p_reliable_cancel(const char* msg_id);
 ```
 
 - Messages are opaque byte buffers (binary-safe). `len == 0` is rejected with
@@ -498,10 +594,20 @@ litep2p_result_t litep2p_send(const char* peer_id, const uint8_t* data, uint32_t
 - Within an established session the engine provides ordered, encrypted,
   binary-safe delivery. Reliability features (reconnect, path failover) are
   engine-internal.
-- There is no per-peer backpressure API; the send queue is bounded by
-  `peer_management.max_queued_messages` in `config.json` (default 100).
-- The engine recognizes the **LP_APP / LP_APP_ACK envelope protocol** for
-  application-level delivery confirmation — see [§6 Messaging model](#6-messaging-model).
+- Plain `litep2p_send` bounds: per-peer queue `peer_management.
+  max_queued_messages` (default 100) and engine-wide pending sends
+  `peer_management.max_pending_sends` (default 1000) — see §6.4.
+- Reliable sends are bounded by `offline_queue.max_messages` (default 500);
+  when the outbox is full `litep2p_send_reliable` returns `QUEUE_FULL` (and
+  fires `on_delivery_status(FAILED, "QUEUE_FULL")` for the msg_id).
+- `on_delivery_status` reasons are machine-readable strings:
+  `OK` | `PEER_OFFLINE` | `TIMEOUT` | `TTL_EXPIRED` | `CANCELLED` |
+  `QUEUE_FULL` | `NO_ROUTE`.
+- Receive-side dedup: `on_message_received` fires **at most once per msg_id**
+  within a 1-hour window, so retries never surface as duplicates.
+- The engine also recognizes the **LP_APP / LP_APP_ACK envelope protocol**
+  for application-level delivery confirmation — see
+  [§6 Messaging model](#6-messaging-model).
 
 ### 4.9 Security (Noise NK)
 
@@ -590,8 +696,11 @@ litep2p_result_t litep2p_set_proxy_role(const char* role);
 ### 4.12 Overlay / multi-hop routing (censorship-resistance layer)
 
 The overlay routes application messages through N sealed relay hops (onion-lite
-LPX2). Payloads are signed with the local Ed25519 key and verified by the
-destination. Static knobs live under the `overlay` object in `config.json`
+LPX2). Censorship resistance is **secure by default** (0.3.0): transport
+obfuscation (OBF1), length-bucketed padding, and Ed25519 origin authentication
+ship enabled — each can be relaxed via the `overlay` object in `config.json`
+(opt-out, never opt-in; see `docs/censorship-resistance.md`). The relay role
+stays opt-in. Static knobs live under the `overlay` object in `config.json`
 (`relay_enabled`, `default_hops`, `relay_peers`, `padding_bucket`,
 `obfuscate_transport`, `cover_interval_ms`, `pex_interval_ms`,
 `require_origin_auth`); runtime operations live here.
@@ -673,6 +782,13 @@ litep2p_result_t litep2p_set_reconnect_mode(const char* mode);
 /* Force an immediate snapshot; delivered via the on_telemetry callback AND
  * returned as a malloc'd JSON string the caller must free with litep2p_free. */
 litep2p_result_t litep2p_telemetry_snapshot(char** out_json);
+
+/* Backpressure gauges (v0.4): plain-send events currently queued in the
+ * engine event loop (heads toward peer_management.max_pending_sends), and
+ * reliable sends currently in the durable outbox (QUEUED or SENT, bounded by
+ * offline_queue.max_messages). Both return 0 when the engine is down. */
+uint32_t litep2p_pending_send_count(void);
+uint32_t litep2p_reliable_pending_count(void);
 
 /* Free memory returned by the engine (e.g. litep2p_telemetry_snapshot). */
 void litep2p_free(void* ptr);
@@ -781,7 +897,7 @@ Rules:
 ```kotlin
 object LiteP2P {
 
-    // Version string, e.g. "0.3.0". Single-sourced from gradle.properties
+    // Version string, e.g. "0.4.0". Single-sourced from gradle.properties
     // LITEP2P_VERSION via BuildConfig; matches litep2p_version_string().
     val version: String
 
@@ -810,6 +926,37 @@ object LiteP2P {
 
     // --- Messaging ---------------------------------------------------------
     fun send(peerId: String, data: ByteArray): EngineResult  // fire-and-forget
+
+    // --- Reliable messaging (v0.4) -------------------------------------------
+    // At-least-once send with engine receipts. Persists into a durable outbox
+    // under filesDir, retries until ACKed or maxRetries exhausted, and stores
+    // on the signaling server when the peer is offline (offline_queue).
+    // Lifecycle via onDeliveryStatus: QUEUED -> SENT -> DELIVERED | FAILED.
+    // OK = accepted into the persistent outbox; QUEUE_FULL = outbox at capacity.
+    fun sendReliable(peerId: String, msgId: String, data: ByteArray,
+                     maxRetries: Int = 3, retryTimeoutMs: Int = 10_000): EngineResult
+
+    // Cancel a pending reliable send; fires onDeliveryStatus(FAILED, "CANCELLED").
+    fun cancelReliable(msgId: String): EngineResult
+
+    // --- Presence & reachability (v0.4) --------------------------------------
+    // Cheap liveness probe; result via onPingResult (rttMs >= 0, or -1 on timeout).
+    fun ping(peerId: String, timeoutMs: Int = 5_000): EngineResult
+
+    // Server-assisted presence; transitions via onPresence. No open session needed.
+    fun subscribePresence(peerIds: List<String>): EngineResult
+
+    // --- Identity directory & invites (v0.4) ---------------------------------
+    // Register an opaque alias hash (e.g. SHA-256 of a phone number) for this
+    // peer on the signaling server; persisted server-side.
+    fun registerAlias(aliasHash: String): EngineResult
+
+    // Resolve an alias to a peer id (+ presence) via onLookupResult; resolves
+    // even when the target is offline (peerId = "" when unregistered).
+    fun lookupPeer(aliasHash: String): EngineResult
+
+    // Signaling push asking a peer to connect; target gets onInviteReceived.
+    fun invitePeer(peerId: String): EngineResult
 
     // --- Security (Noise NK) ------------------------------------------------
     fun localPublicKeyHex(): String                 // "" when unavailable
@@ -845,7 +992,19 @@ Method notes:
 - `stop` returns `OK` when already `STOPPED`/`STOPPING` (idempotent no-op).
 - `shutdown` stops the engine if needed, releases all native state, and resets
   the wrapper so a later `init` starts clean.
-- `send` rejects blank peer ids and empty payloads with `INVALID_ARG`.
+- `send` rejects blank peer ids and empty payloads with `INVALID_ARG`. While
+  the engine is not `RUNNING` it returns `INVALID_STATE`; for a peer the
+  engine has never heard of it returns `NOT_FOUND`; when the engine-wide
+  pending-send queue is at capacity it returns `QUEUE_FULL` (gauge with
+  `pendingSendCount()`, back off briefly and retry).
+- (v0.4) `sendReliable` validates `peerId`/`msgId`/`data` with `INVALID_ARG`
+  and returns `OK` as soon as the message is safely persisted in the outbox —
+  even if the destination is currently offline. `cancelReliable` returns `OK`
+  when the id was known (and a `FAILED/"CANCELLED"` status follows), `OK`
+  harmlessly when it was not.
+- (v0.4) `ping` / `subscribePresence` / `registerAlias` / `lookupPeer` /
+  `invitePeer` reject blank ids with `INVALID_ARG`; `subscribePresence`
+  filters blank entries and rejects an all-blank list.
 - `disconnect` requests a session teardown with the peer: transport connections
   are closed best-effort, the peer FSM is driven to DISCONNECTED, and automatic
   reconnection is suppressed until an explicit `connect` or an inbound
@@ -911,6 +1070,15 @@ object LiteP2P {
     // disabled or the engine is not initialized). Periodic snapshots also
     // arrive via LiteP2PListener.onTelemetry.
     fun telemetrySnapshot(): String
+
+    // --- Backpressure metrics (v0.4) -----------------------------------------
+    // Plain-send events queued in the engine event loop (not yet handed to the
+    // transport). send() starts returning QUEUE_FULL at max_pending_sends.
+    fun pendingSendCount(): Int
+
+    // Reliable sends currently in the durable outbox (QUEUED or SENT, i.e.
+    // not yet DELIVERED/FAILED), bounded by offline_queue.max_messages.
+    fun reliablePendingCount(): Int
 }
 ```
 
@@ -965,6 +1133,26 @@ interface LiteP2PListener {
     // LiteP2P.sendOverlay.
     fun onOverlayDelivery(frameId: String, delivered: Boolean) {}
 
+    // --- Reliable messaging, presence & identity (v0.4) ---------------------
+
+    // Delivery receipt for a sendReliable message. Terminal once DELIVERED or
+    // FAILED. reason is machine-readable: "OK" | "PEER_OFFLINE" | "TIMEOUT" |
+    // "TTL_EXPIRED" | "CANCELLED" | "QUEUE_FULL" | "NO_ROUTE".
+    fun onDeliveryStatus(messageId: String, status: DeliveryStatus, reason: String) {}
+
+    // Presence transition for a peer subscribed via subscribePresence.
+    fun onPresence(peerId: String, online: Boolean, lastSeenMs: Long) {}
+
+    // Ping result: rttMs >= 0 on success, -1 when unreachable within timeout.
+    fun onPingResult(peerId: String, rttMs: Long) {}
+
+    // Alias resolution result: peerId is "" when the alias is unregistered.
+    fun onLookupResult(alias: String, peerId: String, online: Boolean, lastSeenMs: Long) {}
+
+    // An invite arrived: fromPeerId wants this device to connect. Typical
+    // response is LiteP2P.connect(fromPeerId).
+    fun onInviteReceived(fromPeerId: String) {}
+
     // --- File transfer (offer/accept model) --------------------------------
     // An incoming file-transfer offer arrived. Nothing is written to disk
     // until the receiver calls LiteP2P.acceptFileTransfer(savePath) or
@@ -993,8 +1181,18 @@ enum class EngineState(val code: Int) {
 // Result codes (mirror litep2p_result_t values exactly).
 enum class EngineResult(val code: Int) {
     OK(0), INVALID_ARG(-1), INVALID_STATE(-2), BUSY(-3), NOT_FOUND(-4),
-    IO(-5), TIMEOUT(-6), UNSUPPORTED(-7), NO_ROUTE(-8), INTERNAL(-99);
+    IO(-5), TIMEOUT(-6), UNSUPPORTED(-7), NO_ROUTE(-8), QUEUE_FULL(-10),
+    INTERNAL(-99);
     companion object { fun fromCode(code: Int): EngineResult } // unknown -> INTERNAL
+}
+
+// Lifecycle of a reliable send (v0.4; mirrors on_delivery_status codes).
+enum class DeliveryStatus(val code: Int) {
+    QUEUED(0),    // accepted into the persistent outbox, not yet transmitted
+    SENT(1),      // transmitted at least once, awaiting the receiver's ACK
+    DELIVERED(2), // receiver ACKed (terminal success)
+    FAILED(3);    // retries exhausted / cancelled / TTL expired / queue full
+    companion object { fun fromCode(code: Int): DeliveryStatus } // unknown -> FAILED
 }
 
 // Transport selection.
@@ -1034,7 +1232,8 @@ data class PeerInfo(
     val connected: Boolean,         // true when the session is fully established
     val networkId: String,          // LAN identity used for rendezvous
     val fsmState: String,           // best-effort peer FSM state
-    val connectionType: String      // raw path string ("LAN"/"TURN"/"SIGNALING"/...)
+    val connectionType: String,     // raw path string ("LAN"/"TURN"/"SIGNALING"/...)
+    val lastSeenMs: Long = 0        // v0.4: epoch ms last observed online (0 = never)
 ) {
     // Typed connection path derived from connectionType.
     val connectionPath: ConnectionPath
@@ -1042,7 +1241,8 @@ data class PeerInfo(
 ```
 
 > ⚠️ **JNI stability note:** `PeerInfo`'s primary constructor signature is part
-> of the JNI contract (`(String,String,Int,Int,Boolean,String,String,String)`).
+> of the JNI contract
+> (`(String,String,Int,Int,Boolean,String,String,String,Long)`).
 > Do not reorder or change its parameters in your own forks.
 
 ### 5.6 File transfer (Kotlin)
@@ -1132,6 +1332,28 @@ LiteP2P.transfersFlow.collect { event ->
     }
 }
 
+
+// v0.4: reliable-send receipts, presence, pings, lookups, invites.
+LiteP2P.deliveryStatusFlow.collect { s ->      // LiteP2PDeliveryStatus
+    when (s.status) {                          //   .messageId/.status/.reason
+        DeliveryStatus.DELIVERED -> showTick(s.messageId)
+        DeliveryStatus.FAILED    -> showError(s.messageId, s.reason)
+        else                     -> /* QUEUED/SENT: pending/clock icon */
+    }
+}
+LiteP2P.presenceFlow.collect { p ->            // LiteP2PPresence
+    roster[p.peerId] = if (p.online) Online else Offline(p.lastSeenMs)
+}
+LiteP2P.pingResultFlow.collect { r ->          // LiteP2PPingResult
+    latencyLabel[r.peerId] = if (r.rttMs >= 0) "${r.rttMs} ms" else "unreachable"
+}
+LiteP2P.lookupResultFlow.collect { l ->        // LiteP2PLookupResult
+    if (l.peerId.isNotEmpty()) addContact(l.alias, l.peerId)
+}
+LiteP2P.inviteFlow.collect { i ->              // LiteP2PInvite
+    LiteP2P.connect(i.fromPeerId)              // typical response to an invite
+}
+
 // Suspend lifecycle helpers (run the blocking native calls on Dispatchers.IO
 // and suspend until the requested state is reached, or TIMEOUT).
 val startResult: EngineResult = LiteP2P.startAndAwait()   // suspends until RUNNING
@@ -1158,7 +1380,9 @@ Notes:
 
 `LiteP2P.send(peerId, data)` / `litep2p_send(...)` are **fire-and-forget**:
 `EngineResult.OK` / `LITEP2P_OK` means the message was **accepted into the send
-path**, not that it was delivered. There is no engine-level delivery callback.
+path**, not that it was delivered. There is no engine-level delivery callback
+on this path — for engine receipts use reliable send
+([§6.3](#63-reliable-messaging-v04-engine-receipts)).
 
 What the engine *does* guarantee within an established session:
 
@@ -1176,8 +1400,10 @@ What it does *not* guarantee:
 ### 6.2 App-layer ACK envelope protocol (`LP_APP` / `LP_APP_ACK`)
 
 To measure/confirm delivery without engine-level support, LiteP2P recognizes a
-simple JSON envelope protocol on the wire. **This is the recommended pattern
-for chat delivery status.**
+simple JSON envelope protocol on the wire. Since v0.4 this is **superseded for
+chat delivery status by `sendReliable`** ([§6.3](#63-reliable-messaging-v04-engine-receipts));
+the envelope remains useful for latency measurement and interop with peers
+that do not run LiteP2P.
 
 **Sending** — wrap your payload in an `LP_APP` envelope:
 
@@ -1209,13 +1435,71 @@ for chat delivery status.**
 > JSON envelopes. If a peer sends plain bytes without the envelope, they are
 > forwarded verbatim to `onMessageReceived` and no ACK is generated.
 
-### 6.3 Sizing and backpressure
+### 6.3 Reliable messaging (v0.4: engine receipts)
+
+`sendReliable` / `litep2p_send_reliable` give chat messages **at-least-once
+delivery with engine-level receipts**, replacing the hand-rolled
+pending-ACK/retry/dedup stacks apps used to need:
+
+```kotlin
+val msgId = UUID.randomUUID().toString()          // your unique message id
+when (LiteP2P.sendReliable(peerId, msgId, text.toByteArray(Charsets.UTF_8))) {
+    EngineResult.OK         -> renderAsQueued(msgId)   // persisted in the outbox
+    EngineResult.QUEUE_FULL -> backOffAndRetry(msgId)  // outbox at capacity
+    else                    -> renderAsFailed(msgId)
+}
+```
+
+**What the engine does for you:**
+
+1. **Persists** the payload into a durable outbox under `filesDir` (survives
+   `stop()`/`start()` and process death — `OK` already means "safely stored").
+2. **Retries** every `retryTimeoutMs` (default 10 s) until the receiver ACKs
+   or `maxRetries` (default 3) is exhausted — both per-call overridable.
+3. **Falls back to the offline mailbox:** when the peer has no session and
+   `offline_queue.enabled`, the message is stored on the signaling server
+   (fire-once) and delivered on the peer's next connect, while direct retries
+   continue in parallel.
+4. **Deduplicates on the receiver:** `onMessageReceived` fires **at most once
+   per `msg_id`** (1-hour window), so retries never duplicate in the UI.
+5. **Reports every transition** via `onDeliveryStatus` /
+   `deliveryStatusFlow`:
+
+| Transition | Meaning |
+|---|---|
+| `QUEUED` ("OK") | Accepted into the persistent outbox |
+| `SENT` ("OK" / "PEER_OFFLINE") | Direct attempt made, or handed to the signaling mailbox |
+| `DELIVERED` ("OK") | Receiver ACKed — terminal success |
+| `FAILED` | Terminal failure; reason: `TIMEOUT` (retries exhausted), `TTL_EXPIRED` (outbox TTL), `CANCELLED`, `QUEUE_FULL`, `NO_ROUTE` |
+
+Cancel an unsent message with `cancelReliable(msgId)` (→ `FAILED/"CANCELLED"`).
+Prefer `sendReliable` for anything a user would miss — chat text, offers,
+reactions. Keep plain `send` for lossy high-rate streams (cursor position,
+typing state, voice frames).
+
+> The legacy **LP_APP envelope** (§6.2) still works and remains useful for
+> latency measurement and interop with non-LiteP2P peers, but new code should
+> not hand-roll ACK tracking on top of it — that is what `sendReliable` is for.
+
+### 6.4 Sizing and backpressure
 
 - Plain `send` payloads are bounded by `peer_management.max_message_size`
   (default 10 MB in `config.json`).
 - The per-peer send queue is bounded by `peer_management.max_queued_messages`
   (default 100). When full, the engine drops or applies backpressure — keep
   chat messages small and rate-limit heavy bursts.
+- **Engine send queue (v0.4):** the engine also caps the number of send events
+  queued in its event loop at `peer_management.max_pending_sends` (default
+  1000). When the cap is hit, `send` / `litep2p_send` fail fast with
+  `QUEUE_FULL` instead of growing without bound — back off briefly and retry,
+  or switch to reliable sends, which persist into the durable outbox rather
+  than the in-memory queue. Gauge current pressure with
+  `LiteP2P.pendingSendCount()` / `litep2p_pending_send_count()`.
+- **Reliable outbox (v0.4):** reliable sends (`sendReliable` /
+  `litep2p_send_reliable`) are bounded by `offline_queue.max_messages`
+  (default 500, TTL `ttl_ms` = 7 days). When full, they return `QUEUE_FULL`
+  until the outbox drains (delivery confirms) or messages expire. Gauge with
+  `LiteP2P.reliablePendingCount()` / `litep2p_reliable_pending_count()`.
 - Overlay sends have their own smaller cap (640 bytes; see §7).
 
 ---
@@ -1227,12 +1511,13 @@ The overlay (LPX2) routes application messages through **N sealed relay hops**
 link a message to its origin, and messages can be delivered offline via
 mailboxes.
 
-- **Hops:** configurable via `overlay.default_hops` (0–3) in `config.json`.
+- **Hops:** configurable via `overlay.default_hops` (0–3, default 2) in
+  `config.json`.
 - **Sealing:** each hop can only unwrap one layer. Every payload is signed
   with the origin's Ed25519 key. On receipt, if a signing key is registered for
   the claimed origin, the signature must match or the frame is dropped; with
-  `overlay.require_origin_auth` set, unsigned frames are dropped even when no
-  key is registered.
+  `overlay.require_origin_auth` (default **true**), unsigned frames are
+  dropped even when no key is registered.
 - **Relay opt-in:** forwarding frames / holding mailboxes is **off by default**.
   A peer becomes a relay by calling `LiteP2P.setOverlayRelayEnabled(true)` or
   setting `overlay.relay_enabled` in `config.json`.
@@ -1248,18 +1533,27 @@ mailboxes.
 - **Payload limit:** max **640 bytes** per overlay message — suitable for short
   chat texts and presence, not for large media (use `LiteP2P.send` for those).
 
-Security model:
+Security model (secure by default since 0.3.0 — every knob is an opt-out):
 
-- Every participant has an Ed25519 signing keypair (used to sign overlay
-  payloads) plus the Noise NK static keypair (used for the encrypted transport
-  between hops).
-- Origin authentication is **opt-in**: set `overlay.require_origin_auth=true`
-  and register destination signing keys with
-  `LiteP2P.registerPeerSigningKey(peerId, publicKeyHex)` to drop unsigned
-  payloads.
-- Traffic-analysis resistance is **opt-in**: `overlay.padding_bucket`,
-  `overlay.obfuscate_transport`, and `overlay.cover_interval_ms` add padding,
-  per-link obfuscation, and cover traffic.
+- Every participant has an Ed25519 signing keypair (auto-generated at first
+  start, used to sign overlay payloads) plus the Noise NK static keypair
+  (used for the encrypted transport between hops).
+- Origin authentication is **on by default**
+  (`overlay.require_origin_auth=true`): unsigned payloads (pre-Phase-B
+  senders) are dropped. Set the knob to `false` only for legacy interop.
+  Register peer signing keys with
+  `LiteP2P.registerPeerSigningKey(peerId, publicKeyHex)` to additionally bind
+  claimed origins to a specific key (upgrades integrity to identity).
+- Traffic-analysis resistance is **on by default**:
+  `overlay.obfuscate_transport=true` wraps every frame in an OBF1 envelope so
+  the `LPX2` magic never appears on the wire (the receive path auto-detects
+  envelopes by magic, so plain LPX2 frames from relaxed peers still
+  interoperate); `overlay.padding_bucket=128` length-buckets frames
+  (worst-case 1216 B stays under the IPv6 minimum MTU of 1280 B);
+  `overlay.cover_interval_ms=30000` emits cover traffic — but only from
+  relay-role nodes, so default non-relay clients pay no cover-traffic cost.
+  Set `obfuscate_transport=false` / `padding_bucket=0` / `cover_interval_ms=0`
+  to opt out (not recommended). See `docs/censorship-resistance.md`.
 
 ---
 
@@ -1355,6 +1649,7 @@ chat application is most likely to care about:
 | `communication.*.port` | `30001` | Per-transport listen ports |
 | `peer_management.max_message_size` | `10485760` (10 MB) | Largest accepted message |
 | `peer_management.max_queued_messages` | `100` | Per-peer send queue bound |
+| `peer_management.max_pending_sends` | `1000` | Engine-wide queued send-event bound; beyond it `send` returns `QUEUE_FULL` |
 | `peer_management.peer_timeout_sec` | `30` | Peer liveness timeout |
 | `security.noise_nk_protocol.enabled` | `true` | Noise NK sessions on/off |
 | `security.noise_nk_protocol.key_store_path` | `"keystore"` | Where Noise keys are persisted (relative to `filesDir`) |
@@ -1367,14 +1662,17 @@ chat application is most likely to care about:
 | `nat_traversal.hole_punching_enabled` | `true` | UDP hole punching |
 | `signaling.enabled` | `true` | Central signaling rendezvous |
 | `signaling.url` | `"ws://<host>:8765"` | Signaling server WebSocket URL |
+| `offline_queue.enabled` | `true` | v0.4 store-and-forward: reliable sends to offline peers are held by the signaling server |
+| `offline_queue.max_messages` | `500` | Durable-outbox/mailbox capacity; `sendReliable` returns `QUEUE_FULL` beyond it |
+| `offline_queue.ttl_ms` | `604800000` (7 days) | Message TTL; expiry fires `onDeliveryStatus(FAILED, "TTL_EXPIRED")` |
 | `overlay.relay_enabled` | `false` | Become an overlay relay (opt-in) |
-| `overlay.default_hops` | `0` | Overlay hop count (0–3) |
+| `overlay.default_hops` | `2` | Overlay hop count (0–3) |
 | `overlay.relay_peers` | `[]` | Persistent bootstrap relay peer ids |
-| `overlay.padding_bucket` | `0` | Padding bucket bytes for traffic-analysis resistance (0=off, max 4096) |
-| `overlay.obfuscate_transport` | `false` | Per-link payload obfuscation |
-| `overlay.cover_interval_ms` | `0` | Cover-traffic interval (0=off) |
-| `overlay.pex_interval_ms` | `0` | Peer-exchange advertisement interval |
-| `overlay.require_origin_auth` | `false` | Enforce Ed25519 origin signatures |
+| `overlay.padding_bucket` | `128` | Padding bucket bytes for traffic-analysis resistance (0=off, max 4096) |
+| `overlay.obfuscate_transport` | `true` | Per-link OBF1 obfuscation; receive auto-detects, plain LPX2 still accepted |
+| `overlay.cover_interval_ms` | `30000` | Cover-traffic interval, relay-role nodes only (0=off) |
+| `overlay.pex_interval_ms` | `60000` | Relay-list exchange (PEX) interval (0=off) |
+| `overlay.require_origin_auth` | `true` | Enforce Ed25519 origin signatures (drop unsigned payloads) |
 | `monitoring.telemetry.enabled` | `true` | Telemetry collection |
 | `monitoring.telemetry.flush_interval_ms` | `2000` | Telemetry flush cadence |
 | `monitoring.telemetry.include_peer_ids` | `true` | Include peer ids in telemetry (false = redact) |
@@ -1411,6 +1709,14 @@ pinning the first peer ever seen. This powers fast reconnection after restarts.
   used for rendezvous between peers on the same local network.
 - Out-of-band peer invites can be bootstrapped with `LiteP2P.addPeer(peerId,
   networkId)` (e.g. from a scanned QR code containing the peer's id + endpoint).
+- **v0.4 — alias directory:** a peer can register an **opaque alias hash**
+  (e.g. SHA-256 of a normalized phone number) on the signaling server with
+  `registerAlias`, and any other peer resolves it with `lookupPeer` →
+  `onLookupResult(alias, peerId, online, lastSeenMs)` — even while the target
+  is offline. Combine with `invitePeer(peerId)` (signaling push; the target
+  receives `onInviteReceived` and typically calls `connect`) to bootstrap
+  remote peers with no out-of-band channel. The server only ever sees the
+  hash, never the raw identifier, and persists the registry across restarts.
 
 ## 11. Threading and lifecycle contract
 
@@ -1488,32 +1794,48 @@ This section is a concrete blueprint for building the application layer of a
 chat app on top of LiteP2P. The harness (`:app`) is a working reference for
 every pattern below.
 
-### 13.1 Recommended message flow
+### 13.1 Recommended message flow (v0.4)
 
 1. **Identity:** give every user a stable `peerId` (persisted across launches)
-   and register it in `LiteP2PConfig.Builder().peerId(id)`.
+   and register it in `LiteP2PConfig.Builder().peerId(id)`. Then register a
+   discoverable alias on the signaling server:
+   `LiteP2P.registerAlias(sha256(normalizedPhoneNumber))` — the server sees
+   only the hash.
 2. **Bootstrap peers:** LAN discovery finds nearby peers automatically. For
-   remote peers, exchange `peerId` (+ optional `networkId`) out-of-band (QR,
-   deep link, or a directory server) and call `LiteP2P.addPeer(peerId,
-   networkId)`. For NAT traversal across the internet, the engine uses
-   STUN/TURN/signaling automatically (`config.json`).
-3. **Send chat text:** wrap messages in the LP_APP envelope
-   ([§6.2](#62-app-layer-ack-envelope-protocol-lp_app--lp_app_ack)) with a
-   unique `msg_id` and `requires_ack: true` to get delivery status. UTF-8
-   encode the `body`.
-4. **Receive chat text:** handle `onMessageReceived` — the engine already
-   stripped the envelope, so `String(data, Charsets.UTF_8)` is your chat line.
-   Match `peerId` to a conversation.
-5. **Delivery status:** handle `onMessageAcked(messageId, sentTsMs, recvTsMs)`
-   to show "delivered" and compute latency. Messages that never ACK can be
-   re-sent or flagged by your app.
-6. **Presence/peers:** render `onPeersChanged` as the roster; use `PeerInfo.
-   connected` for online/offline and `connectionPath` to show
-   LAN/relay/indirect.
+   remote peers, resolve their alias with `LiteP2P.lookupPeer(aliasHash)` and
+   handle `onLookupResult` (works while they're offline), then nudge them with
+   `LiteP2P.invitePeer(peerId)` — the target receives `onInviteReceived` and
+   typically responds with `connect`. QR/deep-link exchange +
+   `addPeer(peerId, networkId)` remains available as a manual path. NAT
+   traversal across the internet is automatic (STUN/TURN/signaling).
+3. **Send chat text:** `LiteP2P.sendReliable(peerId, msgId,
+   text.toByteArray(Charsets.UTF_8))` with a UUID `msgId` — the engine
+   persists it, retries until ACKed, and stores it in the offline mailbox when
+   the peer is away. (Legacy interop/latency path: the LP_APP envelope,
+   [§6.2](#62-app-layer-ack-envelope-protocol-lp_app--lp_app_ack).)
+4. **Receive chat text:** handle `onMessageReceived` — for reliable sends the
+   engine already ACKed and deduped (at most one callback per `msg_id`), so
+   `String(data, Charsets.UTF_8)` is your chat line. Match `peerId` to a
+   conversation.
+5. **Delivery status:** render ticks from `onDeliveryStatus(msgId, status,
+   reason)` — `QUEUED`/`SENT` → single tick, `DELIVERED` → double tick,
+   `FAILED` → error (show a friendly string for `reason`; `TTL_EXPIRED` and
+   `TIMEOUT` are the common ones). No app-side pending-ACK map needed.
+6. **Presence/roster:** subscribe once with `LiteP2P.subscribePresence(ids)`
+   and render `onPresence(peerId, online, lastSeenMs)`; use `ping` for
+   on-demand RTT probes. `onPeersChanged` remains the source for *established
+   sessions* (`PeerInfo.connected`, `connectionPath` for LAN/relay/indirect).
+7. **Background:** run under `LiteP2PRuntime.start(context)` so the engine
+   survives Doze/screen-off ([§13.3](#133-android-service-integration)).
+8. **Pressure valves:** on `EngineResult.QUEUE_FULL` from `send`, back off and
+   retry or switch to `sendReliable`; watch `pendingSendCount()` /
+   `reliablePendingCount()` if you push high rates (§6.4).
 
-### 13.2 Censorship-resistant mode (optional)
+### 13.2 Censorship-resistant mode
 
-For blocked-network deployments:
+Censorship resistance is **on by default** (0.3.0): overlay frames are
+obfuscated (OBF1), length-padded, and origin-signed out of the box. For
+blocked-network deployments you only need relay capacity:
 
 - Set `overlay.relay_enabled: true` on some peers (or call
   `LiteP2P.setOverlayRelayEnabled(true)`) and list them in
@@ -1521,16 +1843,55 @@ For blocked-network deployments:
 - Send short messages via `LiteP2P.sendOverlay(peerId, data, wantAck = true)`.
 - For offline peers, use `viaMailbox = true` + periodic
   `LiteP2P.pickupMailbox(relayPeerId)`.
-- Enable `overlay.require_origin_auth` and register signing keys with
-  `LiteP2P.registerPeerSigningKey` for stronger authenticity.
+- Register peer signing keys with `LiteP2P.registerPeerSigningKey` to bind
+  claimed origins to specific keys (signature enforcement is already on by
+  default; registration upgrades integrity to identity).
 - Keep overlay payloads under 640 bytes.
+- To interoperate with pre-Phase-B peers, relax the defaults
+  (`overlay.require_origin_auth: false` and/or
+  `overlay.obfuscate_transport: false`) — not recommended for new deployments.
+  See `docs/censorship-resistance.md`.
 
 ### 13.3 Android service integration
 
-The harness runs the engine in a **foreground service**
-(`app/.../LiteP2PService.kt`) with partial wakelock + Wi-Fi multicast lock so
-Doze does not suspend packet delivery. Copy that pattern: engine lifecycle in a
-service, UI subscribed to LiveData/Flow bridges, `START_STICKY` return value.
+Since v0.4 the SDK ships this as a **turnkey runtime component** — no pattern
+copying required:
+
+```kotlin
+// One call: foreground service + wakelocks + env hints + defaults.
+LiteP2PRuntime.start(context)                    // zero-config defaults
+// or with an explicit config:
+LiteP2PRuntime.start(context, myLiteP2PConfig)
+
+LiteP2PRuntime.stop(context)
+```
+
+`LiteP2PRuntime` (in `com.zeengal.litep2p.core`) starts the SDK-owned
+`LiteP2PService` — a `START_STICKY` foreground service (`dataSync` type) that:
+
+- performs native `init`/`start`/`shutdown` on a dedicated engine thread,
+- holds the partial wakelock + Wi-Fi/multicast locks so Doze doesn't suspend
+  packet delivery,
+- pushes network/battery/Doze hints into the engine automatically (§13.4),
+- restores the engine after a process kill (config is persisted; the sticky
+  restart re-inits with it),
+- creates first-run defaults: a stable per-device peer id and a bundled
+  default `config.json` extracted from the AAR assets (an integrator-supplied
+  `filesDir/config.json` or explicit `configPath` always wins),
+- contributes its permissions and service declaration via manifest merging —
+  the app doesn't need any manifest edits (but should request the
+  `POST_NOTIFICATIONS` runtime permission on API 33+ to make the engine
+  notification visible).
+
+The notification is customizable before `start()`:
+`notificationSmallIconResId`, `notificationTitle`, `notificationText`,
+`launchActivity`, and `notificationCustomizer` (a hook over the
+`NotificationCompat.Builder`). Subclassing `LiteP2PService` and overriding
+`onBuildNotification` replaces it entirely.
+
+Apps that need full control can still own the service themselves (the harness
+in `app/.../LiteP2PService.kt` is a working reference); `LiteP2PRuntime` is
+convenience, not a requirement.
 
 ### 13.4 Android connectivity/battery hints
 
@@ -1545,6 +1906,12 @@ LiteP2P.setBatteryLevel(percent, isCharging)
 LiteP2P.setReconnectMode(ReconnectMode.AGGRESSIVE)
 ```
 
+> **v0.4:** when the engine runs under [§13.3](#133-android-service-integration)'s
+> `LiteP2PRuntime`, these hints are wired automatically — network changes,
+> battery level/charging, and Doze/power-save (which switches the engine to
+> `POWER_SAVER` reconnect mode while constrained). Push them manually only in
+> self-managed service setups.
+
 ---
 
 ## 14. Worked examples
@@ -1556,7 +1923,8 @@ class ChatEngine(private val context: Context) {
 
     private val main = Handler(Looper.getMainLooper())
     private val chatLines = MutableLiveData<List<Pair<String, String>>>() // (peerId, text)
-    private val pendingAcks = mutableMapOf<String, Long>()
+    // v0.4: no pendingAcks map, no retry timers, no envelope hand-rolling —
+    // the engine's reliable-send path owns all of it.
 
     private val listener = object : LiteP2PListener {
         override fun onEngineStarted() = log("engine started, my peer id = ${LiteP2P.peerId}")
@@ -1565,12 +1933,25 @@ class ChatEngine(private val context: Context) {
             roster.postValue(peers)
         }
         override fun onMessageReceived(peerId: String, data: ByteArray) {
+            // Engine already deduped (at most once per msg_id) for reliable
+            // sends — just render the chat line.
             val text = String(data, Charsets.UTF_8)
             main.post { chatLines.value = (chatLines.value ?: emptyList()) + (peerId to text) }
         }
-        override fun onMessageAcked(messageId: String, sentTsMs: Long, recvTsMs: Long) {
-            val latencyMs = if (recvTsMs > 0 && sentTsMs > 0) recvTsMs - sentTsMs else -1
-            main.post { deliverStatus.postValue("$messageId delivered in ${latencyMs}ms") }
+        override fun onDeliveryStatus(messageId: String, status: DeliveryStatus, reason: String) {
+            main.post {
+                when (status) {
+                    DeliveryStatus.QUEUED, DeliveryStatus.SENT ->
+                        deliverStatus.postValue("$messageId ⏳")
+                    DeliveryStatus.DELIVERED ->
+                        deliverStatus.postValue("$messageId ✓✓")
+                    DeliveryStatus.FAILED ->
+                        deliverStatus.postValue("$messageId ✗ ($reason)")
+                }
+            }
+        }
+        override fun onPresence(peerId: String, online: Boolean, lastSeenMs: Long) {
+            main.post { rosterMarks[peerId] = if (online) "online" else "seen ${formatAgo(lastSeenMs)}" }
         }
     }
 
@@ -1583,19 +1964,17 @@ class ChatEngine(private val context: Context) {
             .build()
         check(LiteP2P.init(cfg) == EngineResult.OK)
         check(LiteP2P.start() == EngineResult.OK)
+        LiteP2P.registerAlias(UserPrefs.myAliasHash())        // discoverable by phone-hash
+        LiteP2P.subscribePresence(UserPrefs.contactPeerIds()) // roster online/last-seen
     }
 
     fun send(peerId: String, text: String) {
         val msgId = UUID.randomUUID().toString()
-        val envelope = JSONObject().apply {
-            put("type", "LP_APP")
-            put("msg_id", msgId)
-            put("requires_ack", true)
-            put("sent_ts_ms", System.currentTimeMillis())
-            put("body", text)
-        }.toString()
-        LiteP2P.send(peerId, envelope.toByteArray(Charsets.UTF_8))
-        pendingAcks[msgId] = System.currentTimeMillis()   // for UI + re-send
+        when (LiteP2P.sendReliable(peerId, msgId, text.toByteArray(Charsets.UTF_8))) {
+            EngineResult.OK         -> renderAsQueued(msgId)   // persisted; engine retries
+            EngineResult.QUEUE_FULL -> renderAsPending(msgId)  // back off and re-try
+            else                    -> renderAsFailed(msgId)
+        }
     }
 
     fun stop() {
@@ -1604,6 +1983,10 @@ class ChatEngine(private val context: Context) {
     }
 }
 ```
+
+> Run this whole class in the background by replacing `start()`'s manual
+> `init`/`start` with `LiteP2PRuntime.start(context)` ([§13.3](#133-android-service-integration)) —
+> then the engine also survives Doze and process death.
 
 ### 14.2 C ABI — desktop-style usage
 
@@ -1656,6 +2039,7 @@ int main(void) {
 | `TIMEOUT` / `LITEP2P_ERR_TIMEOUT` | -6 | Operation timed out |
 | `UNSUPPORTED` / `LITEP2P_ERR_UNSUPPORTED` | -7 | Feature compiled out or not wired yet |
 | `NO_ROUTE` / `LITEP2P_ERR_NO_ROUTE` | -8 | Overlay: no relay path available |
+| `QUEUE_FULL` / `LITEP2P_ERR_QUEUE_FULL` | -10 | Engine send queue (`max_pending_sends`) or reliable outbox (`offline_queue.max_messages`) at capacity — back off and retry, or drain (see §6.4) |
 | `INTERNAL` / `LITEP2P_ERR_INTERNAL` | -99 | Internal engine error |
 
 > `EngineResult.fromCode` maps any unrecognized native code to `INTERNAL`.

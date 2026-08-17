@@ -31,6 +31,7 @@
 #include <atomic>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -81,6 +82,12 @@ static jmethodID g_onOverlayDeliveryMethod = nullptr;
 static jmethodID g_onFileTransferOfferedMethod = nullptr;
 static jmethodID g_onTransferProgressMethod = nullptr;
 static jmethodID g_onTransferCompletedMethod = nullptr;
+// v0.4 callbacks (reliable send / presence / ping / lookup / invite).
+static jmethodID g_onDeliveryStatusMethod = nullptr;
+static jmethodID g_onPresenceMethod = nullptr;
+static jmethodID g_onPingResultMethod = nullptr;
+static jmethodID g_onLookupResultMethod = nullptr;
+static jmethodID g_onInviteReceivedMethod = nullptr;
 static jclass g_peerInfoClass = nullptr;
 static jmethodID g_peerInfoCtor = nullptr;
 
@@ -177,7 +184,8 @@ void cabi_on_peers_changed(void* /*user_data*/, const litep2p_peer_info_t* peers
             (jboolean)(p.connected != 0),
             jnetworkId,
             jFsmState,
-            jConnectionType);
+            jConnectionType,
+            (jlong)p.last_seen_ms);
 
         env->DeleteLocalRef(jid);
         env->DeleteLocalRef(jip);
@@ -266,6 +274,109 @@ void cabi_on_overlay_delivery(void* /*user_data*/, const char* frame_id, int del
         env->ExceptionClear();
     }
     env->DeleteLocalRef(jFrameId);
+}
+
+// ---------------------------------------------------------------------------
+// v0.4 C ABI callbacks -> NativeEvents (reliable send / presence / ping /
+// lookup / invite). Each runs on an engine thread; getJNIEnv() attaches it.
+// ---------------------------------------------------------------------------
+void cabi_on_delivery_status(void* /*user_data*/, const char* msg_id, int status,
+                             const char* reason) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onDeliveryStatusMethod) return;
+    jstring jMsgId = env->NewStringUTF(msg_id ? msg_id : "");
+    jstring jReason = env->NewStringUTF(reason ? reason : "");
+    if (!jMsgId || !jReason) {
+        clear_any_exception(env);
+        if (jMsgId) env->DeleteLocalRef(jMsgId);
+        if (jReason) env->DeleteLocalRef(jReason);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onDeliveryStatusMethod, jMsgId,
+                              (jint)status, jReason);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onDeliveryStatus");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jMsgId);
+    env->DeleteLocalRef(jReason);
+}
+
+void cabi_on_presence(void* /*user_data*/, const char* peer_id, int online,
+                      int64_t last_seen_ms) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onPresenceMethod) return;
+    jstring jPeerId = env->NewStringUTF(peer_id ? peer_id : "");
+    if (!jPeerId) {
+        clear_any_exception(env);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onPresenceMethod, jPeerId,
+                              online != 0 ? JNI_TRUE : JNI_FALSE, (jlong)last_seen_ms);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onPresence");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jPeerId);
+}
+
+void cabi_on_ping_result(void* /*user_data*/, const char* peer_id, int64_t rtt_ms) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onPingResultMethod) return;
+    jstring jPeerId = env->NewStringUTF(peer_id ? peer_id : "");
+    if (!jPeerId) {
+        clear_any_exception(env);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onPingResultMethod, jPeerId, (jlong)rtt_ms);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onPingResult");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jPeerId);
+}
+
+void cabi_on_lookup_result(void* /*user_data*/, const char* alias, const char* peer_id,
+                           int online, int64_t last_seen_ms) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onLookupResultMethod) return;
+    jstring jAlias = env->NewStringUTF(alias ? alias : "");
+    jstring jPeerId = env->NewStringUTF(peer_id ? peer_id : "");
+    if (!jAlias || !jPeerId) {
+        clear_any_exception(env);
+        if (jAlias) env->DeleteLocalRef(jAlias);
+        if (jPeerId) env->DeleteLocalRef(jPeerId);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onLookupResultMethod, jAlias, jPeerId,
+                              online != 0 ? JNI_TRUE : JNI_FALSE, (jlong)last_seen_ms);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onLookupResult");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jAlias);
+    env->DeleteLocalRef(jPeerId);
+}
+
+void cabi_on_invite_received(void* /*user_data*/, const char* from_peer_id) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onInviteReceivedMethod) return;
+    jstring jFrom = env->NewStringUTF(from_peer_id ? from_peer_id : "");
+    if (!jFrom) {
+        clear_any_exception(env);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onInviteReceivedMethod, jFrom);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onInviteReceived");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jFrom);
 }
 
 void cabi_on_file_transfer_offered(void* /*user_data*/, const litep2p_file_offer_t* offer) {
@@ -361,6 +472,12 @@ void register_cabi_callbacks() {
     cb.on_log = cabi_on_log;
     cb.on_telemetry = cabi_on_telemetry;
     cb.on_overlay_delivery = cabi_on_overlay_delivery;
+    // v0.4 callbacks (reliable send / presence / ping / lookup / invite).
+    cb.on_delivery_status = cabi_on_delivery_status;
+    cb.on_presence = cabi_on_presence;
+    cb.on_ping_result = cabi_on_ping_result;
+    cb.on_lookup_result = cabi_on_lookup_result;
+    cb.on_invite_received = cabi_on_invite_received;
 
     const litep2p_result_t rc = litep2p_set_callbacks(&cb);
     if (rc != LITEP2P_OK) {
@@ -638,6 +755,22 @@ Java_com_zeengal_litep2p_core_LiteP2PNative_telemetrySnapshot(JNIEnv* env, jobje
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// JNI entry points — backpressure metrics (v0.4).
+// ---------------------------------------------------------------------------
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_pendingSendCount(JNIEnv* env, jobject /*thiz*/) {
+    (void)env;
+    return (jint)litep2p_pending_send_count();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_reliablePendingCount(JNIEnv* env, jobject /*thiz*/) {
+    (void)env;
+    return (jint)litep2p_reliable_pending_count();
+}
+
 
 // ---------------------------------------------------------------------------
 // JNI reference caching.
@@ -731,6 +864,41 @@ bool jniBridgeInit(JNIEnv* env) {
         clear_any_exception(env);
     }
 
+    // v0.4 callbacks are optional conveniences; missing methods only disable
+    // those features, never the engine.
+    jmethodID newOnDeliveryStatusMethod =
+        env->GetStaticMethodID(newEventsClass, "onDeliveryStatus",
+                               "(Ljava/lang/String;ILjava/lang/String;)V");
+    if (!newOnDeliveryStatusMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onDeliveryStatus not found (reliable-send UI disabled)");
+        clear_any_exception(env);
+    }
+    jmethodID newOnPresenceMethod =
+        env->GetStaticMethodID(newEventsClass, "onPresence", "(Ljava/lang/String;ZJ)V");
+    if (!newOnPresenceMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onPresence not found (presence UI disabled)");
+        clear_any_exception(env);
+    }
+    jmethodID newOnPingResultMethod =
+        env->GetStaticMethodID(newEventsClass, "onPingResult", "(Ljava/lang/String;J)V");
+    if (!newOnPingResultMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onPingResult not found (ping UI disabled)");
+        clear_any_exception(env);
+    }
+    jmethodID newOnLookupResultMethod =
+        env->GetStaticMethodID(newEventsClass, "onLookupResult",
+                               "(Ljava/lang/String;Ljava/lang/String;ZJ)V");
+    if (!newOnLookupResultMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onLookupResult not found (directory UI disabled)");
+        clear_any_exception(env);
+    }
+    jmethodID newOnInviteReceivedMethod =
+        env->GetStaticMethodID(newEventsClass, "onInviteReceived", "(Ljava/lang/String;)V");
+    if (!newOnInviteReceivedMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onInviteReceived not found (invite UI disabled)");
+        clear_any_exception(env);
+    }
+
     // PeerInfo class (required).
     jclass localPeerInfoClass = env->FindClass("com/zeengal/litep2p/core/PeerInfo");
     if (!localPeerInfoClass) {
@@ -749,7 +917,7 @@ bool jniBridgeInit(JNIEnv* env) {
     jmethodID newPeerInfoCtor = env->GetMethodID(
         newPeerInfoClass, "<init>",
         "(Ljava/lang/String;Ljava/lang/String;IIZLjava/lang/String;Ljava/lang/String;"
-        "Ljava/lang/String;)V");
+        "Ljava/lang/String;J)V");
     if (!newPeerInfoCtor) {
         nativeLog("JNI_BRIDGE: Failed to get PeerInfo constructor method ID");
         clear_any_exception(env);
@@ -776,6 +944,11 @@ bool jniBridgeInit(JNIEnv* env) {
     g_onFileTransferOfferedMethod = newOnFileTransferOfferedMethod;
     g_onTransferProgressMethod = newOnTransferProgressMethod;
     g_onTransferCompletedMethod = newOnTransferCompletedMethod;
+    g_onDeliveryStatusMethod = newOnDeliveryStatusMethod;
+    g_onPresenceMethod = newOnPresenceMethod;
+    g_onPingResultMethod = newOnPingResultMethod;
+    g_onLookupResultMethod = newOnLookupResultMethod;
+    g_onInviteReceivedMethod = newOnInviteReceivedMethod;
 
     g_jni_cache_initialized = true;
     nativeLog("JNI_BRIDGE: Initialization complete.");
@@ -805,6 +978,11 @@ void jniBridgeCleanup(JNIEnv* env) {
     g_onFileTransferOfferedMethod = nullptr;
     g_onTransferProgressMethod = nullptr;
     g_onTransferCompletedMethod = nullptr;
+    g_onDeliveryStatusMethod = nullptr;
+    g_onPresenceMethod = nullptr;
+    g_onPingResultMethod = nullptr;
+    g_onLookupResultMethod = nullptr;
+    g_onInviteReceivedMethod = nullptr;
 
     g_jni_cache_initialized = false;
 }
@@ -943,6 +1121,95 @@ Java_com_zeengal_litep2p_core_LiteP2PNative_overlayStats(JNIEnv* env, jobject /*
     jstring out = env->NewStringUTF(json);
     litep2p_free(json);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// JNI entry points — v0.4: reliable messaging / presence / directory / invite.
+// ---------------------------------------------------------------------------
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_sendReliable(
+    JNIEnv* env, jobject /*thiz*/, jstring peerId, jstring msgId, jbyteArray data,
+    jint maxRetries, jint retryTimeoutMs) {
+    const std::string peer_id = jstring_to_utf8(env, peerId);
+    const std::string msg_id = jstring_to_utf8(env, msgId);
+    if (peer_id.empty() || msg_id.empty() || !data) return (jint)LITEP2P_ERR_INVALID_ARG;
+
+    jsize len = env->GetArrayLength(data);
+    jbyte* elements = env->GetByteArrayElements(data, nullptr);
+    if (!elements) {
+        clear_any_exception(env);
+        return (jint)LITEP2P_ERR_INTERNAL;
+    }
+    const litep2p_result_t rc = litep2p_send_reliable(
+        peer_id.c_str(), msg_id.c_str(),
+        reinterpret_cast<const uint8_t*>(elements), static_cast<uint32_t>(len),
+        maxRetries, static_cast<uint32_t>(retryTimeoutMs));
+    env->ReleaseByteArrayElements(data, elements, JNI_ABORT);
+    return (jint)rc;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_cancelReliable(JNIEnv* env, jobject /*thiz*/,
+                                                           jstring msgId) {
+    const std::string msg_id = jstring_to_utf8(env, msgId);
+    if (msg_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_reliable_cancel(msg_id.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_ping(JNIEnv* env, jobject /*thiz*/,
+                                                 jstring peerId, jint timeoutMs) {
+    const std::string peer_id = jstring_to_utf8(env, peerId);
+    if (peer_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_ping(peer_id.c_str(), static_cast<uint32_t>(timeoutMs));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_subscribePresence(JNIEnv* env, jobject /*thiz*/,
+                                                              jobjectArray peerIds) {
+    if (!peerIds) return (jint)LITEP2P_ERR_INVALID_ARG;
+    const jsize count = env->GetArrayLength(peerIds);
+    if (count <= 0) return (jint)LITEP2P_ERR_INVALID_ARG;
+
+    std::vector<std::string> ids;
+    std::vector<const char*> c_ids;
+    ids.reserve(static_cast<size_t>(count));
+    c_ids.reserve(static_cast<size_t>(count));
+    for (jsize i = 0; i < count; ++i) {
+        auto elem = (jstring)env->GetObjectArrayElement(peerIds, i);
+        if (!elem) continue;
+        ids.push_back(jstring_to_utf8(env, elem));
+        env->DeleteLocalRef(elem);
+    }
+    for (const auto& s : ids) c_ids.push_back(s.c_str());
+    if (c_ids.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_subscribe_presence(c_ids.data(),
+                                            static_cast<uint32_t>(c_ids.size()));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_registerAlias(JNIEnv* env, jobject /*thiz*/,
+                                                          jstring aliasHash) {
+    const std::string alias = jstring_to_utf8(env, aliasHash);
+    if (alias.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_register_alias(alias.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_lookupPeer(JNIEnv* env, jobject /*thiz*/,
+                                                       jstring aliasHash) {
+    const std::string alias = jstring_to_utf8(env, aliasHash);
+    if (alias.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_lookup_peer(alias.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_invitePeer(JNIEnv* env, jobject /*thiz*/,
+                                                       jstring peerId) {
+    const std::string peer_id = jstring_to_utf8(env, peerId);
+    if (peer_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_invite_peer(peer_id.c_str());
 }
 
 // ---------------------------------------------------------------------------

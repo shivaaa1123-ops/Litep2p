@@ -234,6 +234,10 @@ void SessionManager::sendMessageToPeer(const std::string& peer_id, const std::st
     m_impl->sendMessageToPeer(peer_id, message);
 }
 
+int SessionManager::pendingSendCount() const {
+    return m_impl->pending_send_count();
+}
+
 bool SessionManager::isPeerConnected(const std::string& peer_id) const {
     return m_impl->isPeerConnected(peer_id);
 }
@@ -260,6 +264,71 @@ void SessionManager::set_reconnect_mode(const std::string& mode) {
 
 std::string SessionManager::get_reconnect_status_json() const {
     return m_impl->get_reconnect_status_json_public();
+}
+
+// ============================================================================
+// v0.4 public wrappers (ask.md §1/§2/§3/§5)
+// ============================================================================
+bool SessionManager::send_reliable(const std::string& peer_id, const std::string& msg_id,
+                                   const std::string& payload, int max_retries,
+                                   uint32_t retry_timeout_ms) {
+    return m_impl->send_reliable(peer_id, msg_id, payload, max_retries, retry_timeout_ms);
+}
+
+bool SessionManager::reliable_outbox_full() const {
+    return m_impl->reliable_outbox_full();
+}
+
+size_t SessionManager::reliable_pending_count() const {
+    return m_impl->reliable_pending_count();
+}
+
+bool SessionManager::cancel_reliable(const std::string& msg_id) {
+    return m_impl->cancel_reliable(msg_id);
+}
+
+void SessionManager::set_delivery_status_callback(DeliveryStatusCallback cb) {
+    m_impl->set_delivery_status_callback(std::move(cb));
+}
+
+void SessionManager::set_ping_result_callback(PingResultCallback cb) {
+    m_impl->set_ping_result_callback(std::move(cb));
+}
+
+bool SessionManager::ping_peer(const std::string& peer_id, uint32_t timeout_ms) {
+    return m_impl->ping_peer(peer_id, timeout_ms);
+}
+
+void SessionManager::set_presence_callback(PresenceCallback cb) {
+    m_impl->set_presence_callback(std::move(cb));
+}
+
+bool SessionManager::subscribe_presence(const std::vector<std::string>& peer_ids) {
+    return m_impl->subscribe_presence(peer_ids);
+}
+
+int64_t SessionManager::get_peer_last_seen_ms(const std::string& peer_id) const {
+    return m_impl->get_peer_last_seen_ms(peer_id);
+}
+
+void SessionManager::set_lookup_result_callback(LookupResultCallback cb) {
+    m_impl->set_lookup_result_callback(std::move(cb));
+}
+
+void SessionManager::set_invite_callback(InviteCallback cb) {
+    m_impl->set_invite_callback(std::move(cb));
+}
+
+bool SessionManager::register_alias(const std::string& alias_hash) {
+    return m_impl->register_alias(alias_hash);
+}
+
+bool SessionManager::lookup_peer(const std::string& alias_hash) {
+    return m_impl->lookup_peer(alias_hash);
+}
+
+bool SessionManager::invite_peer(const std::string& peer_id) {
+    return m_impl->invite_peer(peer_id);
 }
 
 // ============================================================================
@@ -792,6 +861,47 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
     m_comms_mode = comms_mode;
     m_localPeerId = peer_id;
 
+    // v0.4: reliable-send manager (persistent outbox + retry + offline store).
+    // Re-created on every start so config changes take effect; the outbox file
+    // survives across stop()/start() and process restart.
+    {
+        auto& cfg = ConfigManager::getInstance();
+        m_reliable_send_manager = std::make_unique<ReliableSendManager>();
+        m_reliable_send_manager->configure(cfg.getReliableOutboxDir(),
+                                           cfg.isOfflineQueueEnabled(),
+                                           cfg.getOfflineQueueMaxMessages(),
+                                           cfg.getOfflineQueueTtlMs());
+        m_reliable_send_manager->set_callbacks(
+            // status -> delivery-status callback
+            [this](const std::string& msg_id, int status, const std::string& reason) {
+                SessionManager::DeliveryStatusCallback cb2;
+                {
+                    std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+                    cb2 = m_delivery_status_cb;
+                }
+                if (cb2) cb2(msg_id, status, reason);
+            },
+            // send -> session send path (raw payload; handleSendMessage wraps it)
+            [this](const std::string& peer_id, const std::string& wire_message) {
+                this->sendMessageToPeer(peer_id, wire_message);
+            },
+            // is_connected -> peer session state
+            [this](const std::string& peer_id) {
+                return this->isPeerConnected(peer_id);
+            },
+            // offline store -> signaling server
+            [this](const std::string& peer_id, const std::string& msg_id,
+                   const std::string& payload_b64) {
+                if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) {
+                    return false;
+                }
+                signaling_send_store(peer_id, msg_id, payload_b64);
+                return true;
+            });
+        LOG_INFO("SM: ReliableSendManager configured (offline_queue=" +
+                 std::string(cfg.isOfflineQueueEnabled() ? "on" : "off") + ")");
+    }
+
 #if ENABLE_OVERLAY_MODULE && HAVE_NOISE_PROTOCOL
     // Start the overlay router once identity and keys are available. Keys are
     // generated lazily by the key store on first handshake; ensure they exist
@@ -936,10 +1046,18 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
             } else if (auto* e = std::get_if<SendMessageEvent>(&event)) {
                 LOG_INFO("SM: Event type = SendMessageEvent for peer " + e->peerId);
                 LOG_INFO("SM: SendMessageEvent dispatched to message handler for peer " + e->peerId);
+                // v0.4 backpressure: this send event is leaving the queue.
+                m_pending_sends.fetch_sub(1, std::memory_order_relaxed);
                 m_message_handler->handleSendMessage(*e);
             } else if (auto* e = std::get_if<TimerTickEvent>(&event)) {
                 LOG_DEBUG("SM: Event type = TimerTickEvent");
                 m_maintenance_manager->handleTimerTick(*e);
+                // v0.4: drive the reliable-send retry/offline-store loop.
+                if (m_reliable_send_manager) {
+                    m_reliable_send_manager->tick();
+                }
+                // v0.4: expire app-level pings that never got a PONG.
+                check_ping_timeouts_();
             } else if (auto* e = std::get_if<DiscoveryInitiatedEvent>(&event)) {
                 LOG_DEBUG("SM: Event type = DiscoveryInitiatedEvent");
                 // Handle discovery initiation (queued from handleSendMessageEvent)
@@ -1636,6 +1754,11 @@ void SessionManager::Impl::stop() {
     }
 #endif
 
+    // v0.4: flush the reliable-send outbox to disk so pending sends survive.
+    if (m_reliable_send_manager) {
+        m_reliable_send_manager->stop();
+    }
+
     // Wake the SessionManager timer thread immediately (it may be waiting up to 100ms).
     m_timer_cv.notify_all();
     
@@ -1712,6 +1835,8 @@ void SessionManager::Impl::stop() {
             m_eventQueue.pop();
         }
     }
+    // v0.4 backpressure: all queued send events are gone after stop.
+    m_pending_sends.store(0, std::memory_order_relaxed);
     
     // Stop the low-level UDP discovery service first to prevent blocking
     LOG_INFO("SM: Stopping discovery service...");
@@ -3394,6 +3519,14 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
         // stalled-but-connected sockets and force a re-register.
         m_last_signaling_rx_ms.store(steady_now_ms(), std::memory_order_release);
 
+        // v0.4 signaling protocol extensions (ask.md §2/§3/§5): offline mailbox
+        // delivery, alias lookup results, invites, and server-assisted presence.
+        if (type == "STORED_MESSAGES" || type == "LOOKUP_RESULT" ||
+            type == "INVITE" || type == "PRESENCE") {
+            handle_signaling_v04_message(data);
+            return;
+        }
+
         auto make_placeholder_network_id = [](std::string peer_id) {
             // Must NOT contain ':' unless it's truly ip:port; otherwise connect logic will try to parse it.
             std::replace(peer_id.begin(), peer_id.end(), ':', '_');
@@ -3416,6 +3549,9 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
             LOG_INFO("SM: Processing REGISTER_ACK, setting m_signaling_registered=true");
             m_signaling_registered.store(true, std::memory_order_release);
             LOG_INFO("SM: m_signaling_registered stored as true");
+
+            // v0.4: fetch any offline messages held for us (store-and-forward).
+            signaling_send_fetch();
 
             // Network transitions can request a forced full reconnect. Once we are registered again,
             // clear that request so we don't churn the signaling socket.
@@ -3548,6 +3684,9 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
                 network_id = make_placeholder_network_id(pid);
             }
             handlePeerDiscovered(network_id, pid);
+
+            // v0.4 presence: a peer registering with the server is online.
+            note_peer_presence(pid, true);
 
             auto is_connectable_ipv4_endpoint = [](const std::string& nid) {
                 if (nid.empty()) return false;
@@ -3773,6 +3912,8 @@ void SessionManager::Impl::setup_signaling_callbacks(SignalingClient& client) {
             if (pid.empty()) {
                 return;
             }
+            // v0.4 presence: peer dropped off the server.
+            note_peer_presence(pid, false);
             handlePeerLeftFromSignaling(pid);
             return;
         }
@@ -4744,6 +4885,15 @@ void SessionManager::Impl::pushEvent(SessionEvent event) {
         return;
     }
 
+    // v0.4 backpressure: track in-flight plain-send events so the C ABI can
+    // return LITEP2P_ERR_QUEUE_FULL and expose litep2p_pending_send_count().
+    // Counted here (covers every push path) and decremented when the event
+    // handler dispatches the SendMessageEvent to the transport.
+    const bool is_send_event = std::holds_alternative<SendMessageEvent>(event);
+    if (is_send_event) {
+        m_pending_sends.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (m_event_manager) {
         m_event_manager->pushEvent(std::move(event));
     } else {
@@ -4753,6 +4903,11 @@ void SessionManager::Impl::pushEvent(SessionEvent event) {
         m_eventQueue.push(std::move(event));
         m_eventCv.notify_one();
     }
+}
+
+int SessionManager::Impl::pending_send_count() const {
+    const int n = m_pending_sends.load(std::memory_order_relaxed);
+    return n > 0 ? n : 0;
 }
 
 bool SessionManager::Impl::isPeerConnected(const std::string& peer_id) const {
@@ -5494,5 +5649,353 @@ void SessionManager::Impl::ip_monitor_loop() {
             bool was_wifi = m_is_wifi.load(std::memory_order_acquire);
             set_network_info(was_wifi, true);
         }
+    }
+}
+
+// ============================================================================
+// v0.4 IMPLEMENTATION (ask.md §1/§2/§3/§5)
+// ============================================================================
+
+namespace {
+int64_t v04_now_epoch_ms() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
+void SessionManager::Impl::set_delivery_status_callback(SessionManager::DeliveryStatusCallback cb) {
+    std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+    m_delivery_status_cb = std::move(cb);
+}
+
+void SessionManager::Impl::set_ping_result_callback(SessionManager::PingResultCallback cb) {
+    std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+    m_ping_result_cb = std::move(cb);
+}
+
+void SessionManager::Impl::set_presence_callback(SessionManager::PresenceCallback cb) {
+    std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+    m_presence_cb = std::move(cb);
+}
+
+void SessionManager::Impl::set_lookup_result_callback(SessionManager::LookupResultCallback cb) {
+    std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+    m_lookup_result_cb = std::move(cb);
+}
+
+void SessionManager::Impl::set_invite_callback(SessionManager::InviteCallback cb) {
+    std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+    m_invite_cb = std::move(cb);
+}
+
+bool SessionManager::Impl::send_reliable(const std::string& peer_id, const std::string& msg_id,
+                                         const std::string& payload, int max_retries,
+                                         uint32_t retry_timeout_ms) {
+    if (!m_reliable_send_manager) return false;
+    return m_reliable_send_manager->send_reliable(peer_id, msg_id, payload, max_retries,
+                                                  retry_timeout_ms);
+}
+
+bool SessionManager::Impl::cancel_reliable(const std::string& msg_id) {
+    if (!m_reliable_send_manager) return false;
+    return m_reliable_send_manager->cancel(msg_id);
+}
+
+bool SessionManager::Impl::reliable_outbox_full() const {
+    if (!m_reliable_send_manager) return false;
+    return m_reliable_send_manager->is_full();
+}
+
+size_t SessionManager::Impl::reliable_pending_count() const {
+    if (!m_reliable_send_manager) return 0;
+    return m_reliable_send_manager->pending_count();
+}
+
+int64_t SessionManager::Impl::get_peer_last_seen_ms(const std::string& peer_id) const {
+    {
+        std::lock_guard<std::mutex> lock(m_last_seen_mutex);
+        auto it = m_peer_last_seen_epoch_ms.find(peer_id);
+        if (it != m_peer_last_seen_epoch_ms.end()) return it->second;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_presence_mutex);
+        auto it = m_presence_state.find(peer_id);
+        if (it != m_presence_state.end()) return it->second.second;
+    }
+    return 0;
+}
+
+
+void SessionManager::Impl::note_peer_presence(const std::string& peer_id, bool online) {
+    if (peer_id.empty()) return;
+    const int64_t now = v04_now_epoch_ms();
+
+    SessionManager::PresenceCallback cb;
+    bool subscribed = false;
+    bool changed = false;
+    int64_t last_seen = now;
+    {
+        std::lock_guard<std::mutex> lock(m_presence_mutex);
+        subscribed = m_presence_subscribed.count(peer_id) > 0;
+        auto it = m_presence_state.find(peer_id);
+        if (it == m_presence_state.end()) {
+            m_presence_state[peer_id] = {online, online ? now : 0};
+            changed = true;
+        } else if (it->second.first != online) {
+            it->second.first = online;
+            if (online) it->second.second = now;
+            changed = true;
+        } else if (online) {
+            it->second.second = now;
+        }
+        last_seen = m_presence_state[peer_id].second;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_last_seen_mutex);
+        if (online) m_peer_last_seen_epoch_ms[peer_id] = now;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+        cb = m_presence_cb;
+    }
+    if (cb && subscribed && changed) {
+        cb(peer_id, online, last_seen);
+    }
+}
+
+bool SessionManager::Impl::subscribe_presence(const std::vector<std::string>& peer_ids) {
+    if (peer_ids.empty()) return false;
+    {
+        std::lock_guard<std::mutex> lock(m_presence_mutex);
+        for (const auto& pid : peer_ids) {
+            if (!pid.empty()) m_presence_subscribed.insert(pid);
+        }
+    }
+    // Ask the signaling server for current state (works without sessions).
+    signaling_send_subscribe_presence(peer_ids);
+    return true;
+}
+
+bool SessionManager::Impl::ping_peer(const std::string& peer_id, uint32_t timeout_ms) {
+    if (peer_id.empty()) return false;
+
+    // Resolve the peer's network endpoint; ping requires a known endpoint.
+    std::string network_id;
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        Peer* peer = find_peer_by_id(peer_id);
+        if (peer) {
+            network_id = peer->network_id;
+        }
+    }
+    if (network_id.empty()) {
+        // Unknown peer: report unreachable immediately.
+        SessionManager::PingResultCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+            cb = m_ping_result_cb;
+        }
+        if (cb) cb(peer_id, -1);
+        return true;
+    }
+
+    const uint64_t token = m_ping_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto sent_time = std::chrono::steady_clock::now();
+    const auto deadline = sent_time + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 3000);
+    {
+        std::lock_guard<std::mutex> lk(m_ping_mutex);
+        m_last_ping_by_peer[peer_id] = {token, sent_time};
+    }
+    {
+        std::lock_guard<std::mutex> lk(m_app_ping_mutex);
+        m_pending_pings[peer_id] = {token, deadline};
+    }
+
+    const std::string ping_payload = std::to_string(token);
+    const std::string ping_message = wire::encode_message(MessageType::CONTROL_PING, ping_payload);
+    send_message_to_peer(network_id, ping_message);
+    return true;
+}
+
+bool SessionManager::Impl::register_alias(const std::string& alias_hash) {
+    if (alias_hash.empty()) return false;
+    signaling_send_register_alias(alias_hash);
+    return true;
+}
+
+bool SessionManager::Impl::lookup_peer(const std::string& alias_hash) {
+    if (alias_hash.empty()) return false;
+    signaling_send_lookup(alias_hash);
+    return true;
+}
+
+bool SessionManager::Impl::invite_peer(const std::string& peer_id) {
+    if (peer_id.empty()) return false;
+    signaling_send_invite(peer_id);
+    return true;
+}
+
+void SessionManager::Impl::check_ping_timeouts_() {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::string> expired;
+    {
+        std::lock_guard<std::mutex> lk(m_app_ping_mutex);
+        for (auto it = m_pending_pings.begin(); it != m_pending_pings.end();) {
+            if (now >= it->second.deadline) {
+                expired.push_back(it->first);
+                it = m_pending_pings.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (expired.empty()) return;
+    SessionManager::PingResultCallback cb;
+    {
+        std::lock_guard<std::mutex> lk(m_v04_cb_mutex);
+        cb = m_ping_result_cb;
+    }
+    if (!cb) return;
+    for (const auto& pid : expired) {
+        cb(pid, -1);  // UNREACHABLE
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// v0.4 signaling protocol helpers. All messages ride the existing signaling
+// WebSocket (server.py v0.4 extensions): STORE/FETCH (offline mailbox),
+// REGISTER_ALIAS/LOOKUP (identity directory), INVITE (connect nudge),
+// SUBSCRIBE_PRESENCE/PRESENCE (server-assisted presence).
+// ---------------------------------------------------------------------------
+
+void SessionManager::Impl::signaling_send_store(const std::string& target_peer_id,
+                                                const std::string& msg_id,
+                                                const std::string& payload_b64) {
+    if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) return;
+    nlohmann::json j;
+    j["type"] = "STORE";
+    j["target_peer_id"] = target_peer_id;
+    j["msg_id"] = msg_id;
+    j["payload_b64"] = payload_b64;
+    m_signaling_client->sendRawJson(j.dump());
+}
+
+void SessionManager::Impl::signaling_send_fetch() {
+    if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) return;
+    m_signaling_client->sendRawJson("{\"type\": \"FETCH\"}");
+}
+
+void SessionManager::Impl::signaling_send_register_alias(const std::string& alias_hash) {
+    if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) {
+        // Best-effort: connect on demand so alias registration works pre-bootstrap.
+        ensure_signaling_connected_async(false);
+        return;
+    }
+    nlohmann::json j;
+    j["type"] = "REGISTER_ALIAS";
+    j["alias"] = alias_hash;
+    m_signaling_client->sendRawJson(j.dump());
+}
+
+void SessionManager::Impl::signaling_send_lookup(const std::string& alias_hash) {
+    if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) {
+        ensure_signaling_connected_async(false);
+        return;
+    }
+    nlohmann::json j;
+    j["type"] = "LOOKUP";
+    j["alias"] = alias_hash;
+    m_signaling_client->sendRawJson(j.dump());
+}
+
+void SessionManager::Impl::signaling_send_invite(const std::string& target_peer_id) {
+    if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) {
+        ensure_signaling_connected_async(false);
+        return;
+    }
+    nlohmann::json j;
+    j["type"] = "INVITE";
+    j["target_peer_id"] = target_peer_id;
+    m_signaling_client->sendRawJson(j.dump());
+}
+
+void SessionManager::Impl::signaling_send_subscribe_presence(const std::vector<std::string>& peer_ids) {
+    if (!m_signaling_client || !m_signaling_registered.load(std::memory_order_acquire)) {
+        ensure_signaling_connected_async(false);
+        return;
+    }
+    nlohmann::json j;
+    j["type"] = "SUBSCRIBE_PRESENCE";
+    j["peer_ids"] = peer_ids;
+    m_signaling_client->sendRawJson(j.dump());
+}
+
+// Handle v0.4 signaling server messages. Called from setup_signaling_callbacks
+// for types the base protocol does not recognize.
+void SessionManager::Impl::handle_signaling_v04_message(const json& data) {
+    const std::string type = data.value("type", "");
+
+    if (type == "STORED_MESSAGES") {
+        // Offline mailbox delivery: [{"msg_id","from_peer_id","payload_b64"}]
+        if (!data.contains("messages") || !data["messages"].is_array()) return;
+        for (const auto& m : data["messages"]) {
+            const std::string msg_id = m.value("msg_id", "");
+            const std::string from = m.value("from_peer_id", "");
+            const std::string b64 = m.value("payload_b64", "");
+            if (msg_id.empty() || from.empty()) continue;
+
+            // Receiver-side dedup: fire onMessageReceived at most once per msg_id.
+            if (m_reliable_send_manager && m_reliable_send_manager->is_duplicate(msg_id)) {
+                LOG_INFO("SM: dropping duplicate offline message " + msg_id);
+                continue;
+            }
+
+            const std::string payload = reliable_base64_decode(b64);
+            if (m_message_received_cb) {
+                m_message_received_cb(from, payload);
+            }
+        }
+        return;
+    }
+
+    if (type == "LOOKUP_RESULT") {
+        const std::string alias = data.value("alias", "");
+        const std::string peer_id = data.value("peer_id", "");
+        const bool online = data.value("online", false);
+        const int64_t last_seen = data.value("last_seen_ms", static_cast<int64_t>(0));
+        SessionManager::LookupResultCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+            cb = m_lookup_result_cb;
+        }
+        if (cb) cb(alias, peer_id, online, last_seen);
+        return;
+    }
+
+    if (type == "INVITE") {
+        const std::string from = data.value("source_peer_id", "");
+        if (from.empty()) return;
+        LOG_INFO("SM: invite received from " + from);
+        SessionManager::InviteCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_v04_cb_mutex);
+            cb = m_invite_cb;
+        }
+        if (cb) cb(from);
+        return;
+    }
+
+    if (type == "PRESENCE") {
+        const std::string peer_id = data.value("peer_id", "");
+        const bool online = data.value("online", false);
+        if (peer_id.empty()) return;
+        // Record last-seen even for non-subscribed peers (feeds lastSeenMs).
+        {
+            std::lock_guard<std::mutex> lock(m_last_seen_mutex);
+            if (online) m_peer_last_seen_epoch_ms[peer_id] = v04_now_epoch_ms();
+        }
+        note_peer_presence(peer_id, online);
+        return;
     }
 }

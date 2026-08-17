@@ -33,7 +33,11 @@ public:
 
     void sendListPeers();
     void sendUpdateNetworkId(const std::string& network_id);
-    
+
+    // v0.4: send an arbitrary pre-built JSON frame (alias/lookup/invite/store/
+    // fetch/presence protocol messages). Returns false when not connected.
+    bool sendRawJson(const std::string& json_payload);
+
     void setMessageCallback(MessageCallback callback);
     bool isConnected() const;
     

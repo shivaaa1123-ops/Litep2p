@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        SDK default strings for the LiteP2P foreground-service notification.
+        Host apps can override every value at runtime via
+        LiteP2PRuntime.setNotificationContent(...) or by redefining these
+        string resources in their own app (resource merging: app wins).
+    -->
+    <string name="litep2p_notification_channel_name">LiteP2P engine</string>
+    <string name="litep2p_notification_channel_description">Shows whether the peer-to-peer engine is running.</string>
+    <string name="litep2p_notification_title">LiteP2P engine</string>
+    <string name="litep2p_notification_text_starting">Starting…</string>
+    <string name="litep2p_notification_text_running">Running</string>
+    <string name="litep2p_notification_text_stopping">Stopping…</string>
+    <string name="litep2p_notification_text_stopped">Stopped</string>
+    <string name="litep2p_notification_action_stop">Stop</string>
+</resources>

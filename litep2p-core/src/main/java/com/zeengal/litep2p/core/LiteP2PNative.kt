@@ -83,6 +83,69 @@ internal object LiteP2PNative {
     external fun sendMessage(peerId: String, message: ByteArray): Int
 
     /* ------------------------------------------------------------------ */
+    /* Reliable messaging (v0.4)                                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * At-least-once send with engine receipts. [msgId] is caller-supplied and
+     * unique per message (the receiver dedupes on it). The engine persists the
+     * payload into an outbox under filesDir, retries every [retryTimeoutMs]
+     * until the peer ACKs or [maxRetries] is exhausted, and — when the offline
+     * queue is enabled and the peer has no session — stores the message on the
+     * signaling server. Lifecycle arrives via NativeEvents.onDeliveryStatus.
+     */
+    external fun sendReliable(
+        peerId: String,
+        msgId: String,
+        data: ByteArray,
+        maxRetries: Int,
+        retryTimeoutMs: Int
+    ): Int
+
+    /** Cancels a pending reliable send (no further retries / offline store). */
+    external fun cancelReliable(msgId: String): Int
+
+    /* ------------------------------------------------------------------ */
+    /* Presence & reachability (v0.4)                                       */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Cheap liveness probe. Result arrives via NativeEvents.onPingResult:
+     * rttMs >= 0 on success, -1 after timeout.
+     */
+    external fun ping(peerId: String, timeoutMs: Int): Int
+
+    /**
+     * Subscribes to server-assisted presence for a set of peers. Updates arrive
+     * via NativeEvents.onPresence. Works without holding an open session.
+     */
+    external fun subscribePresence(peerIds: Array<String>): Int
+
+    /* ------------------------------------------------------------------ */
+    /* Identity directory & invites (v0.4)                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Registers a stable lookup alias (e.g. SHA-256 of a normalized phone
+     * number) for this peer on the signaling server. Alias values are opaque
+     * hashes — the server never sees raw identifiers.
+     */
+    external fun registerAlias(aliasHash: String): Int
+
+    /**
+     * Resolves an alias hash to a peer id (+ presence). Result arrives via
+     * NativeEvents.onLookupResult; resolves even when the target is offline.
+     */
+    external fun lookupPeer(aliasHash: String): Int
+
+    /**
+     * Nudges a remote/offline peer to connect via a signaling push. The target
+     * receives NativeEvents.onInviteReceived and typically responds with
+     * [connect].
+     */
+    external fun invitePeer(peerId: String): Int
+
+    /* ------------------------------------------------------------------ */
     /* Security (Noise NK)                                                  */
     /* ------------------------------------------------------------------ */
 
@@ -190,6 +253,16 @@ internal object LiteP2PNative {
 
     /** Pull-based telemetry snapshot as single-line JSON, or "" on failure. */
     external fun telemetrySnapshot(): String
+
+    /* ------------------------------------------------------------------ */
+    /* Backpressure metrics (v0.4)                                          */
+    /* ------------------------------------------------------------------ */
+
+    /** Plain-send events queued in the engine event loop (not yet sent). */
+    external fun pendingSendCount(): Int
+
+    /** Reliable sends in the durable outbox (QUEUED or SENT). */
+    external fun reliablePendingCount(): Int
 
     init {
         System.loadLibrary("litep2p")

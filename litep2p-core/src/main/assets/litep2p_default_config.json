@@ -1,0 +1,130 @@
+{
+    "_comment": "LiteP2P SDK default config (bundled in the AAR assets). Extracted to filesDir/litep2p_default_config.json on first run when no config.json exists. Override any value by placing your own config.json in filesDir or passing LiteP2PConfig.Builder().configPath(...).",
+    "network": {
+        "default_server_port": 30001,
+        "discovery_port": 30000,
+        "listen_backlog": 5,
+        "select_max_retries": 3
+    },
+    "communication": {
+        "default_protocol": "UDP",
+        "udp": {
+            "enabled": true,
+            "port": 30001,
+            "buffer_size": 65535,
+            "timeout_ms": 5000,
+            "select_timeout_sec": 1
+        },
+        "tcp": {
+            "enabled": true,
+            "port": 30001,
+            "nodelay": true,
+            "buffer_size": 4096,
+            "connect_timeout_sec": 5,
+            "select_timeout_sec": 1
+        }
+    },
+    "peer_management": {
+        "peer_timeout_sec": 30,
+        "timer_tick_interval_sec": 10,
+        "ping_interval_sec": 10,
+        "heartbeat_interval_sec": 10,
+        "peer_expiration_timeout_ms": 30000,
+        "max_queued_messages": 100,
+        "max_pending_sends": 1000,
+        "max_message_size": 10485760,
+        "max_handshake_retries": 3
+    },
+    "discovery": {
+        "message_prefix": "LITEP2P_DISCOVERY",
+        "max_message_size": 1024,
+        "broadcast_interval_sec": 5
+    },
+    "security": {
+        "transport_key": "e8fefcbd7ee7fe24fa62cc4bb5a788363647398c44c446cd9e4364e0b269f3ab",
+        "noise_nk_protocol": {
+            "enabled": true,
+            "mandatory": true,
+            "key_store_path": "keystore",
+            "key_rotation_interval_hours": 24
+        },
+        "selective_encryption_enabled": true
+    },
+    "session_manager": {
+        "num_workers": 4,
+        "cache_size": 100,
+        "cache_lifetime_sec": 3600,
+        "session_timeout_ms": 30000,
+        "max_concurrent_sessions": 100
+    },
+    "event_manager": {
+        "queue_wait_timeout_ms": 100,
+        "timer_tick_interval_ms": 500,
+        "thread_sleep_ms": 100
+    },
+    "battery_optimizer": {
+        "enabled": true,
+        "aggressive_mode": false,
+        "power_save_threshold": 20,
+        "level_critical": 10,
+        "level_low": 20,
+        "level_medium": 80
+    },
+    "reconnect_policy": {
+        "mode": "auto",
+        "max_backoff_level": 16,
+        "max_consecutive_failures": 5,
+        "default_backoff_ms": 30000,
+        "initial_backoff_ms": 500,
+        "max_backoff_ms": 60000
+    },
+    "offline_queue": {
+        "enabled": true,
+        "max_messages": 500,
+        "ttl_ms": 604800000
+    },
+    "signaling": {
+        "enabled": true,
+        "url": "ws://64.227.140.251:8765",
+        "reconnect_interval_ms": 5000
+    },
+    "proxy": {
+        "enable_gateway": false,
+        "enable_client": true,
+        "enable_test_echo": false
+    },
+    "overlay": {
+        "relay_enabled": false,
+        "default_hops": 2,
+        "relay_peers": [],
+        "obfuscate_transport": true,
+        "padding_bucket": 128,
+        "cover_interval_ms": 30000,
+        "pex_interval_ms": 60000,
+        "require_origin_auth": true
+    },
+    "global_discovery": {
+        "enabled": false,
+        "discovery_strategy": "broadcast",
+        "local_network_scan": true,
+        "announce_self": true,
+        "announce_interval_ms": 30000,
+        "bootstrap_nodes": []
+    },
+    "logging": {
+        "level": "info",
+        "format": "text",
+        "file_path": "",
+        "max_file_size_mb": 10,
+        "retention_days": 7,
+        "console_output": true
+    },
+    "storage": {
+        "peer_db": {
+            "enabled": true,
+            "path": "",
+            "reconnect_candidate_limit": 2000,
+            "prune_after_days": 15
+        }
+    }
+}

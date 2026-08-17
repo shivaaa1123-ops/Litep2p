@@ -5,6 +5,7 @@
 #include <sodium.h>
 
 #include <algorithm>
+#include <cstring>
 #include <random>
 
 namespace overlay {
@@ -90,7 +91,12 @@ void OverlayRouter::start() {
     if (m_running.exchange(true)) return;
     LOG_INFO("OVL: overlay router started (relay=" +
              std::string(m_relay_enabled.load() ? "on" : "off") +
-             ", hops=" + std::to_string(m_cfg.default_hops) + ")");
+             ", hops=" + std::to_string(m_cfg.default_hops) +
+             ", obfuscate=" + (m_cfg.obfuscate_transport ? "on" : "off") +
+             ", padding=" + std::to_string(m_cfg.padding_bucket) +
+             ", cover_ms=" + std::to_string(m_cfg.cover_interval_ms) +
+             ", pex_ms=" + std::to_string(m_cfg.pex_interval_ms) +
+             ", origin_auth=" + (m_cfg.require_origin_auth ? "on" : "off") + ")");
     m_tick_thread = std::thread([this] { tick_loop_(); });
 }
 
@@ -345,10 +351,16 @@ OverlayRouter::SendResult OverlayRouter::send(const std::string& dest_peer_id,
 
 void OverlayRouter::on_frame(const std::string& from_peer_id,
                              const std::string& frame_bytes) {
-    // Phase B: optional obfuscated transport — peel the OBF1 envelope first so
-    // the LPX2 magic is never seen on the wire. Mismatched configs drop here.
+    // Phase B: obfuscated transport — peel the OBF1 envelope first so the LPX2
+    // magic is never seen on the wire. Detection is by MAGIC, not by config:
+    // obfuscation is on by default for outgoing frames, but we must still
+    // accept plain LPX2 frames from peers running with obfuscation disabled
+    // (mixed-config interop). This is not a downgrade attack: OBF1 envelopes
+    // are AEAD-sealed to our static key, and plain LPX2 frames still require
+    // a sealed hop instruction addressed to us before anything is processed.
     std::string payload = frame_bytes;
-    if (m_cfg.obfuscate_transport) {
+    if (frame_bytes.size() >= 4 &&
+        std::memcmp(frame_bytes.data(), "OBF1", 4) == 0) {
         std::string plain;
         if (!obfuscate_unwrap(m_local_pk, m_local_sk, frame_bytes, plain)) {
             std::lock_guard<std::mutex> lock(m_mu);

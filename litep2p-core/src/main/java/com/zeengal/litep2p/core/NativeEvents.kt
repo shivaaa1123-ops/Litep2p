@@ -81,4 +81,43 @@ object NativeEvents {
     fun onTransferCompleted(transferId: String, success: Boolean, error: String?) {
         LiteP2P.dispatchTransferCompleted(transferId, success, error)
     }
+
+    /* ------------------------------------------------------------------ */
+    /* v0.4: reliable messaging / presence / directory / invites            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Reliable-send delivery receipt (msg_id, status, reason).
+     * status: 0=QUEUED 1=SENT 2=DELIVERED 3=FAILED.
+     * reason: "OK" | "NO_ROUTE" | "PEER_OFFLINE" | "QUEUE_FULL" | "TIMEOUT"
+     *         | "TTL_EXPIRED" | "CANCELLED".
+     */
+    @JvmStatic
+    fun onDeliveryStatus(msgId: String, status: Int, reason: String) {
+        LiteP2P.dispatchDeliveryStatus(msgId, status, reason)
+    }
+
+    /** Presence update for a subscribed peer (peer_id, online, last_seen_ms). */
+    @JvmStatic
+    fun onPresence(peerId: String, online: Boolean, lastSeenMs: Long) {
+        LiteP2P.dispatchPresence(peerId, online, lastSeenMs)
+    }
+
+    /** Ping result (peer_id, rtt_ms >= 0 on success, -1 on timeout/unreachable). */
+    @JvmStatic
+    fun onPingResult(peerId: String, rttMs: Long) {
+        LiteP2P.dispatchPingResult(peerId, rttMs)
+    }
+
+    /** Alias lookup result (alias, peer_id — "" when unregistered, online, last_seen_ms). */
+    @JvmStatic
+    fun onLookupResult(alias: String, peerId: String, online: Boolean, lastSeenMs: Long) {
+        LiteP2P.dispatchLookupResult(alias, peerId, online, lastSeenMs)
+    }
+
+    /** Invite received from [fromPeerId] (signaling push; typically followed by connect). */
+    @JvmStatic
+    fun onInviteReceived(fromPeerId: String) {
+        LiteP2P.dispatchInviteReceived(fromPeerId)
+    }
 }

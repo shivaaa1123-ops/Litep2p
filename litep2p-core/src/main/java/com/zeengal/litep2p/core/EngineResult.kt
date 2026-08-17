@@ -17,6 +17,7 @@ enum class EngineResult(val code: Int) {
     TIMEOUT(-6),
     UNSUPPORTED(-7),
     NO_ROUTE(-8),
+    QUEUE_FULL(-10),
     INTERNAL(-99);
 
     companion object {

@@ -119,6 +119,60 @@ async def main() -> None:
             assert '"type": "SIGNAL"' in msg or '"type":"SIGNAL"' in msg
             assert peer_a in msg
 
+            # ------------------------------------------------------------------
+            # v0.4: offline mailbox (STORE while target offline, FETCH on return)
+            # ------------------------------------------------------------------
+            peer_c = f"peer-c-{suffix}"
+            await a.send(
+                json.dumps(
+                    {
+                        "type": "STORE",
+                        "target_peer_id": peer_c,
+                        "msg_id": "m-1",
+                        "payload_b64": "aGVsbG8=",
+                    }
+                )
+            )
+            # peer_c connects later and should receive the held message on REGISTER.
+            async with websockets.connect(uri) as c:
+                await c.send(f'{{"type":"REGISTER","peer_id":"{peer_c}"}}')
+                msg = await _recv_until(
+                    c,
+                    predicate=lambda m: '"STORED_MESSAGES"' in m,
+                    timeout=3,
+                )
+                payload = json.loads(msg)
+                assert payload.get("type") == "STORED_MESSAGES"
+                msgs = payload.get("messages") or []
+                assert any(m.get("msg_id") == "m-1" for m in msgs)
+
+            # ------------------------------------------------------------------
+            # v0.4: identity directory (REGISTER_ALIAS + LOOKUP)
+            # ------------------------------------------------------------------
+            alias_hash = f"alias-{suffix}"
+            await a.send(json.dumps({"type": "REGISTER_ALIAS", "alias": alias_hash}))
+            msg = await _recv_until(a, predicate=lambda m: '"ALIAS_ACK"' in m, timeout=3)
+            assert '"OK"' in msg
+
+            await b.send(json.dumps({"type": "LOOKUP", "alias": alias_hash}))
+            msg = await _recv_until(b, predicate=lambda m: '"LOOKUP_RESULT"' in m, timeout=3)
+            payload = json.loads(msg)
+            assert payload.get("peer_id") == peer_a
+            assert payload.get("online") is True
+
+            # ------------------------------------------------------------------
+            # v0.4: presence subscription (SUBSCRIBE_PRESENCE + PRESENCE events)
+            # ------------------------------------------------------------------
+            await b.send(json.dumps({"type": "SUBSCRIBE_PRESENCE", "peer_ids": [peer_a]}))
+            # Immediate current-state report: peer_a is online.
+            msg = await _recv_until(
+                b,
+                predicate=lambda m: '"PRESENCE"' in m and peer_a in m,
+                timeout=3,
+            )
+            payload = json.loads(msg)
+            assert payload.get("online") is True
+
         where = "remote" if is_remote_target else "local"
         print(f"OK: signaling server smoke test passed ({where}, {uri})")
     finally:

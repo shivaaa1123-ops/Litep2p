@@ -194,6 +194,84 @@ void apply_overlay_delivery_cb(SessionManager* engine) {
     });
 }
 
+// Wire the v0.4 callbacks (delivery status, presence, ping, lookup, invite)
+// onto the engine. Called from litep2p_start() after engine creation and from
+// litep2p_set_callbacks() when the engine already exists. Each callback reads
+// the registered struct under g_cb_mutex so re-registration is safe.
+void apply_v04_callbacks(SessionManager* engine) {
+    if (!engine) return;
+
+    engine->set_delivery_status_callback(
+        [](const std::string& msg_id, int status, const std::string& reason) {
+            void* user_data = nullptr;
+            void (*cb)(void*, const char*, int, const char*) = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_cb_mutex);
+                if (g_callbacks_set) {
+                    user_data = g_callbacks.user_data;
+                    cb = g_callbacks.on_delivery_status;
+                }
+            }
+            if (cb) cb(user_data, msg_id.c_str(), status, reason.c_str());
+        });
+
+    engine->set_presence_callback(
+        [](const std::string& peer_id, bool online, int64_t last_seen_ms) {
+            void* user_data = nullptr;
+            void (*cb)(void*, const char*, int, int64_t) = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_cb_mutex);
+                if (g_callbacks_set) {
+                    user_data = g_callbacks.user_data;
+                    cb = g_callbacks.on_presence;
+                }
+            }
+            if (cb) cb(user_data, peer_id.c_str(), online ? 1 : 0, last_seen_ms);
+        });
+
+    engine->set_ping_result_callback(
+        [](const std::string& peer_id, int64_t rtt_ms) {
+            void* user_data = nullptr;
+            void (*cb)(void*, const char*, int64_t) = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_cb_mutex);
+                if (g_callbacks_set) {
+                    user_data = g_callbacks.user_data;
+                    cb = g_callbacks.on_ping_result;
+                }
+            }
+            if (cb) cb(user_data, peer_id.c_str(), rtt_ms);
+        });
+
+    engine->set_lookup_result_callback(
+        [](const std::string& alias, const std::string& peer_id, bool online,
+           int64_t last_seen_ms) {
+            void* user_data = nullptr;
+            void (*cb)(void*, const char*, const char*, int, int64_t) = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(g_cb_mutex);
+                if (g_callbacks_set) {
+                    user_data = g_callbacks.user_data;
+                    cb = g_callbacks.on_lookup_result;
+                }
+            }
+            if (cb) cb(user_data, alias.c_str(), peer_id.c_str(), online ? 1 : 0, last_seen_ms);
+        });
+
+    engine->set_invite_callback([](const std::string& from_peer_id) {
+        void* user_data = nullptr;
+        void (*cb)(void*, const char*) = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_cb_mutex);
+            if (g_callbacks_set) {
+                user_data = g_callbacks.user_data;
+                cb = g_callbacks.on_invite_received;
+            }
+        }
+        if (cb) cb(user_data, from_peer_id.c_str());
+    });
+}
+
 // Replicate the JNI bridge's files-dir configuration without JNI (api-spec §3.4).
 void apply_files_dir_config(const StoredConfig& cfg) {
     ConfigManager& cm = ConfigManager::getInstance();
@@ -236,6 +314,12 @@ void apply_files_dir_config(const StoredConfig& cfg) {
         const std::string db = cfg.files_dir + "/litep2p_peers.sqlite";
         cm.setValueAtPath({"storage", "peer_db", "path"}, db);
         nativeLog("CABI: Peer DB path set to " + db);
+    }
+
+    // v0.4: the reliable-send outbox persists under files_dir so pending sends
+    // survive stop()/start() and process restart (ask.md §1).
+    if (!cfg.files_dir.empty()) {
+        cm.setValueAtPath({"storage", "reliable_outbox", "dir"}, cfg.files_dir);
     }
 }
 
@@ -286,6 +370,7 @@ const char* litep2p_result_string(litep2p_result_t result) {
         case LITEP2P_ERR_TIMEOUT:       return "TIMEOUT";
         case LITEP2P_ERR_UNSUPPORTED:   return "UNSUPPORTED";
         case LITEP2P_ERR_NO_ROUTE:      return "NO_ROUTE";
+        case LITEP2P_ERR_QUEUE_FULL:    return "QUEUE_FULL";
         case LITEP2P_ERR_INTERNAL:      return "INTERNAL";
         default:                        return "UNKNOWN";
     }
@@ -367,6 +452,7 @@ litep2p_result_t litep2p_set_callbacks(const litep2p_callbacks_t* callbacks) {
             engine = g_engine.get();
         }
         if (engine) apply_overlay_delivery_cb(engine);
+        if (engine) apply_v04_callbacks(engine);
     }
 
     return LITEP2P_OK;
@@ -489,6 +575,8 @@ litep2p_result_t litep2p_start(void) {
             copy_to_buf(info.connection_path, sizeof(info.connection_path),
                         normalize_connection_path(connectionPathToString(p.active_connection_path)));
             copy_to_buf(info.fsm_state, sizeof(info.fsm_state), engine->getPeerFsmState(p.id));
+            // v0.4: last-seen epoch ms (session/discovery/signaling observation).
+            info.last_seen_ms = engine->get_peer_last_seen_ms(p.id);
             infos.push_back(info);
         }
         void* user_data = nullptr;
@@ -532,6 +620,9 @@ litep2p_result_t litep2p_start(void) {
 
     // Wire the overlay delivery callback the same way.
     apply_overlay_delivery_cb(engine);
+
+    // Wire the v0.4 callbacks (delivery status / presence / ping / lookup / invite).
+    apply_v04_callbacks(engine);
 
     // Blocking engine start — no API lock held, so consumers may re-enter the
     // C ABI from callbacks without deadlocking.
@@ -694,10 +785,103 @@ litep2p_result_t litep2p_send(const char* peer_id, const uint8_t* data, uint32_t
     if (len > 0 && !data) return LITEP2P_ERR_INVALID_ARG;
     std::lock_guard<std::mutex> lock(g_api_mutex);
     if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    // v0.4 (honorable mention): richer failure reasons instead of a blanket
+    // NOT_FOUND. The engine must be RUNNING to accept app traffic.
+    if (g_state.load(std::memory_order_acquire) != (int)LITEP2P_STATE_RUNNING) {
+        return LITEP2P_ERR_INVALID_STATE;  // not running yet
+    }
+    // Unknown peer (never discovered/added) -> NOT_FOUND.
+    if (!g_engine->isPeerConnected(peer_id) &&
+        g_engine->getPeerFsmState(peer_id) == "UNKNOWN") {
+        return LITEP2P_ERR_NOT_FOUND;
+    }
+    // v0.4 backpressure: explicit QUEUE_FULL instead of unbounded queue growth.
+    // The limit is config-driven (peer_management.max_pending_sends, default
+    // 1000). Callers should back off / retry or switch to litep2p_send_reliable().
+    const int max_pending = ConfigManager::getInstance().getMaxPendingSends();
+    if (max_pending > 0 && g_engine->pendingSendCount() >= max_pending) {
+        return LITEP2P_ERR_QUEUE_FULL;
+    }
     // LITEP2P_OK means "accepted into the send path", not "delivered".
     g_engine->sendMessageToPeer(peer_id,
                                 std::string(reinterpret_cast<const char*>(data), len));
     return LITEP2P_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Reliable messaging (v0.4, ask.md §1/§2)                                   */
+/* ------------------------------------------------------------------------ */
+litep2p_result_t litep2p_send_reliable(const char* peer_id, const char* msg_id,
+                                       const uint8_t* data, uint32_t len,
+                                       int max_retries, uint32_t retry_timeout_ms) {
+    if (!peer_id || !peer_id[0] || !msg_id || !msg_id[0]) return LITEP2P_ERR_INVALID_ARG;
+    if (len > 0 && !data) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    // v0.4 backpressure: surface outbox exhaustion as an explicit QUEUE_FULL
+    // instead of a blanket INTERNAL (the delivery-status callback also fires
+    // FAILED/"QUEUE_FULL" for this msg_id).
+    if (g_engine->reliable_outbox_full()) {
+        return LITEP2P_ERR_QUEUE_FULL;
+    }
+    const bool ok = g_engine->send_reliable(
+        peer_id, msg_id, std::string(reinterpret_cast<const char*>(data), len),
+        max_retries, retry_timeout_ms);
+    return ok ? LITEP2P_OK : LITEP2P_ERR_INTERNAL;
+}
+
+litep2p_result_t litep2p_reliable_cancel(const char* msg_id) {
+    if (!msg_id || !msg_id[0]) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->cancel_reliable(msg_id) ? LITEP2P_OK : LITEP2P_ERR_NOT_FOUND;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Presence & reachability (v0.4, ask.md §5)                                 */
+/* ------------------------------------------------------------------------ */
+litep2p_result_t litep2p_ping(const char* peer_id, uint32_t timeout_ms) {
+    if (!peer_id || !peer_id[0]) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->ping_peer(peer_id, timeout_ms) ? LITEP2P_OK : LITEP2P_ERR_INTERNAL;
+}
+
+litep2p_result_t litep2p_subscribe_presence(const char* const* peer_ids, uint32_t count) {
+    if (!peer_ids || count == 0) return LITEP2P_ERR_INVALID_ARG;
+    std::vector<std::string> ids;
+    ids.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (peer_ids[i] && peer_ids[i][0]) ids.emplace_back(peer_ids[i]);
+    }
+    if (ids.empty()) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->subscribe_presence(ids) ? LITEP2P_OK : LITEP2P_ERR_INTERNAL;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Identity directory & invites (v0.4, ask.md §3)                            */
+/* ------------------------------------------------------------------------ */
+litep2p_result_t litep2p_register_alias(const char* alias_hash) {
+    if (!alias_hash || !alias_hash[0]) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->register_alias(alias_hash) ? LITEP2P_OK : LITEP2P_ERR_INTERNAL;
+}
+
+litep2p_result_t litep2p_lookup_peer(const char* alias_hash) {
+    if (!alias_hash || !alias_hash[0]) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->lookup_peer(alias_hash) ? LITEP2P_OK : LITEP2P_ERR_INTERNAL;
+}
+
+litep2p_result_t litep2p_invite_peer(const char* peer_id) {
+    if (!peer_id || !peer_id[0]) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->invite_peer(peer_id) ? LITEP2P_OK : LITEP2P_ERR_INTERNAL;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1027,6 +1211,22 @@ litep2p_result_t litep2p_telemetry_snapshot(char** out_json) {
     if (cb) cb(user_data, buf);
 
     return LITEP2P_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Backpressure metrics (v0.4)                                               */
+/* ------------------------------------------------------------------------ */
+uint32_t litep2p_pending_send_count(void) {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return 0;
+    const int n = g_engine->pendingSendCount();
+    return n > 0 ? static_cast<uint32_t>(n) : 0;
+}
+
+uint32_t litep2p_reliable_pending_count(void) {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return 0;
+    return static_cast<uint32_t>(g_engine->reliable_pending_count());
 }
 
 void litep2p_free(void* ptr) {

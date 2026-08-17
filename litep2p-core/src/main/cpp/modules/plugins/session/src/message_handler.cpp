@@ -427,6 +427,26 @@ namespace detail {
                 }
                 LOG_INFO("SM: PONG latency from " + peer_id + ": " + std::to_string(ms) + "ms");
 
+                // v0.4: resolve a pending app-level ping (litep2p_ping) if the
+                // token matches, and fire the ping-result callback with the RTT.
+                {
+                    SessionManager::PingResultCallback ping_cb;
+                    bool matched = false;
+                    {
+                        std::lock_guard<std::mutex> lk(m_sm->m_app_ping_mutex);
+                        auto it = m_sm->m_pending_pings.find(peer_id);
+                        if (it != m_sm->m_pending_pings.end() && it->second.token == token) {
+                            m_sm->m_pending_pings.erase(it);
+                            matched = true;
+                        }
+                    }
+                    if (matched) {
+                        std::lock_guard<std::mutex> lk(m_sm->m_v04_cb_mutex);
+                        ping_cb = m_sm->m_ping_result_cb;
+                    }
+                    if (ping_cb) ping_cb(peer_id, static_cast<int64_t>(ms));
+                }
+
                 if (m_sm->m_peer_tier_manager) {
                     m_sm->m_peer_tier_manager->record_latency(peer_id, static_cast<int>(ms));
                 }
@@ -838,6 +858,48 @@ namespace detail {
                 Telemetry::getInstance().inc_counter("rx_app_bytes_total", static_cast<int64_t>(payload.size()));
 
                 // ------------------------------------------------------------
+                // ------------------------------------------------------------
+                // Reliable-send envelope (v0.4, ask.md §1): LP_RELIABLE
+                // ------------------------------------------------------------
+                // Payload: {"type":"LP_RELIABLE","msg_id":"...","body_b64":"..."}
+                // Receiver dedupes on msg_id, ACKs with LP_RELIABLE_ACK, and
+                // forwards the decoded body to the app callback exactly once.
+                if (!payload.empty() && payload.front() == '{') {
+                    if (payload.find("\"type\"") != std::string::npos &&
+                        payload.find("LP_RELIABLE") != std::string::npos) {
+                        try {
+                            const auto j = nlohmann::json::parse(payload);
+                            if (j.is_object() && j.value("type", std::string{}) == "LP_RELIABLE") {
+                                const std::string msg_id = j.value("msg_id", std::string{});
+                                const std::string body_b64 = j.value("body_b64", std::string{});
+
+                                // Always ACK so the sender can mark DELIVERED.
+                                if (!msg_id.empty()) {
+                                    nlohmann::json ack;
+                                    ack["type"] = "LP_RELIABLE_ACK";
+                                    ack["msg_id"] = msg_id;
+                                    const std::string ack_payload = ack.dump();
+                                    const std::string ack_msg =
+                                        wire::encode_message(MessageType::APPLICATION_ACK, ack_payload);
+                                    m_sm->send_message_to_peer(event.network_id, ack_msg);
+                                    Telemetry::getInstance().inc_counter("tx_reliable_acks_total");
+                                }
+
+                                // Dedup: fire onMessageReceived at most once per msg_id.
+                                const bool dup = m_sm->m_reliable_send_manager &&
+                                                 m_sm->m_reliable_send_manager->is_duplicate(msg_id);
+                                if (!dup && m_sm->m_message_received_cb) {
+                                    const std::string body = reliable_base64_decode(body_b64);
+                                    m_sm->m_message_received_cb(peer_id, body);
+                                }
+                                break;
+                            }
+                        } catch (...) {
+                            // Fall through to legacy handling.
+                        }
+                    }
+                }
+
                 // App-level ACK protocol (LP_APP envelope)
                 // ------------------------------------------------------------
                 // Expected payload (JSON):
@@ -920,6 +982,24 @@ namespace detail {
 
             case MessageType::APPLICATION_ACK: {
                 Telemetry::getInstance().inc_counter("rx_app_acks_total");
+
+                // Reliable-send ACK (v0.4): {"type":"LP_RELIABLE_ACK","msg_id":"..."}
+                if (!payload.empty() && payload.front() == '{' &&
+                    payload.find("LP_RELIABLE_ACK") != std::string::npos) {
+                    try {
+                        const auto j = nlohmann::json::parse(payload);
+                        if (j.is_object() && j.value("type", std::string{}) == "LP_RELIABLE_ACK") {
+                            const std::string msg_id = j.value("msg_id", std::string{});
+                            if (!msg_id.empty() && m_sm->m_reliable_send_manager) {
+                                m_sm->m_reliable_send_manager->on_ack(msg_id);
+                            }
+                            break;
+                        }
+                    } catch (...) {
+                        // ignore; fall through
+                    }
+                }
+
                 if (!payload.empty() && payload.front() == '{') {
                     // Cheap substring gate
                     if (payload.find("LP_APP_ACK") != std::string::npos && payload.find("\"msg_id\"") != std::string::npos) {

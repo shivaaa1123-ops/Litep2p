@@ -591,9 +591,12 @@ int main() {
         CHECK(bob->router->stats().auth_fail_total == 0, "no auth failures on valid path");
     }
     {
-        // require_origin_auth=true drops unsigned payloads.
+        // Origin-auth enforcement. As of 0.3.0 the DEFAULT config requires
+        // origin signatures, so an unsigned payload is dropped out of the box.
+        // Explicitly relaxing the knob (require_origin_auth=false) restores
+        // delivery of unsigned payloads for pre-Phase-B interop.
         Mesh mesh;
-        Node* bob = mesh.make("bob", false);
+        Node* bob = mesh.make("bob", false);  // default cfg: require_origin_auth=true
 
         // Build an UNSIGNED deliver frame by hand (seal_final without keys).
         overlay::FinalPayload fp;
@@ -610,30 +613,36 @@ int main() {
         uint8_t fid[overlay::kFrameIdSize];
         overlay::random_frame_id(fid);
         bob->router->on_frame("relay1", overlay::encode_frame(0, 4, fid, body));
-        CHECK(bob->has_payload("unsigned intruder"), "unsigned delivered when not enforced");
+        CHECK(!bob->has_payload("unsigned intruder"),
+              "default config drops unsigned payload");
+        CHECK(bob->router->stats().auth_fail_total == 1,
+              "default config counted the unsigned payload as an auth failure");
 
-        // Now enforce: unsigned must be dropped.
+        // Explicitly relax the knob: unsigned must now be delivered (legacy).
         OverlayRouter::Config cfg{};
-        cfg.require_origin_auth = true;
+        cfg.require_origin_auth = false;
         cfg.tick_interval_ms = 200;
-        OverlayRouter strict(cfg);
-        strict.set_local_identity("bob", bob->keys.pk, bob->keys.sk);
-        strict.set_peer_key_fn([&mesh](const std::string& p) {
+        std::string lenient_payload;
+        OverlayRouter lenient(cfg);
+        lenient.set_local_identity("bob", bob->keys.pk, bob->keys.sk);
+        lenient.set_peer_key_fn([&mesh](const std::string& p) {
             auto it = mesh.key_dir.find(p);
             return it == mesh.key_dir.end() ? std::vector<uint8_t>{} : it->second;
         });
-        strict.set_peer_signing_key_fn([&mesh](const std::string& p) {
+        lenient.set_peer_signing_key_fn([&mesh](const std::string& p) {
             auto it = mesh.sign_dir.find(p);
             return it == mesh.sign_dir.end() ? std::vector<uint8_t>{} : it->second;
         });
-        strict.set_deliver_fn([](const std::string&, const std::string&) {});
-        strict.start();
+        lenient.set_deliver_fn(
+            [&lenient_payload](const std::string&, const std::string& p) { lenient_payload = p; });
+        lenient.start();
 
         uint8_t fid2[overlay::kFrameIdSize];
         overlay::random_frame_id(fid2);
-        strict.on_frame("relay1", overlay::encode_frame(0, 4, fid2, body));
-        CHECK(strict.stats().auth_fail_total == 1, "require_origin_auth dropped unsigned frame");
-        strict.stop();
+        lenient.on_frame("relay1", overlay::encode_frame(0, 4, fid2, body));
+        CHECK(lenient_payload == "unsigned intruder",
+              "require_origin_auth=false delivers unsigned payload (legacy interop)");
+        lenient.stop();
     }
 
     // ------------------------------------------------------------------
@@ -717,6 +726,10 @@ int main() {
             c.obfuscate_transport = true;
             c.padding_bucket = 128;
             c.tick_interval_ms = 200;
+            // This test isolates obfuscation + padding. Origin auth now defaults
+            // ON and would drop these unsigned, manually-wired payloads; it is
+            // covered end-to-end in test 14 and across the mesh suites.
+            c.require_origin_auth = false;
             return c;
         };
 
@@ -788,6 +801,83 @@ int main() {
         sender.stop();
         relayer.stop();
         receiver.stop();
+    }
+
+    // ------------------------------------------------------------------
+    // 18. Secure defaults + mixed-obfuscation interop:
+    //     (a) a default-constructed Config ships censorship resistance ON;
+    //     (b) the receive path auto-detects OBF1 by magic, so an obfuscated
+    //         frame reaches a receiver with obfuscation disabled, and a plain
+    //         LPX2 frame reaches a receiver with obfuscation enabled.
+    // ------------------------------------------------------------------
+    {
+        // (a) Default pinning — guards against regressions to insecure defaults.
+        const OverlayRouter::Config dflt{};
+        CHECK(dflt.obfuscate_transport, "default: obfuscate_transport ON");
+        CHECK(dflt.padding_bucket == 128, "default: padding_bucket = 128");
+        CHECK(dflt.cover_interval_ms == 30000, "default: cover_interval_ms = 30000");
+        CHECK(dflt.pex_interval_ms == 60000, "default: pex_interval_ms = 60000");
+        CHECK(dflt.require_origin_auth, "default: require_origin_auth ON");
+
+        // (b) Mixed interop at the frame level. Build a signed Deliver frame
+        //     sealed to bob, then exercise both directions of the config mix.
+        const KeyPair bob = gen_key();
+        const SignKeyPair alice_sign = gen_sign_key();
+
+        overlay::FinalPayload fp;
+        fp.origin_peer_id = "alice";
+        fp.created_ts_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        fp.app_payload = "across the config divide";
+        const std::string inner =
+            overlay::seal_final(bob.pk, fp, alice_sign.sk.data(), alice_sign.pk.data());
+        overlay::HopInstruction term;
+        term.kind = overlay::HopKind::Deliver;
+        term.inner = inner;
+        const std::string body = overlay::seal_hop(bob.pk, term);
+        uint8_t fid[overlay::kFrameIdSize];
+        overlay::random_frame_id(fid);
+        const std::string plain_wire = overlay::encode_frame(0, 4, fid, body);
+
+        auto make_bob = [&](bool obfuscate_on, std::string* out) {
+            OverlayRouter::Config cfg{};
+            cfg.obfuscate_transport = obfuscate_on;
+            cfg.require_origin_auth = false;  // isolate the envelope handling
+            cfg.tick_interval_ms = 200;
+            auto r = std::make_unique<OverlayRouter>(cfg);
+            r->set_local_identity("bob", bob.pk, bob.sk);
+            r->set_deliver_fn([out](const std::string&, const std::string& p) { *out = p; });
+            r->start();
+            return r;
+        };
+
+        // Direction 1: OBF1-wrapped frame -> receiver with obfuscation OFF.
+        const KeyPair alice = gen_key();
+        const std::string obf_wire =
+            overlay::obfuscate_wrap(bob.pk, alice.sk, plain_wire, 0);
+        CHECK(!obf_wire.empty(), "obfuscate_wrap produced an envelope");
+        CHECK(obf_wire.find("LPX2") == std::string::npos, "OBF1 hides the LPX2 magic");
+
+        std::string got1;
+        auto bob_plain = make_bob(false, &got1);  // obfuscation OFF
+        bob_plain->on_frame("alice", obf_wire);
+        CHECK(got1 == "across the config divide",
+              "obfuscated frame delivered to obfuscation-OFF receiver");
+        CHECK(bob_plain->stats().obf_ok_total == 1,
+              "obfuscation-OFF receiver auto-unwrapped the OBF1 envelope");
+        bob_plain->stop();
+
+        // Direction 2: plain LPX2 frame -> receiver with obfuscation ON.
+        std::string got2;
+        auto bob_obf = make_bob(true, &got2);  // obfuscation ON
+        uint8_t fid2[overlay::kFrameIdSize];
+        overlay::random_frame_id(fid2);
+        const std::string plain_wire2 = overlay::encode_frame(0, 4, fid2, body);
+        bob_obf->on_frame("alice", plain_wire2);
+        CHECK(got2 == "across the config divide",
+              "plain frame delivered to obfuscation-ON receiver");
+        bob_obf->stop();
     }
 
     return suite_exit("overlay_test");

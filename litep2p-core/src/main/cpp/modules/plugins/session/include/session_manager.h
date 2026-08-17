@@ -51,6 +51,12 @@ public:
     void sendMessageToPeer(const std::string& peer_id, const std::string& message);
     bool isPeerConnected(const std::string& peer_id) const;
 
+    // v0.4 backpressure: number of plain-send events currently queued in the
+    // engine event loop (accepted but not yet handed to the transport). Used
+    // by the C ABI to return LITEP2P_ERR_QUEUE_FULL and to expose the
+    // litep2p_pending_send_count() metric.
+    int pendingSendCount() const;
+
     // Expose the Peer FSM state as a stable string for UI/debugging.
     // This is intentionally best-effort and returns "UNKNOWN" if the peer context is missing.
     std::string getPeerFsmState(const std::string& peer_id) const;
@@ -171,6 +177,54 @@ public:
     // Override reconnect policy behavior. Accepted values: "auto", "aggressive", "balanced", "power_saver".
     void set_reconnect_mode(const std::string& mode);
     std::string get_reconnect_status_json() const;
+
+    // ==================== Reliable messaging (v0.4, ask.md §1/§2) ====================
+    // Send with delivery guarantees: persistent outbox, retry, receiver dedup,
+    // and offline store-and-forward via the signaling server. Returns true when
+    // accepted into the outbox. Status is reported via the delivery-status
+    // callback (QUEUED/SENT/DELIVERED/FAILED + machine-readable reason).
+    bool send_reliable(const std::string& peer_id, const std::string& msg_id,
+                       const std::string& payload, int max_retries, uint32_t retry_timeout_ms);
+    bool cancel_reliable(const std::string& msg_id);
+
+    // v0.4 backpressure metrics: outbox occupancy of the reliable-send queue.
+    // reliable_outbox_full() is true when send_reliable would reject with
+    // QUEUE_FULL; reliable_pending_count() counts QUEUED/SENT messages.
+    bool reliable_outbox_full() const;
+    size_t reliable_pending_count() const;
+
+    using DeliveryStatusCallback =
+        std::function<void(const std::string& msg_id, int status, const std::string& reason)>;
+    void set_delivery_status_callback(DeliveryStatusCallback cb);
+
+    // ==================== Presence & reachability (v0.4, ask.md §5) ====================
+    // Cheap liveness probe; result via the ping callback (rtt_ms >= 0, or -1
+    // on timeout). Works for connected peers without extra app plumbing.
+    using PingResultCallback = std::function<void(const std::string& peer_id, int64_t rtt_ms)>;
+    void set_ping_result_callback(PingResultCallback cb);
+    bool ping_peer(const std::string& peer_id, uint32_t timeout_ms);
+
+    // Server-assisted presence. Subscribed peers get transition updates via
+    // the presence callback; works without holding an open session.
+    using PresenceCallback =
+        std::function<void(const std::string& peer_id, bool online, int64_t last_seen_ms)>;
+    void set_presence_callback(PresenceCallback cb);
+    bool subscribe_presence(const std::vector<std::string>& peer_ids);
+
+    // Epoch ms when the peer was last observed online (0 = never).
+    int64_t get_peer_last_seen_ms(const std::string& peer_id) const;
+
+    // ==================== Identity directory & invites (v0.4, ask.md §3) ====================
+    using LookupResultCallback = std::function<void(const std::string& alias,
+                                                    const std::string& peer_id,
+                                                    bool online, int64_t last_seen_ms)>;
+    using InviteCallback = std::function<void(const std::string& from_peer_id)>;
+    void set_lookup_result_callback(LookupResultCallback cb);
+    void set_invite_callback(InviteCallback cb);
+
+    bool register_alias(const std::string& alias_hash);
+    bool lookup_peer(const std::string& alias_hash);
+    bool invite_peer(const std::string& peer_id);
 
 // private:
     class Impl;

@@ -5,7 +5,7 @@ engine with a Kotlin API, distributed as an AAR.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Android%20(minSdk%2024)-brightgreen)](litep2p-core/build.gradle.kts)
-[![Version](https://img.shields.io/badge/version-0.3.0-orange)](gradle.properties)
+[![Version](https://img.shields.io/badge/version-0.4.0-orange)](gradle.properties)
 
 > **Status:** `0.x` pre-release. The public contract is the C ABI
 > (`litep2p.h`) + the Kotlin wrapper; expect breaking changes until `1.0`.
@@ -26,16 +26,32 @@ without dealing with P2P complexity:
   (`TCP` / `UDP` / `QUIC` / `ALL` / `AUTO`)
 - **Security** — Noise NK encrypted sessions (libsodium), per-peer transport
   keys, Ed25519 origin authentication
-- **Messaging** — binary-safe, fire-and-forget sends with an optional
-  app-layer ACK envelope protocol
+- **Messaging** — binary-safe fire-and-forget sends **plus v0.4 reliable
+  sends**: at-least-once delivery with engine-level receipts
+  (`sendReliable` → `onDeliveryStatus`), a persistent outbox that survives
+  restarts, receiver-side dedup, and store-and-forward offline mailboxes via
+  the signaling server; explicit `QUEUE_FULL` backpressure with live gauges
+  (`pendingSendCount()` / `reliablePendingCount()`). (The legacy app-layer
+  ACK envelope protocol remains for interop/latency measurement.)
 - **File transfer** — offer/accept model, chunking, congestion control,
   pause/resume/cancel, checkpointing
 - **Overlay routing (LPX2)** — multi-hop onion-style relay routing with
-  offline mailboxes, bounded-reliable delivery, replay protection, cover
-  traffic and transport obfuscation (censorship resistance)
+  offline mailboxes, bounded-reliable delivery, replay protection, and
+  secure-by-default censorship resistance (OBF1 transport obfuscation,
+  length padding, Ed25519 origin authentication — all opt-out; relay role
+  opt-in; see `docs/censorship-resistance.md`)
 - **Operations** — first-class telemetry (counters, gauges, latency
   histograms, connection paths), environment hints (battery/network),
   reconnect policies, single-thread mode for reduced resource usage
+- **Identity & presence (v0.4)** — opaque alias directory on the signaling
+  server (`registerAlias` / `lookupPeer` / `invitePeer`), server-assisted
+  presence + last-seen (`subscribePresence` / `onPresence`), cheap RTT pings
+  (`ping`), and `PeerInfo.lastSeenMs`
+- **Turnkey Android runtime (v0.4)** — `LiteP2PRuntime.start(context)` boots
+  the engine in an SDK-owned foreground service: wakelocks, manifest-merged
+  permissions, automatic network/battery/Doze hints, sticky restore after
+  process death, and a bundled default config + stable peer id. Correct
+  background operation in one line.
 
 ## Architecture
 
@@ -70,13 +86,21 @@ Publish to Maven Local (or depend on the module/AAR directly — all options in
 // settings.gradle.kts — repositories { mavenLocal(); google(); mavenCentral() }
 // app/build.gradle.kts
 dependencies {
-    implementation("com.zeengal:litep2p-core:0.3.0")
+    implementation("com.zeengal:litep2p-core:0.4.0")
 }
 ```
 
 ```kotlin
 import com.zeengal.litep2p.core.*
 
+// ── Zero-config path (v0.4) ─────────────────────────────────────────────
+// One line: foreground service, wakelocks, permissions (manifest-merged),
+// network/battery/Doze hints, sticky restore, default config + peer id.
+LiteP2PRuntime.start(context)
+// … later:
+LiteP2PRuntime.stop(context)
+
+// ── Manual path (same engine, full control) ─────────────────────────────
 // 1. Register listeners BEFORE starting (callbacks arrive on engine threads).
 LiteP2P.addListener(object : LiteP2PListener {
     override fun onEngineStarted() { /* engine is up */ }
@@ -96,14 +120,16 @@ LiteP2P.init(
 LiteP2P.start()
 
 // 4. Send / receive, then stop when done.
-LiteP2P.send(peerId, "hello".toByteArray())
+LiteP2P.send(peerId, "hello".toByteArray())                 // fire-and-forget
+LiteP2P.sendReliable(peerId, msgId, "must arrive".toByteArray()) // with receipts
 LiteP2P.stop()
 LiteP2P.shutdown()
 ```
 
-Reactive variants (`stateFlow`, `messagesFlow`, `startAndAwait()`) and the
-full API reference (file transfer, overlay, proxy, telemetry, environment
-hints) are in [docs/api-spec.md §5](docs/api-spec.md).
+Reactive variants (`stateFlow`, `messagesFlow`, `deliveryStatusFlow`,
+`presenceFlow`, `startAndAwait()`) and the full API reference (reliable
+messaging, aliases/invites, presence/ping, file transfer, overlay, proxy,
+telemetry, environment hints) are in [docs/api-spec.md §5](docs/api-spec.md).
 
 ## Building
 

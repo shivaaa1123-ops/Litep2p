@@ -24,6 +24,7 @@
 #include "wire_codec.h"
 #include "local_peer_db.h"
 #include "rugged_recovery_manager.h"
+#include "reliable_send_manager.h"
 #if ENABLE_PROXY_MODULE
 #include "proxy_endpoint.h"
 #endif
@@ -122,6 +123,29 @@ public:
 
     void enable_noise_nk();
     bool is_noise_nk_enabled() const;
+
+    // ==================== v0.4: reliable messaging / presence / directory ====================
+    bool send_reliable(const std::string& peer_id, const std::string& msg_id,
+                       const std::string& payload, int max_retries, uint32_t retry_timeout_ms);
+    bool cancel_reliable(const std::string& msg_id);
+    bool reliable_outbox_full() const;
+    size_t reliable_pending_count() const;
+    void set_delivery_status_callback(SessionManager::DeliveryStatusCallback cb);
+
+    void set_ping_result_callback(SessionManager::PingResultCallback cb);
+    bool ping_peer(const std::string& peer_id, uint32_t timeout_ms);
+    void set_presence_callback(SessionManager::PresenceCallback cb);
+    bool subscribe_presence(const std::vector<std::string>& peer_ids);
+    int64_t get_peer_last_seen_ms(const std::string& peer_id) const;
+
+    void set_lookup_result_callback(SessionManager::LookupResultCallback cb);
+    void set_invite_callback(SessionManager::InviteCallback cb);
+    bool register_alias(const std::string& alias_hash);
+    bool lookup_peer(const std::string& alias_hash);
+    bool invite_peer(const std::string& peer_id);
+
+    // Presence bookkeeping (called from signaling handlers / peer lifecycle).
+    void note_peer_presence(const std::string& peer_id, bool online);
 
 private:
     friend class SessionManager;
@@ -494,4 +518,55 @@ private:
     std::atomic<bool> m_signaling_persistent_after_db_exhausted{false};
 
     static constexpr int MAX_QUEUED_MESSAGES = 100;
+
+    // v0.4 backpressure (ask.md honorable mention): number of SendMessageEvents
+    // accepted into the event loop but not yet dispatched to the transport.
+    // Incremented in sendMessageToPeer(), decremented when the event handler
+    // processes the event. litep2p_send() rejects with QUEUE_FULL once the
+    // configured limit is reached so callers get explicit backpressure instead
+    // of unbounded memory growth.
+    std::atomic<int> m_pending_sends{0};
+    int pending_send_count() const;
+
+    // ---------------------------------------------------------------------
+    // v0.4: reliable messaging, presence, identity directory
+    // ---------------------------------------------------------------------
+    std::unique_ptr<ReliableSendManager> m_reliable_send_manager;
+
+    // Callbacks (guarded by m_v04_cb_mutex).
+    mutable std::mutex m_v04_cb_mutex;
+    SessionManager::DeliveryStatusCallback m_delivery_status_cb;
+    SessionManager::PingResultCallback m_ping_result_cb;
+    SessionManager::PresenceCallback m_presence_cb;
+    SessionManager::LookupResultCallback m_lookup_result_cb;
+    SessionManager::InviteCallback m_invite_cb;
+
+    // Presence state: peer_id -> (online, last_seen_epoch_ms).
+    mutable std::mutex m_presence_mutex;
+    std::unordered_map<std::string, std::pair<bool, int64_t>> m_presence_state;
+    std::unordered_set<std::string> m_presence_subscribed;
+
+    // Last-seen epoch ms for all known peers (populated from sessions/signaling).
+    mutable std::mutex m_last_seen_mutex;
+    std::unordered_map<std::string, int64_t> m_peer_last_seen_epoch_ms;
+
+    // Pending app-level pings: peer_id -> (token, deadline steady_clock).
+    mutable std::mutex m_app_ping_mutex;
+    struct PendingPing {
+        uint64_t token;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::unordered_map<std::string, PendingPing> m_pending_pings;
+    // Expire app-level pings whose deadline passed without a PONG (fires -1).
+    void check_ping_timeouts_();
+
+    // Signaling protocol helpers (v0.4 messages over the signaling socket).
+    void signaling_send_store(const std::string& target_peer_id, const std::string& msg_id,
+                              const std::string& payload_b64);
+    void signaling_send_fetch();
+    void signaling_send_register_alias(const std::string& alias_hash);
+    void signaling_send_lookup(const std::string& alias_hash);
+    void signaling_send_invite(const std::string& target_peer_id);
+    void signaling_send_subscribe_presence(const std::vector<std::string>& peer_ids);
+    void handle_signaling_v04_message(const json& data);
 };

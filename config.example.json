@@ -44,6 +44,7 @@
         "heartbeat_interval_sec": 10,
         "peer_expiration_timeout_ms": 30000,
         "max_queued_messages": 100,
+        "max_pending_sends": 1000,
         "max_message_size": 10485760,
         "max_handshake_retries": 3
     },
@@ -168,6 +169,46 @@
         "enable_gateway": false,
         "enable_client": true,
         "enable_test_echo": false
+    },
+    "overlay": {
+        /*
+            Multi-hop overlay routing (LPX2) — censorship resistance.
+
+            SECURE BY DEFAULT (0.3.0): transport obfuscation, length padding,
+            and origin authentication ship ENABLED. Every knob below is an
+            OPT-OUT; omit the whole section to keep the secure defaults.
+            See docs/censorship-resistance.md for the full behavior spec.
+
+            - obfuscate_transport: wraps every outgoing overlay frame in an
+              OBF1 envelope (X25519 + XChaCha20-Poly1305) so the "LPX2" magic
+              is never visible on the wire. Incoming frames are auto-detected
+              by magic, so plain LPX2 frames from older/relaxed peers are
+              still accepted (mixed-config interop).
+            - padding_bucket: pads frames to multiples of this many bytes,
+              hiding real message lengths from DPI. 128 keeps the worst-case
+              frame (1216 B) under the IPv6 minimum MTU (1280 B). 0 disables.
+            - cover_interval_ms: relay-role nodes emit dummy cover frames
+              after this much idle time, obscuring silence/presence patterns.
+              Only nodes with relay_enabled=true ever emit cover traffic, so
+              default (non-relay) clients pay no cost. 0 disables.
+            - pex_interval_ms: relay-list exchange period; relay knowledge
+              spreads peer-to-peer without any central directory. 0 disables.
+            - require_origin_auth: drop overlay payloads without a valid
+              Ed25519 origin signature. All 0.3.0 nodes auto-generate signing
+              keys and sign every payload, so this breaks no legitimate
+              traffic. Set false only to interoperate with pre-Phase-B peers.
+            - relay_enabled: forwarding frames / holding mailboxes for other
+              peers stays OPT-IN (default false), matching the proxy-gateway
+              policy. Origin/destination roles need no opt-in.
+        */
+        "relay_enabled": false,
+        "default_hops": 2,
+        "relay_peers": [],
+        "obfuscate_transport": true,
+        "padding_bucket": 128,
+        "cover_interval_ms": 30000,
+        "pex_interval_ms": 60000,
+        "require_origin_auth": true
     },
     "global_discovery": {
         "enabled": false,

@@ -1,11 +1,33 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
     <!--
-        The engine needs network access. Consumers merge these permissions into their
-        manifest automatically; declared here so the library is self-contained.
+        Consumed by the manifest merger: an app that depends on litep2p-core
+        gets these permissions and the engine's foreground service without
+        touching its own manifest.
+
+        POST_NOTIFICATIONS (API 33+) is declared so the engine notification can
+        render by default; it is a runtime permission — apps that want the
+        notification visible on 13+ still request it once (the engine keeps
+        running either way, Android just hides the notification).
     -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application>
+        <!--
+            SDK-owned engine host (ask.md §4). Started via LiteP2PRuntime.start();
+            not exported since it is only ever started from within the app.
+        -->
+        <service
+            android:name="com.zeengal.litep2p.core.LiteP2PService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
 </manifest>

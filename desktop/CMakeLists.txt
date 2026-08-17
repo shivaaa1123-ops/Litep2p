@@ -4,7 +4,7 @@ project(LiteP2P_Desktop C CXX)
 # Single source of truth for the SDK version (mirrors gradle.properties
 # LITEP2P_VERSION). Override with: cmake -DLITEP2P_VERSION=x.y.z ..
 if(NOT DEFINED LITEP2P_VERSION)
-    set(LITEP2P_VERSION "0.3.0")
+    set(LITEP2P_VERSION "0.4.0")
 endif()
 
 # Derive the ABI version macros so desktop tests exercise the same version
@@ -150,6 +150,7 @@ set(SESSION_SOURCES
     ../litep2p-core/src/main/cpp/modules/plugins/session/src/session_cache.cpp
     ../litep2p-core/src/main/cpp/modules/plugins/session/src/tier_manager.cpp
     ../litep2p-core/src/main/cpp/modules/plugins/session/src/rugged_recovery_manager.cpp
+    ../litep2p-core/src/main/cpp/modules/plugins/session/src/reliable_send_manager.cpp
 )
 
 # Transport layer

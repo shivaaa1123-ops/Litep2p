@@ -1,0 +1,15 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!--
+        SDK default small icon for the LiteP2P foreground-service notification.
+        A simple "mesh" glyph: three connected nodes. Host apps override it via
+        LiteP2PRuntime.setNotificationSmallIcon() or by replacing this resource.
+        Notification small icons must be alpha-only; the system applies tinting.
+    -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,3.5a2.25,2.25 0 0,1 1.06,4.23l3.6,4.32a2.25,2.25 0 1,1 -1.38,1.15l-3.6,-4.32a2.26,2.26 0 0,1 -0.72,0l-3.6,4.32a2.25,2.25 0 1,1 -1.38,-1.15l3.6,-4.32A2.25,2.25 0 0,1 12,3.5zM5.25,14.5a1.25,1.25 0 1,0 0,2.5 1.25,1.25 0 0,0 0,-2.5zM18.75,14.5a1.25,1.25 0 1,0 0,2.5 1.25,1.25 0 0,0 0,-2.5zM12,4.5a1.25,1.25 0 1,0 0,2.5 1.25,1.25 0 0,0 0,-2.5z" />
+</vector>

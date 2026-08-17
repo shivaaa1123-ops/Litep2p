@@ -36,13 +36,13 @@ extern "C" {
 #define LITEP2P_VERSION_MAJOR 0
 #endif
 #ifndef LITEP2P_VERSION_MINOR
-#define LITEP2P_VERSION_MINOR 3
+#define LITEP2P_VERSION_MINOR 4
 #endif
 #ifndef LITEP2P_VERSION_PATCH
 #define LITEP2P_VERSION_PATCH 0
 #endif
 #ifndef LITEP2P_VERSION_STRING
-#define LITEP2P_VERSION_STRING "0.3.0"
+#define LITEP2P_VERSION_STRING "0.4.0"
 #endif
 
 /* Packed version: major<<16 | minor<<8 | patch. */
@@ -79,6 +79,7 @@ typedef enum litep2p_result {
     LITEP2P_ERR_TIMEOUT       =  -6,
     LITEP2P_ERR_UNSUPPORTED   =  -7,  /* feature compiled out / not wired yet */
     LITEP2P_ERR_NO_ROUTE      =  -8,  /* overlay: no relay path available */
+    LITEP2P_ERR_QUEUE_FULL    = -10,  /* v0.4: send rejected, engine queue at capacity */
     LITEP2P_ERR_INTERNAL      = -99,
 } litep2p_result_t;
 
@@ -161,6 +162,9 @@ typedef struct litep2p_peer_info {
     char connection_path[32];    /* "LAN_DIRECT" | "WAN_HOLE_PUNCH" | "TURN_RELAY"
                                   * | "SIGNALING_RELAY" | "UNKNOWN" */
     char fsm_state[32];          /* best-effort peer FSM state string */
+    int64_t last_seen_ms;        /* v0.4: epoch ms when the peer was last observed
+                                  * online (session, discovery, or signaling);
+                                  * 0 when never seen */
 } litep2p_peer_info_t;
 
 typedef struct litep2p_callbacks {
@@ -189,6 +193,33 @@ typedef struct litep2p_callbacks {
      * want_ack overlay sends when the destination ACKs (delivered=1) or the
      * bounded retry budget is exhausted (delivered=0). */
     void (*on_overlay_delivery)(void* user_data, const char* frame_id, int delivered);
+
+    /* Reliable-send delivery receipts (v0.4, ask.md §1). msg_id is the
+     * caller-supplied id passed to litep2p_send_reliable().
+     * status: 0=QUEUED 1=SENT 2=DELIVERED 3=FAILED.
+     * reason: "OK" | "NO_ROUTE" | "PEER_OFFLINE" | "QUEUE_FULL" | "TIMEOUT"
+     *         | "TTL_EXPIRED" | "CANCELLED" (machine-readable). */
+    void (*on_delivery_status)(void* user_data, const char* msg_id,
+                               int status, const char* reason);
+
+    /* Presence updates (v0.4, ask.md §5). Fires for subscribed peers on
+     * online/offline transitions. last_seen_ms is epoch ms of the last time
+     * the peer was observed online (0 when unknown). */
+    void (*on_presence)(void* user_data, const char* peer_id, int online,
+                        int64_t last_seen_ms);
+
+    /* Ping result (v0.4, ask.md §5). rtt_ms >= 0 on success, -1 when the
+     * peer is unreachable within the timeout. */
+    void (*on_ping_result)(void* user_data, const char* peer_id, int64_t rtt_ms);
+
+    /* Alias lookup result (v0.4, ask.md §3). alias is the requested hash;
+     * peer_id is "" when the alias is unregistered. online/last_seen_ms
+     * reflect server-side presence knowledge. */
+    void (*on_lookup_result)(void* user_data, const char* alias, const char* peer_id,
+                             int online, int64_t last_seen_ms);
+
+    /* Invite received (v0.4, ask.md §3). from_peer_id is the inviter. */
+    void (*on_invite_received)(void* user_data, const char* from_peer_id);
 } litep2p_callbacks_t;
 
 /* Register the event callbacks. Must be called before litep2p_start() to
@@ -210,7 +241,64 @@ litep2p_result_t litep2p_peer_get_connection_path(const char* peer_id,
 /* ------------------------------------------------------------------------ */
 /* Messaging (§3.8) — fire-and-forget                                        */
 /* ------------------------------------------------------------------------ */
+/* Fire-and-forget send. LITEP2P_OK means "accepted into the send path", not
+ * "delivered". Failure reasons (v0.4, ask.md honorable mention):
+ *   LITEP2P_ERR_INVALID_STATE  engine not initialized / not RUNNING
+ *   LITEP2P_ERR_NOT_FOUND      peer unknown (never discovered/added)
+ *   LITEP2P_ERR_QUEUE_FULL     engine send queue at capacity — back off and
+ *                              retry, or use litep2p_send_reliable() which
+ *                              persists into the durable outbox instead. */
 litep2p_result_t litep2p_send(const char* peer_id, const uint8_t* data, uint32_t len);
+
+/* ------------------------------------------------------------------------ */
+/* Reliable messaging (v0.4, ask.md §1) — at-least-once with engine receipts */
+/* ------------------------------------------------------------------------ */
+/* Send a message with delivery guarantees. msg_id is caller-supplied (unique
+ * per message; the receiver dedupes on it). The engine persists the payload
+ * into an outbox under files_dir, retries every retry_timeout_ms until the
+ * peer ACKs or max_retries is exhausted, and — when the offline queue is
+ * enabled and the peer has no session — stores the message on the signaling
+ * server for delivery on the peer's next connect.
+ *
+ * Lifecycle is reported via on_delivery_status:
+ *   QUEUED -> SENT -> DELIVERED | FAILED(reason).
+ * Returns LITEP2P_OK when accepted into the persistent outbox. Plain
+ * litep2p_send() semantics are unchanged (fire-and-forget). */
+litep2p_result_t litep2p_send_reliable(const char* peer_id, const char* msg_id,
+                                       const uint8_t* data, uint32_t len,
+                                       int max_retries, uint32_t retry_timeout_ms);
+
+/* Cancel a pending reliable send (no further retries / offline store).
+ * Fires on_delivery_status(FAILED, "CANCELLED") when the id was known. */
+litep2p_result_t litep2p_reliable_cancel(const char* msg_id);
+
+/* ------------------------------------------------------------------------ */
+/* Presence & reachability (v0.4, ask.md §5)                                 */
+/* ------------------------------------------------------------------------ */
+/* Cheap liveness probe without holding a full session open. The result is
+ * delivered via on_ping_result: rtt_ms >= 0 on success, -1 after timeout. */
+litep2p_result_t litep2p_ping(const char* peer_id, uint32_t timeout_ms);
+
+/* Subscribe to server-assisted presence for a set of peers. The engine asks
+ * the signaling server for current state and then receives transition
+ * updates via on_presence. Works without holding an open session. */
+litep2p_result_t litep2p_subscribe_presence(const char* const* peer_ids, uint32_t count);
+
+/* ------------------------------------------------------------------------ */
+/* Identity directory & invites (v0.4, ask.md §3)                            */
+/* ------------------------------------------------------------------------ */
+/* Register a stable lookup alias (e.g. SHA-256 of a normalized phone number)
+ * for this peer on the signaling server. Alias values are opaque hashes —
+ * the server never sees raw identifiers. Persisted server-side. */
+litep2p_result_t litep2p_register_alias(const char* alias_hash);
+
+/* Resolve an alias hash to a peer id (+ presence). Result delivered via
+ * on_lookup_result; resolves even when the target peer is offline. */
+litep2p_result_t litep2p_lookup_peer(const char* alias_hash);
+
+/* Nudge a remote/offline peer to connect via a signaling push. The target
+ * receives on_invite_received and typically responds with litep2p_connect(). */
+litep2p_result_t litep2p_invite_peer(const char* peer_id);
 
 /* ------------------------------------------------------------------------ */
 /* Security — Noise NK (§3.9)                                                */
@@ -320,6 +408,19 @@ litep2p_result_t litep2p_set_reconnect_mode(const char* mode);
  * NUL-terminated JSON string the caller must free with litep2p_free(). Also
  * delivered via the on_telemetry callback when one is registered. */
 litep2p_result_t litep2p_telemetry_snapshot(char** out_json);
+
+/* ------------------------------------------------------------------------ */
+/* Backpressure metrics (v0.4)                                               */
+/* ------------------------------------------------------------------------ */
+/* Number of plain-send events currently queued in the engine event loop
+ * (accepted by litep2p_send() but not yet handed to the transport). Use to
+ * gauge backpressure before sending bursts; litep2p_send() starts returning
+ * LITEP2P_ERR_QUEUE_FULL once the internal limit is reached. */
+uint32_t litep2p_pending_send_count(void);
+
+/* Number of reliable sends currently in the durable outbox (QUEUED or SENT,
+ * i.e. not yet DELIVERED/FAILED). Bounded by offline_queue.max_messages. */
+uint32_t litep2p_reliable_pending_count(void);
 
 /* Free memory returned by the engine (e.g. litep2p_telemetry_snapshot). */
 void litep2p_free(void* ptr);

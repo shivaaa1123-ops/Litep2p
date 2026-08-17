@@ -66,6 +66,9 @@ public:
     // Peer Management
     int getHeartbeatIntervalSec() const;
     int getPeerExpirationTimeoutMs() const;
+    // v0.4 backpressure: max plain-send events allowed in the engine event
+    // queue before litep2p_send() returns LITEP2P_ERR_QUEUE_FULL.
+    int getMaxPendingSends() const;
 
     // Event Manager
     int getEventQueueWaitTimeoutMs() const;
@@ -128,6 +131,14 @@ public:
     bool isSignalingEnabled() const;
     std::string getSignalingUrl() const;
     int getSignalingReconnectIntervalMs() const;
+
+    // Offline queue (store-and-forward mailbox, v0.4 ask.md §2)
+    bool isOfflineQueueEnabled() const;
+    int getOfflineQueueMaxMessages() const;
+    int64_t getOfflineQueueTtlMs() const;
+    // Directory for the persistent reliable-send outbox (set by the C ABI from
+    // files_dir; empty = outbox persistence disabled).
+    std::string getReliableOutboxDir() const;
 
     // Reconnect Policy
     std::string getReconnectPolicyMode() const;

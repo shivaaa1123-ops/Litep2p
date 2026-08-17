@@ -114,6 +114,12 @@ dependencies {
     // The core library deliberately avoids AndroidX UI dependencies; only annotations.
     implementation(libs.androidx.annotation)
 
+    // Used by the SDK runtime (LiteP2PService / LiteP2PRuntime / EnvironmentHints)
+    // for NotificationCompat / ContextCompat / ServiceCompat, and exposed in
+    // LiteP2PRuntime's public API (notificationCustomizer receives a
+    // NotificationCompat.Builder), hence `api`.
+    api(libs.androidx.core.ktx)
+
     // Exposed in the public API (Flow / StateFlow / suspend helpers), so it is
     // declared with `api` to propagate transitively to consumers.
     api(libs.kotlinx.coroutines.core)

@@ -323,6 +323,12 @@ int ConfigManager::getPeerExpirationTimeoutMs() const {
     return jsonGetOr<int>(m_config, {"peer_management", "peer_expiration_timeout_ms"}, 30000);
 }
 
+int ConfigManager::getMaxPendingSends() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 1000;
+    return jsonGetOr<int>(m_config, {"peer_management", "max_pending_sends"}, 1000);
+}
+
 int ConfigManager::getEventQueueWaitTimeoutMs() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return 100;
@@ -717,6 +723,30 @@ int ConfigManager::getSignalingReconnectIntervalMs() const {
     // want multiple retries inside the strict <=8s recovery window.
     if (!m_config.is_object()) return 1000;
     return jsonGetOr<int>(m_config, {"signaling", "reconnect_interval_ms"}, 1000);
+}
+
+bool ConfigManager::isOfflineQueueEnabled() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return true;
+    return jsonGetOr<bool>(m_config, {"offline_queue", "enabled"}, true);
+}
+
+int ConfigManager::getOfflineQueueMaxMessages() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 500;
+    return jsonGetOr<int>(m_config, {"offline_queue", "max_messages"}, 500);
+}
+
+int64_t ConfigManager::getOfflineQueueTtlMs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 604800000;  // 7 days
+    return jsonGetOr<int64_t>(m_config, {"offline_queue", "ttl_ms"}, static_cast<int64_t>(604800000));
+}
+
+std::string ConfigManager::getReliableOutboxDir() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return "";
+    return jsonGetOr<std::string>(m_config, {"storage", "reliable_outbox", "dir"}, "");
 }
 
 bool ConfigManager::isPeerDbEnabled() const {

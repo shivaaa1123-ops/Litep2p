@@ -6,6 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/). The SDK version is
 single-sourced from `LITEP2P_VERSION` in `gradle.properties` and mirrored in
 `litep2p.h` (`LITEP2P_VERSION_*`) and `LiteP2P.version`.
 
+## [0.4.0] - Unreleased
+
+### Added
+- **Reliable messaging with receipts**: `litep2p_send_reliable` /
+  `LiteP2P.sendReliable` persist sends into a durable outbox and retry until
+  delivered; delivery progress arrives via `onDeliveryStatus`
+  (`QUEUED → SENT → DELIVERED`/`FAILED`). Plain `litep2p_send` is
+  receipt-eligible when the peer supports it (`onMessageAcked`).
+- **Store-and-forward mailboxes**: relay-capable peers hold mail for offline
+  peers (bounded, TTL'd); offline peers collect with
+  `litep2p_pickup_mailbox` / `LiteP2P.pickupMailbox`.
+- **Alias / invite directory**: human-readable aliases registered through the
+  signaling server (`litep2p_register_alias`, `litep2p_lookup_alias`,
+  `litep2p_invite_peer`); results via `onLookupResult` / `onInviteReceived`.
+- **Presence, ping, lastSeen**: `litep2p_ping` / `LiteP2P.ping` (RTT via
+  `onPingResult`), presence transitions via `onPresence(peerId, online,
+  lastSeenMs)`, and `PeerInfo.lastSeenMs` in peer snapshots.
+- **Native send backpressure**: the engine caps queued send events at
+  `peer_management.max_pending_sends` (default 1000) and the reliable outbox
+  at `offline_queue.max_messages` — beyond the caps, sends fail fast with the
+  new `QUEUE_FULL` result (`LITEP2P_ERR_QUEUE_FULL = -10`) instead of growing
+  unbounded. New metrics expose live pressure:
+  `litep2p_pending_send_count` / `litep2p_reliable_pending_count` and Kotlin
+  `LiteP2P.pendingSendCount()` / `LiteP2P.reliablePendingCount()`.
+- **Turnkey Android runtime (Feature 4)**: `LiteP2PRuntime.start(context,
+  config?)` boots the engine inside the SDK-owned `LiteP2PService` — a
+  `START_STICKY` foreground service (`dataSync`) holding the partial
+  wakelock + Wi-Fi/multicast locks, auto-restoring the engine after process
+  kills (persisted config), wiring network/battery/Doze hints into the engine
+  (`EnvironmentHints`), and creating first-run defaults (stable peer id +
+  bundled `litep2p_default_config.json` extracted from AAR assets).
+  Notification is overridable (icon/title/text/launch-activity/builder hook).
+  Permissions and the service declaration ship via manifest merging; the
+  library now depends on `androidx.core` (`api`).
+- **Signaling server v0.4 protocol**: alias registration/lookup, invites,
+  presence + `lastSeenMs`, and mailbox STORE/DELIVER ops — covered by an
+  end-to-end smoke test (`tools/signaling_server/smoke_test.py`).
+
+### Changed
+- `docs/api-spec.md` §6.3 (backpressure), §13.3 (service integration now
+  points at `LiteP2PRuntime` instead of "copy the harness pattern"), §13.4
+  (hints auto-wired under the runtime), §15 (QUEUE_FULL).
+- `config.example.json` documents `peer_management.max_pending_sends`.
+
 ## [0.3.0] - Unreleased
 
 ### Added
@@ -48,6 +92,17 @@ single-sourced from `LITEP2P_VERSION` in `gradle.properties` and mirrored in
   `:litep2p-core` and must not leak into the library's public API.
 - Desktop build mirrors the Android version macros so tests exercise the same
   version string.
+- **Overlay censorship resistance is now secure by default**:
+  `obfuscate_transport=true` (OBF1 envelopes on every outgoing frame; the
+  receive path auto-detects envelopes by magic, so plain LPX2 frames from
+  relaxed/legacy peers still interoperate), `padding_bucket=128` (worst-case
+  frame 1216 B stays under the IPv6 minimum MTU of 1280 B),
+  `cover_interval_ms=30000` and `pex_interval_ms=60000` (cover traffic is
+  emitted by relay-role nodes only, so default clients pay no cost), and
+  `require_origin_auth=true` (nodes auto-generate Ed25519 signing keys and
+  sign every payload, so enforcement breaks no legitimate traffic). The
+  relay role remains opt-in. All knobs stay configurable under the `overlay`
+  object in `config.json`; see `docs/censorship-resistance.md`.
 
 ### Fixed
 - Desktop `ENABLE_OVERLAY_MODULE` option ordering (overlay was silently

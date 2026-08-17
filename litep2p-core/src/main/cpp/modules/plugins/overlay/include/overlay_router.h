@@ -67,23 +67,41 @@ public:
         uint64_t replay_window_ms{15ull * 60 * 1000};  // reject sealed payloads older than this
 
         // ---- Phase B: censorship resistance --------------------------------
+        // SECURE BY DEFAULT (0.3.0): every knob below ships enabled. Each can
+        // still be relaxed via the `overlay` object in config.json, but the
+        // stock configuration must resist DPI and traffic analysis out of the
+        // box — opt-out, never opt-in.
+        //
         // Cover traffic: pad every LPX2 frame to the next multiple of
         // `padding_bucket` bytes (0 = off). All frames from a node then fall
         // into a small set of sizes, hiding real message lengths from DPI.
-        size_t padding_bucket{0};
-        // Obfuscated transport: wrap every hop frame in the OBF1 envelope so
-        // the "LPX2" magic is never visible on the wire. Both peers must agree.
-        bool obfuscate_transport{false};
+        // 128 keeps the worst case (1100 B frame + 78 B OBF1 overhead = 1178
+        // -> 1216 B) under the IPv6 minimum MTU of 1280, so overlay frames
+        // never force IP fragmentation. Do not raise above ~192 without
+        // re-checking that bound.
+        size_t padding_bucket{128};
+        // Obfuscated transport: wrap every outgoing hop frame in the OBF1
+        // envelope so the "LPX2" magic is never visible on the wire. The
+        // receive path auto-detects OBF1 by magic, so legacy plain LPX2
+        // frames are still accepted (mixed-config interop).
+        bool obfuscate_transport{true};
         // Emit cover (dummy) frames when no real traffic has been sent for
         // this many ms (0 = off). Obscures silence / presence patterns.
-        uint64_t cover_interval_ms{0};
+        // Only nodes with the relay role enabled ever emit cover traffic, so
+        // this costs nothing on default (non-relay) mobile clients.
+        uint64_t cover_interval_ms{30000};
         // Relay-list exchange period (ms). 0 = off. Peers also answer a PEX
-        // whenever they receive a relay advertisement (B5).
-        uint64_t pex_interval_ms{0};
-        // Reject unsigned FinalPayloads entirely (origin authentication). When
-        // false, unsigned payloads are delivered (backward compatible) but the
-        // origin's signature is still verified when present.
-        bool require_origin_auth{false};
+        // whenever they receive a relay advertisement (B5). Periodic PEX
+        // spreads relay knowledge without any central directory.
+        uint64_t pex_interval_ms{60000};
+        // Reject unsigned FinalPayloads entirely (origin authentication). All
+        // 0.3.0 nodes auto-generate an Ed25519 signing keypair and sign every
+        // payload, so enforcing signatures breaks no legitimate traffic. Set
+        // false only to interoperate with pre-Phase-B senders. NOTE: identity
+        // BINDING (dropping payloads signed by the wrong key for a claimed
+        // origin) additionally requires registering the origin's signing key
+        // (litep2p_overlay_register_peer_signing_key).
+        bool require_origin_auth{true};
     };
 
     enum class SendResult {

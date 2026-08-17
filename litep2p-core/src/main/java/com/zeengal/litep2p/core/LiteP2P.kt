@@ -274,11 +274,128 @@ object LiteP2P {
     /**
      * Fire-and-forget send: [EngineResult.OK] means the message was accepted into
      * the send path, not that it was delivered (api-spec.md §3.8).
+     *
+     * Failure reasons (v0.4):
+     *  - [EngineResult.INVALID_ARG] — blank peer id or empty payload
+     *  - [EngineResult.INVALID_STATE] — engine not initialized / not running
+     *  - [EngineResult.NOT_FOUND] — peer unknown (never discovered/added)
+     *  - [EngineResult.QUEUE_FULL] — engine send queue at capacity; back off
+     *    and retry, or use [sendReliable] which persists into the durable
+     *    outbox instead. Check [pendingSendCount] to gauge backpressure.
      */
     fun send(peerId: String, data: ByteArray): EngineResult {
         if (peerId.isBlank()) return EngineResult.INVALID_ARG
         if (data.isEmpty()) return EngineResult.INVALID_ARG
         return EngineResult.fromCode(LiteP2PNative.sendMessage(peerId, data))
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Reliable messaging (v0.4)                                            */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * At-least-once send with engine receipts.
+     *
+     * The engine persists [data] into a durable outbox under `filesDir`,
+     * retries every [retryTimeoutMs] until the peer ACKs or [maxRetries] is
+     * exhausted, and — when the offline queue is enabled and the peer has no
+     * session — stores the message on the signaling server for delivery on the
+     * peer's next connect. The receiver dedupes on [msgId].
+     *
+     * Lifecycle is reported via [LiteP2PListener.onDeliveryStatus]:
+     * `QUEUED -> SENT -> DELIVERED | FAILED(reason)`.
+     *
+     * @param peerId Destination peer id.
+     * @param msgId Caller-supplied unique message id (UUID recommended).
+     * @param data Payload (non-empty).
+     * @param maxRetries Retry budget before FAILED(TIMEOUT). Defaults to 3.
+     * @param retryTimeoutMs Retry interval in ms. Defaults to 10 000.
+     * @return [EngineResult.OK] when accepted into the persistent outbox.
+     */
+    fun sendReliable(
+        peerId: String,
+        msgId: String,
+        data: ByteArray,
+        maxRetries: Int = 3,
+        retryTimeoutMs: Int = 10_000
+    ): EngineResult {
+        if (peerId.isBlank() || msgId.isBlank() || data.isEmpty()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(
+            LiteP2PNative.sendReliable(peerId, msgId, data, maxRetries, retryTimeoutMs)
+        )
+    }
+
+    /**
+     * Cancels a pending reliable send (no further retries / offline store).
+     * Fires [LiteP2PListener.onDeliveryStatus] with FAILED/"CANCELLED" when the
+     * id was known.
+     */
+    fun cancelReliable(msgId: String): EngineResult {
+        if (msgId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.cancelReliable(msgId))
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Presence & reachability (v0.4)                                       */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Cheap liveness probe that does not require holding a full session open.
+     * The result arrives asynchronously via [LiteP2PListener.onPingResult]:
+     * `rttMs >= 0` on success, `-1` when the peer is unreachable within
+     * [timeoutMs].
+     */
+    fun ping(peerId: String, timeoutMs: Int = 5_000): EngineResult {
+        if (peerId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.ping(peerId, timeoutMs))
+    }
+
+    /**
+     * Subscribes to server-assisted presence for [peerIds]. The engine asks the
+     * signaling server for current state and then delivers transition updates
+     * via [LiteP2PListener.onPresence]. Works without holding an open session.
+     */
+    fun subscribePresence(peerIds: List<String>): EngineResult {
+        val ids = peerIds.filter { it.isNotBlank() }
+        if (ids.isEmpty()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.subscribePresence(ids.toTypedArray()))
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Identity directory & invites (v0.4)                                  */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Registers a stable lookup alias for this peer on the signaling server.
+     *
+     * Alias values are expected to be opaque hashes (e.g. SHA-256 of a
+     * normalized phone number) — the server never sees raw identifiers. The
+     * registration is persisted server-side so other devices can resolve it
+     * with [lookupPeer] even while this device is offline.
+     */
+    fun registerAlias(aliasHash: String): EngineResult {
+        if (aliasHash.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.registerAlias(aliasHash))
+    }
+
+    /**
+     * Resolves an alias hash to a peer id (+ presence). The result arrives
+     * asynchronously via [LiteP2PListener.onLookupResult]; resolves even when
+     * the target peer is offline.
+     */
+    fun lookupPeer(aliasHash: String): EngineResult {
+        if (aliasHash.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.lookupPeer(aliasHash))
+    }
+
+    /**
+     * Nudges a remote/offline peer to connect via a signaling push. The target
+     * receives [LiteP2PListener.onInviteReceived] and typically responds with
+     * [connect].
+     */
+    fun invitePeer(peerId: String): EngineResult {
+        if (peerId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.invitePeer(peerId))
     }
 
     /* ------------------------------------------------------------------ */
@@ -471,6 +588,29 @@ object LiteP2P {
     fun telemetrySnapshot(): String = LiteP2PNative.telemetrySnapshot()
 
     /* ------------------------------------------------------------------ */
+    /* Backpressure metrics (v0.4)                                          */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Number of plain-send events currently queued in the engine event loop
+     * (accepted by [send] but not yet handed to the transport). Use to gauge
+     * backpressure before sending bursts: [send] starts returning
+     * [EngineResult.QUEUE_FULL] once the internal limit is reached. Returns 0
+     * when the engine is not initialized.
+     */
+    fun pendingSendCount(): Int = runCatching { LiteP2PNative.pendingSendCount() }.getOrDefault(0)
+
+    /**
+     * Number of reliable sends currently in the durable outbox (QUEUED or
+     * SENT, i.e. not yet DELIVERED/FAILED). Bounded by
+     * `offline_queue.max_messages`; [sendReliable] returns
+     * [EngineResult.QUEUE_FULL] once the outbox is full. Returns 0 when the
+     * engine is not initialized.
+     */
+    fun reliablePendingCount(): Int =
+        runCatching { LiteP2PNative.reliablePendingCount() }.getOrDefault(0)
+
+    /* ------------------------------------------------------------------ */
     /* Event dispatch (called by NativeEvents from engine threads)         */
     /* ------------------------------------------------------------------ */
 
@@ -518,5 +658,26 @@ object LiteP2P {
 
     internal fun dispatchTransferCompleted(transferId: String, success: Boolean, error: String?) {
         for (l in listeners) runCatching { l.onTransferCompleted(transferId, success, error) }
+    }
+
+    internal fun dispatchDeliveryStatus(messageId: String, status: Int, reason: String) {
+        val typed = DeliveryStatus.fromCode(status)
+        for (l in listeners) runCatching { l.onDeliveryStatus(messageId, typed, reason) }
+    }
+
+    internal fun dispatchPresence(peerId: String, online: Boolean, lastSeenMs: Long) {
+        for (l in listeners) runCatching { l.onPresence(peerId, online, lastSeenMs) }
+    }
+
+    internal fun dispatchPingResult(peerId: String, rttMs: Long) {
+        for (l in listeners) runCatching { l.onPingResult(peerId, rttMs) }
+    }
+
+    internal fun dispatchLookupResult(alias: String, peerId: String, online: Boolean, lastSeenMs: Long) {
+        for (l in listeners) runCatching { l.onLookupResult(alias, peerId, online, lastSeenMs) }
+    }
+
+    internal fun dispatchInviteReceived(fromPeerId: String) {
+        for (l in listeners) runCatching { l.onInviteReceived(fromPeerId) }
     }
 }

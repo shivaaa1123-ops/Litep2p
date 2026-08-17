@@ -23,6 +23,30 @@ data class LiteP2POverlayDelivery(val frameId: String, val delivered: Boolean)
 /** A structured engine log line. */
 data class LiteP2PLogLine(val level: LogLevel, val line: String)
 
+/** Reliable-send delivery receipt (v0.4); see [LiteP2P.sendReliable]. */
+data class LiteP2PDeliveryStatus(
+    val messageId: String,
+    val status: DeliveryStatus,
+    val reason: String
+)
+
+/** Presence update for a subscribed peer (v0.4); see [LiteP2P.subscribePresence]. */
+data class LiteP2PPresence(val peerId: String, val online: Boolean, val lastSeenMs: Long)
+
+/** Ping probe result (v0.4); [rttMs] is -1 when the peer was unreachable. */
+data class LiteP2PPingResult(val peerId: String, val rttMs: Long)
+
+/** Alias lookup result (v0.4); [peerId] is "" when the alias is unregistered. */
+data class LiteP2PLookupResult(
+    val alias: String,
+    val peerId: String,
+    val online: Boolean,
+    val lastSeenMs: Long
+)
+
+/** Invite received (v0.4); see [LiteP2P.invitePeer]. */
+data class LiteP2PInvite(val fromPeerId: String)
+
 /**
  * File-transfer events surfaced on [LiteP2P.transfersFlow].
  */
@@ -101,6 +125,41 @@ internal object LiteP2PFlowHub {
     )
     val transfers: SharedFlow<LiteP2PTransferEvent> = _transfers.asSharedFlow()
 
+    private val _deliveryStatuses = MutableSharedFlow<LiteP2PDeliveryStatus>(
+        replay = 0,
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val deliveryStatuses: SharedFlow<LiteP2PDeliveryStatus> = _deliveryStatuses.asSharedFlow()
+
+    private val _presences = MutableSharedFlow<LiteP2PPresence>(
+        replay = 0,
+        extraBufferCapacity = 64,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val presences: SharedFlow<LiteP2PPresence> = _presences.asSharedFlow()
+
+    private val _pingResults = MutableSharedFlow<LiteP2PPingResult>(
+        replay = 0,
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val pingResults: SharedFlow<LiteP2PPingResult> = _pingResults.asSharedFlow()
+
+    private val _lookupResults = MutableSharedFlow<LiteP2PLookupResult>(
+        replay = 0,
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val lookupResults: SharedFlow<LiteP2PLookupResult> = _lookupResults.asSharedFlow()
+
+    private val _invites = MutableSharedFlow<LiteP2PInvite>(
+        replay = 0,
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val invites: SharedFlow<LiteP2PInvite> = _invites.asSharedFlow()
+
     private val listener = object : LiteP2PListener {
         override fun onPeersChanged(peers: List<PeerInfo>) {
             _peers.tryEmit(peers)
@@ -138,6 +197,26 @@ internal object LiteP2PFlowHub {
 
         override fun onTransferCompleted(transferId: String, success: Boolean, error: String?) {
             _transfers.tryEmit(LiteP2PTransferEvent.Completed(transferId, success, error))
+        }
+
+        override fun onDeliveryStatus(messageId: String, status: DeliveryStatus, reason: String) {
+            _deliveryStatuses.tryEmit(LiteP2PDeliveryStatus(messageId, status, reason))
+        }
+
+        override fun onPresence(peerId: String, online: Boolean, lastSeenMs: Long) {
+            _presences.tryEmit(LiteP2PPresence(peerId, online, lastSeenMs))
+        }
+
+        override fun onPingResult(peerId: String, rttMs: Long) {
+            _pingResults.tryEmit(LiteP2PPingResult(peerId, rttMs))
+        }
+
+        override fun onLookupResult(alias: String, peerId: String, online: Boolean, lastSeenMs: Long) {
+            _lookupResults.tryEmit(LiteP2PLookupResult(alias, peerId, online, lastSeenMs))
+        }
+
+        override fun onInviteReceived(fromPeerId: String) {
+            _invites.tryEmit(LiteP2PInvite(fromPeerId))
         }
     }
 
@@ -200,6 +279,41 @@ val LiteP2P.transfersFlow: Flow<LiteP2PTransferEvent>
     get() {
         LiteP2PFlowHub.ensureStarted()
         return LiteP2PFlowHub.transfers
+    }
+
+/** Hot stream of reliable-send delivery receipts (v0.4, [LiteP2P.sendReliable]). */
+val LiteP2P.deliveryStatusFlow: Flow<LiteP2PDeliveryStatus>
+    get() {
+        LiteP2PFlowHub.ensureStarted()
+        return LiteP2PFlowHub.deliveryStatuses
+    }
+
+/** Hot stream of presence updates for subscribed peers (v0.4). */
+val LiteP2P.presenceFlow: Flow<LiteP2PPresence>
+    get() {
+        LiteP2PFlowHub.ensureStarted()
+        return LiteP2PFlowHub.presences
+    }
+
+/** Hot stream of ping probe results (v0.4, [LiteP2P.ping]). */
+val LiteP2P.pingResultFlow: Flow<LiteP2PPingResult>
+    get() {
+        LiteP2PFlowHub.ensureStarted()
+        return LiteP2PFlowHub.pingResults
+    }
+
+/** Hot stream of alias lookup results (v0.4, [LiteP2P.lookupPeer]). */
+val LiteP2P.lookupResultFlow: Flow<LiteP2PLookupResult>
+    get() {
+        LiteP2PFlowHub.ensureStarted()
+        return LiteP2PFlowHub.lookupResults
+    }
+
+/** Hot stream of received invites (v0.4, [LiteP2P.invitePeer] on the remote side). */
+val LiteP2P.inviteFlow: Flow<LiteP2PInvite>
+    get() {
+        LiteP2PFlowHub.ensureStarted()
+        return LiteP2PFlowHub.invites
     }
 
 /* ------------------------------------------------------------------ */

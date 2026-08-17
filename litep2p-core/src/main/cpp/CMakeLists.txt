@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22.1)
 
 # Project name and version
 if(NOT DEFINED LITEP2P_VERSION)
-    set(LITEP2P_VERSION "0.3.0")
+    set(LITEP2P_VERSION "0.4.0")
 endif()
 project(litep2p VERSION ${LITEP2P_VERSION})
 
@@ -210,6 +210,7 @@ set(SESSION_SOURCES
     "modules/plugins/session/src/local_peer_db.cpp"
     "modules/plugins/session/src/sqlite3_dyn.cpp"
     "modules/plugins/session/src/rugged_recovery_manager.cpp"
+    "modules/plugins/session/src/reliable_send_manager.cpp"
 )
 add_library(litep2p_session STATIC ${SESSION_SOURCES})
 target_link_libraries(litep2p_session litep2p_corep2p)

@@ -583,6 +583,11 @@ void SignalingClient::sendUpdateNetworkId(const std::string& network_id) {
     sendFrame(payload.dump());
 }
 
+bool SignalingClient::sendRawJson(const std::string& json_payload) {
+    if (!m_connected.load() || json_payload.empty()) return false;
+    return sendFrame(json_payload);
+}
+
 bool SignalingClient::sendFrame(const std::string& data, uint8_t opcode) {
     if (!m_connected) return false;
 
