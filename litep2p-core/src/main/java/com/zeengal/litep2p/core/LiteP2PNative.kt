@@ -59,6 +59,16 @@ internal object LiteP2PNative {
     /** Resolved local peer id (engine-generated when none was configured), or "". */
     external fun nativeGetPeerId(): String
 
+    /**
+     * Pushes platform device info (JSON object string: brand/model/os/abi/sdk)
+     * into the engine's AnomalyReporter so incident files identify the device.
+     * Safe to call before/after start; idempotent.
+     */
+    external fun nativeSetAnomalyDeviceInfo(json: String)
+
+    /** Resolved incident-log directory ("" when the reporter is disabled). */
+    external fun nativeGetAnomalyDirectory(): String
+
     /* ------------------------------------------------------------------ */
     /* Peer operations                                                      */
     /* ------------------------------------------------------------------ */

@@ -108,6 +108,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/corep2p/reactor/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/corep2p/transport/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/corep2p/security/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/corep2p/monitoring/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/session/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/overlay/include
 )
@@ -143,6 +144,7 @@ include_directories(
 # deleting a source file leaves a stale Ninja graph that still compiles removed files.
 file(GLOB_RECURSE COREP2P_SOURCES CONFIGURE_DEPENDS
     "modules/corep2p/core/src/*.cpp"
+    "modules/corep2p/monitoring/src/*.cpp"
     "modules/corep2p/crypto/src/*.cpp"
     "modules/corep2p/crypto/src/*.c"
     "modules/corep2p/reactor/src/*.cpp"

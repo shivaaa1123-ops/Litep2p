@@ -79,3 +79,5 @@ app/src/main/cpp/libsodium/**/Release/**
 .externalNativeBuild
 .cxx
 local.properties
+# Field-diagnostics incident files (AnomalyReporter)
+anomalies/

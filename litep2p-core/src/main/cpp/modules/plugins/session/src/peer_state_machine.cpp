@@ -1,5 +1,6 @@
 #include "peer_state_machine.h"
 #include "logger.h"
+#include "anomaly_reporter.h"
 
 #if HAVE_JNI
 #include <android/log.h>
@@ -51,6 +52,42 @@ FSMResult PeerStateMachine::handle_event(PeerContext& peer, PeerEvent event) {
             state_to_string(result.new_state) +
             " peer=" + peer.peer_id
         );
+
+        // ---- Field diagnostics: report anomalies to the AnomalyReporter ----
+        // (Disconnect / connect-failure / handshake-failure / terminal failure.)
+        // Graceful SHUTDOWN transitions are expected and skipped.
+        if (event != PeerEvent::SHUTDOWN && AnomalyReporter::getInstance().isEnabled()) {
+            AnomalyReporter::Event ev;
+            ev.peer_id = peer.peer_id;
+            ev.network_id = peer.network_id;
+            const std::string fsm = std::string(state_to_string(old_state)) + " --(" +
+                                    event_to_string(event) + ")--> " +
+                                    state_to_string(result.new_state);
+
+            if (result.new_state == PeerState::FAILED) {
+                if (event == PeerEvent::RETRY_EXHAUSTED || event == PeerEvent::CONNECT_FAILED) {
+                    ev.type = "connect_failed";
+                    ev.detail = "FSM reached terminal FAILED state: " + fsm;
+                } else if (event == PeerEvent::HANDSHAKE_FAILED) {
+                    ev.type = "handshake_failed";
+                    ev.detail = "FSM reached terminal FAILED state: " + fsm;
+                } else {
+                    ev.type = "peer_failed";
+                    ev.detail = "FSM reached terminal FAILED state: " + fsm;
+                }
+                ev.extras.emplace_back("previous_state", state_to_string(old_state));
+                ev.extras.emplace_back("trigger_event", event_to_string(event));
+                AnomalyReporter::getInstance().report(ev);
+            } else if (result.new_state == PeerState::DISCONNECTED &&
+                       (old_state == PeerState::READY || old_state == PeerState::CONNECTED ||
+                        old_state == PeerState::DEGRADED || old_state == PeerState::HANDSHAKING)) {
+                ev.type = "peer_disconnected";
+                ev.detail = "Unexpected peer disconnect: " + fsm;
+                ev.extras.emplace_back("previous_state", state_to_string(old_state));
+                ev.extras.emplace_back("trigger_event", event_to_string(event));
+                AnomalyReporter::getInstance().report(ev);
+            }
+        }
     } else {
         // NATIVELOGW("PeerStateMachine::handle_event: State did NOT change.");
     }

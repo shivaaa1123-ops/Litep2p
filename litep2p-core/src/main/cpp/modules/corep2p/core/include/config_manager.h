@@ -54,6 +54,17 @@ public:
     // fixed port). Returns false when unset/malformed.
     bool getDataPortRange(int& lo, int& hi) const;
 
+    // LAN discovery listener/broadcast port (network.discovery_port).
+    // Historically hardcoded to 30000; now config-driven so deployments (and
+    // hermetic tests) can use a distinct port. Falls back to 30000.
+    int getDiscoveryPort() const;
+
+    // LAN discovery master switch (network.discovery_enabled, default true).
+    // When false the engine never binds/sends discovery announcements
+    // (deployments that rely purely on signaling/peer-DB can disable LAN
+    // discovery; hermetic tests use it to keep the FSM fully isolated).
+    bool isDiscoveryEnabled() const;
+
     // Discovery fingerprint controls (network.discovery_magic + network.discovery_shared_key).
     // - magic: prefix bytes on discovery announcements; set to a random string
     //   per deployment so packets are not recognizable as "LITEP2P_DISCOVERY".
@@ -121,6 +132,18 @@ public:
     int getTelemetryFlushIntervalMs() const;
     std::string getTelemetryFilePath() const;
     bool telemetryIncludePeerIds() const;
+
+    // AnomalyReporter (field-diagnostics incident log + uploader, v0.4)
+    // Write a structured incident file for every anomaly (disconnect, connect
+    // failure, stall, runtime error) and optionally upload it to a collector.
+    bool isAnomalyReporterEnabled() const;
+    std::string getAnomalyDirectory() const;      // subdir under base_dir, e.g. "anomalies"
+    int getAnomalyMaxFiles() const;               // rotation cap
+    bool isAnomalyUploadEnabled() const;
+    std::string getAnomalyUploadUrl() const;      // "http://host:port/path"
+    int getAnomalyUploadIntervalMs() const;
+    bool anomalyIncludeTelemetry() const;         // embed Telemetry snapshot
+    int getAnomalyStallThresholdMs() const;       // peer stuck in CONNECTING/HANDSHAKING => stall
     
     // NAT Traversal
     bool isNATTraversalEnabled() const;

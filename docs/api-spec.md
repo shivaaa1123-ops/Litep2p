@@ -1644,6 +1644,7 @@ chat application is most likely to care about:
 |---|---|---|
 | `network.default_server_port` | `30001` | Main listener port |
 | `network.discovery_port` | `30000` | LAN broadcast discovery port |
+| `network.discovery_enabled` | `true` | LAN discovery master switch; `false` → run purely on signaling/peer-DB/direct endpoints (hermetic tests set this) |
 | `network.port_range` | *(unset)* | v0.4 censorship resistance: `[min,max]` → the engine binds a **random free port** from this range at startup (a static port blocklist cannot pin it down). The real port is advertised via discovery/signaling. |
 | `network.discovery_magic` | `"LITEP2P_DISCOVERY"` | v0.4: prefix bytes on discovery announcements. Set a random per-deployment string so packets aren't recognizable by DPI. |
 | `network.discovery_shared_key` | *(empty)* | v0.4: 64-hex AEAD key; when set, discovery announcements are encrypted + padded so peer ids/ports are opaque. All nodes must share the same magic + key. |
@@ -1679,6 +1680,14 @@ chat application is most likely to care about:
 | `monitoring.telemetry.enabled` | `true` | Telemetry collection |
 | `monitoring.telemetry.flush_interval_ms` | `2000` | Telemetry flush cadence |
 | `monitoring.telemetry.include_peer_ids` | `true` | Include peer ids in telemetry (false = redact) |
+| `anomaly_reporter.enabled` | `true` | v0.4 field diagnostics: write an incident file for every anomaly |
+| `anomaly_reporter.directory` | `"anomalies"` | Incident subdir under the config dir / `filesDir` (`<dir>/anomalies/`) |
+| `anomaly_reporter.max_files` | `200` | Rotation cap (oldest removed first) |
+| `anomaly_reporter.upload_enabled` | `false` | Periodically POST incident files to the collector |
+| `anomaly_reporter.upload_url` | `""` | Collector endpoint, e.g. `http://host:8899/ingest` (plain HTTP for now; HTTPS in the TLS phase) |
+| `anomaly_reporter.upload_interval_ms` | `300000` | Upload attempt cadence (5 min) |
+| `anomaly_reporter.include_telemetry` | `true` | Embed the telemetry snapshot in every incident |
+| `anomaly_reporter.stall_threshold_ms` | `60000` | A peer stuck in CONNECTING/HANDSHAKING past this → `stall_not_recovered` incident |
 | `reconnect_policy.mode` | `"auto"` | Initial reconnect aggressiveness |
 | `battery_optimizer.enabled` | `true` | Battery-aware scheduling |
 | `logging.level` | `"debug"` | Engine log verbosity |
@@ -1696,6 +1705,46 @@ When `storage.peer_db.enabled` is true, the engine maintains
 `litep2p_peers.sqlite` under `filesDir` with `peers`, `peer_events`, and `meta`
 tables, auto-pruning stale peers after `prune_after_days` (default 15) and
 pinning the first peer ever seen. This powers fast reconnection after restarts.
+
+### 9.2 Anomaly / incident logging (field diagnostics)
+
+When `anomaly_reporter.enabled` is true, the engine writes one **JSON incident
+file** per anomaly into `<config-dir>/anomalies/` (Android: `filesDir/anomalies/`),
+rotated to `max_files`. Inspect from a terminal or with
+`adb shell run-as <pkg> ls files/anomalies`. Incident schema `litep2p-anomaly/1`:
+
+```json
+{
+  "schema": "litep2p-anomaly/1",
+  "incident_id": "…",
+  "timestamp_utc": "2026-08-18T00:00:00.000Z",
+  "engine_uptime_ms": 42328,
+  "engine_version": "0.4.0",
+  "local_peer_id": "…",
+  "event_type": "peer_disconnected | connect_failed | handshake_failed | "
+                "peer_failed | stall_not_recovered | runtime_error",
+  "peer_id": "…",
+  "network_id": "ip:port",
+  "detail": "…",
+  "extras": { "previous_state": "READY", "trigger_event": "DISCONNECT_DETECTED" },
+  "device": { "brand": "…", "model": "…", "os": "…", "abi": "…" },
+  "telemetry": { "ts_ms": …, "uptime_ms": …, "counters": {…}, "gauges": {…} }
+}
+```
+
+Triggers: FSM transitions to `FAILED` (connect/handshake failure) and
+`DISCONNECTED` (unexpected drop from READY/CONNECTED/DEGRADED/HANDSHAKING), a
+peer stuck in CONNECTING/HANDSHAKING past `stall_threshold_ms`
+(`stall_not_recovered`), and runtime errors such as a failed UDP-socket restart
+after a network change. Graceful shutdown is never reported.
+
+**Production upload**: with `upload_enabled` + `upload_url`, the maintenance
+loop POSTs each pending incident (raw JSON body, `Content-Type:
+application/json`, header `X-LiteP2P-Anomaly: 1`) every `upload_interval_ms`,
+then deletes the file on a 2xx response. Failed uploads stay pending and are
+retried; `max_files` caps the backlog. The uploader speaks plain HTTP on both
+platforms (HTTPS lands with the TLS phase). On Android, the SDK automatically
+pushes device info (brand/model/Android version/ABI) via `LiteP2P.setAnomalyDeviceInfo`.
 
 ---
 
@@ -1777,6 +1826,16 @@ The engine is designed to be "rigid and reliable":
   budgets per mode, verifiable via the §8 gauges (`rss_bytes`, `thread_count`).
 - **Clean shutdown:** `stop` completes within a documented deadline; sockets,
   threads, and file handles are released; `shutdown` is idempotent.
+- **Parser robustness:** every wire/control/announcement/handshake parser is
+  fuzz-tested (coverage-guided libFuzzer harnesses in `desktop/fuzz/`, run in
+  CI with ASan/UBSan) and covered by a deterministic malformed-input
+  regression suite (`malformed_input_test`).
+- **Hermetic FSM testing:** the session-manager suite is fully isolated since
+  v0.4 — `network.discovery_enabled=false` + unique `network.discovery_port`
+  keep the process-wide Discovery singleton from injecting foreign peers, and
+  `network.port_range` is unset so tests control their listener ports. The
+  suite runs deterministically in CI (was previously excluded for LAN
+  broadcast leakage).
 
 Operational checklist for a production chat app:
 

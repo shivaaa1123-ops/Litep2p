@@ -111,5 +111,15 @@
             "flush_interval_ms": 2000,
             "include_peer_ids": true
         }
+    },
+    "anomaly_reporter": {
+        "enabled": true,
+        "directory": "anomalies",
+        "max_files": 200,
+        "upload_enabled": false,
+        "upload_url": "",
+        "upload_interval_ms": 300000,
+        "include_telemetry": true,
+        "stall_threshold_ms": 60000
     }
 }

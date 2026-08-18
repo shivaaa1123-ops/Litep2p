@@ -127,5 +127,15 @@
             "reconnect_candidate_limit": 2000,
             "prune_after_days": 15
         }
+    },
+    "anomaly_reporter": {
+        "enabled": true,
+        "directory": "anomalies",
+        "max_files": 200,
+        "upload_enabled": false,
+        "upload_url": "",
+        "upload_interval_ms": 300000,
+        "include_telemetry": true,
+        "stall_threshold_ms": 60000
     }
 }

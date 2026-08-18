@@ -2,15 +2,18 @@
 #include "session_manager_p.h"
 #include "config_manager.h"
 #include "telemetry.h"
+#include "anomaly_reporter.h"
 #include "wire_codec.h"
 #include "rugged_recovery_manager.h"
 #include "../../discovery/include/discovery.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <sstream>
+#include <unordered_map>
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <unistd.h>
@@ -132,6 +135,17 @@ namespace detail {
         if (m_sm->m_shutting_down.load(std::memory_order_acquire)) {
             return;
         }
+
+        // AnomalyReporter housekeeping: upload pending incident files (rate-limited
+        // to the configured interval). Best-effort; failures leave files pending.
+        AnomalyReporter::getInstance().tick();
+
+        // --- STALL DETECTION (field diagnostics) ---
+        // A peer stuck in CONNECTING/HANDSHAKING beyond the threshold never
+        // recovered. Report it to the AnomalyReporter once per episode (until the
+        // peer's FSM state changes), so long-lived stalls are captured without
+        // spamming one incident per maintenance tick.
+        detectStalledPeers();
 
         // RUGGED RECOVERY: Process pending message retries and recovery queue
         if (m_sm->m_recovery_manager) {
@@ -1071,3 +1085,47 @@ namespace detail {
         }
     }
 }
+
+void detail::MaintenanceManager::detectStalledPeers() {
+    const int64_t threshold_ms = ConfigManager::getInstance().getAnomalyStallThresholdMs();
+    if (threshold_ms <= 0) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
+    for (const auto& kv : m_sm->m_peer_contexts) {
+        const PeerContext& ctx = kv.second;
+        const int state_int = static_cast<int>(ctx.state);
+        const bool is_transient = (ctx.state == PeerState::CONNECTING || ctx.state == PeerState::HANDSHAKING);
+        if (!is_transient) {
+            m_reported_stall_state.erase(ctx.peer_id);
+            continue;
+        }
+        const auto stuck_for = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   now - ctx.last_state_change)
+                                   .count();
+        if (stuck_for < threshold_ms) continue;
+
+        // Report once per (peer, state) episode — not on every maintenance tick.
+        const auto it = m_reported_stall_state.find(ctx.peer_id);
+        if (it != m_reported_stall_state.end() && it->second == state_int) {
+            continue;
+        }
+        m_reported_stall_state[ctx.peer_id] = state_int;
+
+        AnomalyReporter::Event ev;
+        ev.type = "stall_not_recovered";
+        ev.peer_id = ctx.peer_id;
+        ev.network_id = ctx.network_id;
+        ev.detail = "Peer stuck in " + m_sm->state_to_string(ctx.state) + " for " +
+                    std::to_string(stuck_for) + " ms (threshold " +
+                    std::to_string(threshold_ms) + " ms); recovery did not complete";
+        ev.extras.emplace_back("state", m_sm->state_to_string(ctx.state));
+        ev.extras.emplace_back("stuck_ms", std::to_string(stuck_for));
+        ev.extras.emplace_back("threshold_ms", std::to_string(threshold_ms));
+        AnomalyReporter::getInstance().report(ev);
+        LOG_WARN("MM: STALL NOT RECOVERED peer=" + ctx.peer_id +
+                 " state=" + m_sm->state_to_string(ctx.state) +
+                 " stuck_ms=" + std::to_string(stuck_for));
+    }
+}
+

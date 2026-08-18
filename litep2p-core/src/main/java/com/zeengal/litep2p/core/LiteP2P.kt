@@ -96,6 +96,24 @@ object LiteP2P {
     fun supportsEncryption(): Boolean = capabilities.encryption
 
     /**
+     * Pushes platform device info (JSON object string: brand/model/os/abi/sdk)
+     * into the engine's AnomalyReporter so incident files identify the device
+     * that experienced the anomaly (field-data collection). [LiteP2PRuntime] /
+     * [LiteP2PService] call this automatically; integrators using [init] directly
+     * should call it once with their device facts. Idempotent, safe any time.
+     */
+    fun setAnomalyDeviceInfo(json: String) {
+        runCatching { LiteP2PNative.nativeSetAnomalyDeviceInfo(json) }
+    }
+
+    /**
+     * Absolute path of the incident-log directory ("" while disabled) — inspect
+     * it from a terminal or `adb shell run-as <pkg> ls files/anomalies`.
+     */
+    fun anomaliesDirectory(): String =
+        runCatching { LiteP2PNative.nativeGetAnomalyDirectory() }.getOrDefault("")
+
+    /**
      * The local peer id. Once the engine has started this returns the resolved id
      * (engine-generated when none was configured); before start it falls back to
      * the configured id, or empty.

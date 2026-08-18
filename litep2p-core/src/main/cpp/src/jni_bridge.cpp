@@ -24,6 +24,7 @@
 #include "jni_helpers.h"
 #include "logger.h"
 #include "litep2p.h"
+#include "anomaly_reporter.h"
 
 #include <jni.h>
 #include <signal.h>
@@ -613,6 +614,24 @@ Java_com_zeengal_litep2p_core_LiteP2PNative_nativeGetPeerId(JNIEnv* env, jobject
         return env->NewStringUTF("");
     }
     return env->NewStringUTF(buf);
+}
+
+// Push platform device info (brand/model/os/abi as a JSON object string) into
+// the AnomalyReporter so incident files carry the device that experienced the
+// anomaly (field-data collection). No-op on engines without the reporter.
+extern "C" JNIEXPORT void JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nativeSetAnomalyDeviceInfo(JNIEnv* env, jobject /*thiz*/, jstring json) {
+    if (json == nullptr) return;
+    const char* cstr = env->GetStringUTFChars(json, nullptr);
+    if (cstr == nullptr) return;
+    AnomalyReporter::getInstance().setDeviceInfo(std::string(cstr));
+    env->ReleaseStringUTFChars(json, cstr);
+}
+
+// Resolved incidents directory (or empty when the reporter is disabled).
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nativeGetAnomalyDirectory(JNIEnv* env, jobject /*thiz*/) {
+    return env->NewStringUTF(AnomalyReporter::getInstance().directory().c_str());
 }
 
 

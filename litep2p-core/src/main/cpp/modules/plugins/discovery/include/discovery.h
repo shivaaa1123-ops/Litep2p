@@ -40,4 +40,13 @@ public:
 
 Discovery* getGlobalDiscoveryInstance();
 
+// Parse a discovery announcement (legacy "<magic>:<peer_id>:<port>" or the
+// obfuscated "<magic> || nonce(12) || AEAD_ct" form when a shared key is
+// configured). Magic + key come from ConfigManager (network.discovery_magic /
+// discovery_shared_key). Thread-safe, exception-safe, never throws. Returns
+// false for anything malformed. Exposed as a free function so the parser can
+// be fuzzed and unit-tested without a live socket.
+bool parse_discovery_announcement(const std::string& raw,
+                                  std::string& out_peer_id, int& out_port);
+
 #endif // DISCOVERY_H

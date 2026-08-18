@@ -11,6 +11,10 @@
     "network": {
         "default_server_port": 30001,
         "discovery_port": 30000,
+        /* discovery_enabled: LAN broadcast discovery master switch. Default
+           true. Set false to run purely on signaling/peer-DB/direct endpoints
+           (or for hermetic test environments). */
+        "discovery_enabled": true,
         "listen_backlog": 5,
         "select_max_retries": 3,
 
@@ -252,6 +256,26 @@
         "enabled": false,
         "metrics_port": 9090,
         "health_check_interval_ms": 30000
+    },
+    /* v0.4 field diagnostics: writes a structured incident file for every
+       anomaly (disconnect, connect failure, stall that did not recover, runtime
+       error) into <filesDir|CWD>/anomalies/ so it can be inspected via terminal
+       or adb. Each incident carries timestamp, engine uptime, peer/endpoint,
+       device info (brand/model/os/abi), engine version and a telemetry snapshot.
+
+       Production: set upload_enabled + upload_url and the engine periodically
+       POSTs pending incident files (plain HTTP for now; HTTPS in the TLS phase)
+       to your collector server, then deletes the uploaded files. Failed uploads
+       stay pending and are retried next interval, capped by max_files. */
+    "anomaly_reporter": {
+        "enabled": true,
+        "directory": "anomalies",
+        "max_files": 200,
+        "upload_enabled": false,
+        "upload_url": "http://YOUR_COLLECTOR_HOST:8899/ingest",
+        "upload_interval_ms": 300000,
+        "include_telemetry": true,
+        "stall_threshold_ms": 60000
     },
     "remote_control": {
         "enabled": false,

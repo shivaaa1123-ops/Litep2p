@@ -3,7 +3,9 @@
 #include "logger.h"
 #include "device_utils.h"
 #include "config_manager.h"
+#include "anomaly_reporter.h"
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <chrono>
@@ -225,6 +227,37 @@ int main(int argc, char* argv[]) {
     // Create P2P node (not started yet)
     P2PNode node;
     std::string peer_id = custom_peer_id.empty() ? get_persistent_device_id() : custom_peer_id;
+
+    // Field diagnostics: identify this host in incident logs (AnomalyReporter).
+    {
+        std::ostringstream dev;
+        dev << "{\"brand\":\"desktop\",\"model\":\"";
+#if defined(__APPLE__)
+        dev << "macOS";
+#elif defined(__linux__)
+        dev << "Linux";
+#else
+        dev << "desktop";
+#endif
+        dev << "\",\"os\":\"";
+#if defined(__APPLE__)
+        dev << "macOS";
+#elif defined(__linux__)
+        dev << "Linux";
+#endif
+        dev << "\",\"abi\":\"";
+#if defined(__x86_64__) || defined(_M_X64)
+        dev << "x86_64";
+#elif defined(__aarch64__)
+        dev << "arm64";
+#elif defined(__i386__)
+        dev << "x86";
+#else
+        dev << "unknown";
+#endif
+        dev << "\",\"peer_id\":\"" << peer_id << "\"}";
+        AnomalyReporter::getInstance().setDeviceInfo(dev.str());
+    }
     
     nativeLog("MAIN: P2PNode created, peer_id=" + peer_id);
     

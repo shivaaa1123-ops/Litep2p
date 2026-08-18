@@ -90,11 +90,70 @@ namespace {
 
         return targets;
     }
-}
+} // namespace
+
+// ------------------------------------------------------------------
+// Censorship-resistant discovery packet parsing (v0.4)
+// ------------------------------------------------------------------
+// Legacy format:      <magic>:<peer_id>:<port>          (plaintext)
+// Obfuscated format:  <magic> || nonce(12) || AEAD_ct   (when a shared
+//                     key is configured).
+// The magic is config-driven (network.discovery_magic). Legacy interop:
+// default-magic peers are still accepted when our magic differs.
+// Declared in discovery.h so the parser can be fuzzed/unit-tested.
+bool parse_discovery_announcement(const std::string& raw,
+                                  std::string& out_peer_id, int& out_port) {
+        const std::string magic = ConfigManager::getInstance().getDiscoveryMagic();
+        std::vector<uint8_t> key;
+        const bool encrypted = ConfigManager::getInstance().getDiscoverySharedKey(key);
+
+        std::string body;
+        if (encrypted && key.size() == 32 &&
+            raw.size() > magic.size() + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
+                                    crypto_aead_xchacha20poly1305_ietf_ABYTES &&
+            raw.compare(0, magic.size(), magic) == 0) {
+            const size_t off = magic.size();
+            std::vector<uint8_t> nonce(raw.begin() + off,
+                                       raw.begin() + off + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+            std::vector<uint8_t> ct(raw.begin() + off + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
+                                    raw.end());
+            std::vector<uint8_t> pt(ct.size());
+            unsigned long long plen = 0;
+            if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+                    pt.data(), &plen, nullptr,
+                    ct.data(), ct.size(), nullptr, 0, nonce.data(), key.data()) != 0) {
+                return false;  // not encrypted by our key -> drop
+            }
+            pt.resize(plen);
+            body.assign(reinterpret_cast<const char*>(pt.data()), pt.size());
+            while (!body.empty() && body.back() == ' ') body.pop_back();
+        } else if (raw.compare(0, magic.size(), magic) == 0) {
+            body = raw.substr(magic.size());
+            if (!body.empty() && body[0] == ':') body = body.substr(1);
+        } else {
+            // Legacy interop: default-magic peers.
+            const std::string legacy = DISCOVERY_MESSAGE_PREFIX;
+            if (raw.compare(0, legacy.size(), legacy) != 0) return false;
+            body = raw.substr(legacy.size());
+            if (!body.empty() && body[0] == ':') body = body.substr(1);
+        }
+
+        const size_t colon = body.find(':');
+        if (colon == std::string::npos) return false;
+        out_peer_id = body.substr(0, colon);
+        try {
+            out_port = std::stoi(body.substr(colon + 1));
+        } catch (...) {
+            return false;
+        }
+        return !out_peer_id.empty() && out_port > 0 && out_port <= 65535;
+    }
 
 class DiscoveryImpl : public Discovery {
 public:
-    DiscoveryImpl() : m_running(false), m_sock(-1), m_connection_port(30001), m_use_central_discovery(true), m_event_loop_mode(false) {}
+    DiscoveryImpl()
+        : m_running(false), m_sock(-1), m_connection_port(30001),
+          m_discovery_port(30000), m_use_central_discovery(true), m_event_loop_mode(false) {}
     ~DiscoveryImpl() override { stop(); }
 
     void start(int port, const std::string& peer_id) override {
@@ -105,6 +164,10 @@ public:
 
         m_peer_id = peer_id;
         m_connection_port = port;
+        // The discovery listener/broadcast port is config-driven
+        // (network.discovery_port) so deployments and hermetic tests can use a
+        // distinct port instead of the historic hardcoded 30000.
+        m_discovery_port = ConfigManager::getInstance().getDiscoveryPort();
 
         m_sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (m_sock < 0) {
@@ -123,7 +186,7 @@ public:
         sockaddr_in bind_addr{};
         bind_addr.sin_family = AF_INET;
         bind_addr.sin_addr.s_addr = INADDR_ANY;
-        bind_addr.sin_port = htons(DISCOVERY_PORT);
+        bind_addr.sin_port = htons(static_cast<uint16_t>(m_discovery_port));
         
         int bind_attempts = 0;
         const int max_bind_attempts = 5;
@@ -155,6 +218,7 @@ public:
 
         m_peer_id = peer_id;
         m_connection_port = port;
+        m_discovery_port = ConfigManager::getInstance().getDiscoveryPort();
 
         m_sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (m_sock < 0) {
@@ -176,7 +240,7 @@ public:
         sockaddr_in bind_addr{};
         bind_addr.sin_family = AF_INET;
         bind_addr.sin_addr.s_addr = INADDR_ANY;
-        bind_addr.sin_port = htons(DISCOVERY_PORT);
+        bind_addr.sin_port = htons(static_cast<uint16_t>(m_discovery_port));
         
         if (bind(m_sock, (sockaddr*)&bind_addr, sizeof(bind_addr)) < 0) {
             nativeLog("Discovery Error: Failed to bind socket in event-loop mode.");
@@ -234,7 +298,7 @@ public:
         if (m_sock < 0 || !m_running) return;
 
         std::string msg = buildAnnouncement();
-        const auto targets = get_ipv4_broadcast_targets(static_cast<uint16_t>(DISCOVERY_PORT));
+        const auto targets = get_ipv4_broadcast_targets(static_cast<uint16_t>(m_discovery_port));
 
         bool any_sent = false;
         int sent_count = 0;
@@ -314,7 +378,7 @@ public:
         
         sockaddr_in dst{};
         dst.sin_family = AF_INET;
-        dst.sin_port = htons(static_cast<uint16_t>(DISCOVERY_PORT));  // Send to discovery port
+        dst.sin_port = htons(static_cast<uint16_t>(m_discovery_port));  // Send to discovery port
         
         if (inet_pton(AF_INET, ip.c_str(), &dst.sin_addr) <= 0) {
             nativeLog("Discovery: sendDirectProbe - invalid IP: " + ip);
@@ -325,7 +389,7 @@ public:
                                     reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
         
         if (sent >= 0) {
-            nativeLog("Discovery: Sent direct probe to " + ip + ":" + std::to_string(DISCOVERY_PORT) + " (" + std::to_string(sent) + " bytes)");
+            nativeLog("Discovery: Sent direct probe to " + ip + ":" + std::to_string(m_discovery_port) + " (" + std::to_string(sent) + " bytes)");
         } else {
             nativeLog("Discovery: Failed to send direct probe to " + ip + " errno=" + std::to_string(errno));
         }
@@ -427,50 +491,9 @@ public:
 
     bool parseAnnouncement(const std::string& raw,
                            std::string& out_peer_id, int& out_port) const {
-        const std::string magic = ConfigManager::getInstance().getDiscoveryMagic();
-        std::vector<uint8_t> key;
-        const bool encrypted = ConfigManager::getInstance().getDiscoverySharedKey(key);
-
-        std::string body;
-        if (encrypted && key.size() == 32 &&
-            raw.size() > magic.size() + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES +
-                                    crypto_aead_xchacha20poly1305_ietf_ABYTES &&
-            raw.compare(0, magic.size(), magic) == 0) {
-            const size_t off = magic.size();
-            std::vector<uint8_t> nonce(raw.begin() + off,
-                                       raw.begin() + off + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
-            std::vector<uint8_t> ct(raw.begin() + off + crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
-                                    raw.end());
-            std::vector<uint8_t> pt(ct.size());
-            unsigned long long plen = 0;
-            if (crypto_aead_xchacha20poly1305_ietf_decrypt(
-                    pt.data(), &plen, nullptr,
-                    ct.data(), ct.size(), nullptr, 0, nonce.data(), key.data()) != 0) {
-                return false;  // not encrypted by our key -> drop
-            }
-            pt.resize(plen);
-            body.assign(reinterpret_cast<const char*>(pt.data()), pt.size());
-            while (!body.empty() && body.back() == ' ') body.pop_back();
-        } else if (raw.compare(0, magic.size(), magic) == 0) {
-            body = raw.substr(magic.size());
-            if (!body.empty() && body[0] == ':') body = body.substr(1);
-        } else {
-            // Legacy interop: default-magic peers.
-            const std::string legacy = DISCOVERY_MESSAGE_PREFIX;
-            if (raw.compare(0, legacy.size(), legacy) != 0) return false;
-            body = raw.substr(legacy.size());
-            if (!body.empty() && body[0] == ':') body = body.substr(1);
-        }
-
-        const size_t colon = body.find(':');
-        if (colon == std::string::npos) return false;
-        out_peer_id = body.substr(0, colon);
-        try {
-            out_port = std::stoi(body.substr(colon + 1));
-        } catch (...) {
-            return false;
-        }
-        return !out_peer_id.empty() && out_port > 0 && out_port <= 65535;
+        // Delegates to the free function (see discovery.h) so the exact parser
+        // is fuzz-tested and unit-tested without a live socket.
+        return ::parse_discovery_announcement(raw, out_peer_id, out_port);
     }
 
 private:
@@ -479,7 +502,7 @@ private:
             // Include connection port in the discovery message
             // Format: obfuscated (see buildAnnouncement)
             std::string msg = buildAnnouncement();
-            const auto targets = get_ipv4_broadcast_targets(static_cast<uint16_t>(DISCOVERY_PORT));
+            const auto targets = get_ipv4_broadcast_targets(static_cast<uint16_t>(m_discovery_port));
 
             nativeLog("Discovery broadcastLoop: Sending to " + std::to_string(targets.size()) + " broadcast targets");
 
@@ -512,7 +535,7 @@ private:
     }
 
     void listenLoop() {
-        nativeLog("Discovery listenLoop: Started listening on UDP port " + std::to_string(DISCOVERY_PORT));
+        nativeLog("Discovery listenLoop: Started listening on UDP port " + std::to_string(m_discovery_port));
         char buf[DISCOVERY_MSG_MAX];
         while (m_running) {
             sockaddr_in from_addr{};
@@ -595,6 +618,7 @@ private:
     int m_sock;
     std::string m_peer_id;
     int m_connection_port;
+    int m_discovery_port;  // network.discovery_port (config-driven, default 30000)
     std::thread m_broadcastThread;
     std::thread m_listenThread;
     std::function<void(const std::string&, const std::string&)> m_callback;

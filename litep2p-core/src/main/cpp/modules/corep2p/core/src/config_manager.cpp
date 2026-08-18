@@ -261,6 +261,22 @@ bool ConfigManager::getDataPortRange(int& lo, int& hi) const {
     return lo > 0 && hi >= lo && hi <= 65535;
 }
 
+int ConfigManager::getDiscoveryPort() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    int port = 30000;
+    if (m_config.is_object()) {
+        port = jsonGetOr<int>(m_config, {"network", "discovery_port"}, 30000);
+    }
+    if (port < 1 || port > 65535) port = 30000;
+    return port;
+}
+
+bool ConfigManager::isDiscoveryEnabled() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return true;
+    return jsonGetOr<bool>(m_config, {"network", "discovery_enabled"}, true);
+}
+
 std::string ConfigManager::getDiscoveryMagic() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return "LITEP2P_DISCOVERY";
@@ -522,6 +538,54 @@ bool ConfigManager::telemetryIncludePeerIds() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return true;
     return jsonGetOr<bool>(m_config, {"monitoring", "telemetry", "include_peer_ids"}, true);
+}
+
+bool ConfigManager::isAnomalyReporterEnabled() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return true;
+    return jsonGetOr<bool>(m_config, {"anomaly_reporter", "enabled"}, true);
+}
+
+std::string ConfigManager::getAnomalyDirectory() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return "anomalies";
+    return jsonGetOr<std::string>(m_config, {"anomaly_reporter", "directory"}, "anomalies");
+}
+
+int ConfigManager::getAnomalyMaxFiles() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 200;
+    return jsonGetOr<int>(m_config, {"anomaly_reporter", "max_files"}, 200);
+}
+
+bool ConfigManager::isAnomalyUploadEnabled() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return false;
+    return jsonGetOr<bool>(m_config, {"anomaly_reporter", "upload_enabled"}, false);
+}
+
+std::string ConfigManager::getAnomalyUploadUrl() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return "";
+    return jsonGetOr<std::string>(m_config, {"anomaly_reporter", "upload_url"}, "");
+}
+
+int ConfigManager::getAnomalyUploadIntervalMs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 300000;
+    return jsonGetOr<int>(m_config, {"anomaly_reporter", "upload_interval_ms"}, 300000);
+}
+
+bool ConfigManager::anomalyIncludeTelemetry() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return true;
+    return jsonGetOr<bool>(m_config, {"anomaly_reporter", "include_telemetry"}, true);
+}
+
+int ConfigManager::getAnomalyStallThresholdMs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 60000;
+    return jsonGetOr<int>(m_config, {"anomaly_reporter", "stall_threshold_ms"}, 60000);
 }
 
 bool ConfigManager::isNATTraversalEnabled() const {

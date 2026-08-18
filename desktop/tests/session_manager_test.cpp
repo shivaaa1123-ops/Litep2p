@@ -67,11 +67,26 @@ static void configure_unit_test_runtime() {
     (void)ConfigManager::getInstance().setValueAtPath({"nat_traversal", "peer_discovery", "enabled"}, false);
     // Prevent DB-first reconnect from pulling real peers off disk during unit tests.
     (void)ConfigManager::getInstance().setValueAtPath({"storage", "peer_db", "enabled"}, false);
+    // Field-diagnostics incident writer is off for unit tests (no files on disk).
+    (void)ConfigManager::getInstance().setValueAtPath({"anomaly_reporter", "enabled"}, false);
+    // Dynamic-port range must be OFF: tests allocate explicit free ports and the
+    // engine would otherwise swap them for random range ports, breaking the
+    // in-process loopback handshakes (this is what made the UDP tests flaky).
+    (void)ConfigManager::getInstance().eraseValueAtPath({"network", "port_range"});
 
     // Speed up liveness-related tests.
     (void)ConfigManager::getInstance().setValueAtPath({"peer_management", "heartbeat_interval_sec"}, 1);
     // Set a large expiration so that heartbeat-bounded liveness is what flips connected->false.
     (void)ConfigManager::getInstance().setValueAtPath({"peer_management", "peer_expiration_timeout_ms"}, 60000);
+
+    // HERMETIC TEST ISOLATION (v0.4): LAN discovery is a process-wide shared
+    // singleton. On a host running other LiteP2P processes its fixed port
+    // received foreign broadcasts (the documented flake), and even with a
+    // unique port the in-process peers A/B exchange announcements that can
+    // "connect around" assertions (e.g. the stale-endpoint test). The engine
+    // now supports network.discovery_enabled=false; with discovery off the
+    // FSM only sees what each test explicitly addPeer()s — fully deterministic.
+    (void)ConfigManager::getInstance().setValueAtPath({"network", "discovery_enabled"}, false);
  }
 
 static int get_free_local_port(int socket_type) {
@@ -315,8 +330,11 @@ bool test_udp_endpoint_upgrade_while_connecting_prefers_local() {
     a->start(port_a, mock_peer_callback, "UDP", peer_a);
     b->start(port_b, mock_peer_callback, "UDP", peer_b);
 
-    // Ensure both sides know each other's IDs so UDP handshake paths can complete.
-    b->addPeer(peer_a, "127.0.0.1:" + std::to_string(port_a));
+    // Do NOT wire B->A here: if B knew A's real endpoint, B's maintenance
+    // loop would auto-connect to A within the 300ms window below and the
+    // inbound handshake would mark A "connected to B" — defeating the
+    // stale-endpoint assertion. A must initiate everything; B only responds
+    // to A's CONTROL_CONNECT (it does not need to know A beforehand).
 
     // Simulate a stale signaling/STUN endpoint for B (public IP that will not be reachable in this unit test).
     // This mirrors the real-world case where clients try a public endpoint even though both peers are on LAN.

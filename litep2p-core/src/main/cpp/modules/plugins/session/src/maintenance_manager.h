@@ -4,6 +4,7 @@
 #include "session_manager.h"
 #include <chrono>
 #include <atomic>
+#include <unordered_map>
 
 namespace detail {
     class MaintenanceManager {
@@ -29,5 +30,10 @@ namespace detail {
         void performLanRediscovery();
         // Helper to check and fallback endpoints for failing connections
         void checkEndpointFallback();
+        // Field diagnostics: report peers stuck in CONNECTING/HANDSHAKING beyond
+        // the anomaly_reporter.stall_threshold_ms (once per stall episode).
+        void detectStalledPeers();
+        // Tracks which stalled (peer, state) episodes have already been reported.
+        std::unordered_map<std::string, int> m_reported_stall_state;
     };
 }

@@ -39,6 +39,11 @@ option(ENABLE_OVERLAY_MODULE "Enable multi-hop overlay module (LPX2)" ON)
 # Enable with: cmake -DSINGLE_THREAD_MODE=ON ..
 option(SINGLE_THREAD_MODE "Enable single-thread mode for reduced resource usage" OFF)
 
+# Parser fuzzing (libFuzzer). Requires Clang. Builds desktop/fuzz/* targets.
+#   cmake -S desktop -B desktop/build-fuzz -DLITEP2P_FUZZING=ON \
+#         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+option(LITEP2P_FUZZING "Build libFuzzer harnesses for the wire parsers" OFF)
+
 # ============================================================================
 # BUILD TARGET SELECTION - Pass -DBUILD_TARGET=DESKTOP to build for desktop
 # If not passed, defaults to DESKTOP (since this is the desktop CMakeLists)
@@ -130,6 +135,7 @@ set(DESKTOP_SOURCES
 set(CORE_SOURCES
     ../litep2p-core/src/main/cpp/modules/corep2p/core/src/logger.cpp
     ../litep2p-core/src/main/cpp/modules/corep2p/core/src/device_utils.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/monitoring/src/anomaly_reporter.cpp
 )
 
 # Session Manager and related components
@@ -277,6 +283,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/corep2p/reactor/include
     ../litep2p-core/src/main/cpp/modules/corep2p/security/include
     ../litep2p-core/src/main/cpp/modules/corep2p/crypto/include
+    ../litep2p-core/src/main/cpp/modules/corep2p/monitoring/include
     ../litep2p-core/src/main/cpp/modules/corep2p/include
     ../litep2p-core/src/main/cpp/modules/plugins/session/include
     ../litep2p-core/src/main/cpp/modules/plugins/session/src
@@ -360,6 +367,28 @@ endif()
 
 target_compile_options(litep2p_engine PRIVATE -Wall -Wextra -fPIC)
 
+# ---------------------------------------------------------------------------
+# Parser fuzzing (LITEP2P_FUZZING=ON, clang only)
+# ---------------------------------------------------------------------------
+if(LITEP2P_FUZZING)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "LITEP2P_FUZZING requires Clang (libFuzzer). "
+                            "Pass -DCMAKE_CXX_COMPILER=clang++.")
+    endif()
+    # Instrument the whole engine for coverage + sanitizers, but only link
+    # libFuzzer into the fuzz executables (not the engine lib).
+    target_compile_options(litep2p_engine PRIVATE
+        -fsanitize=fuzzer-no-link,address,undefined
+        -fno-omit-frame-pointer
+        -g
+    )
+    target_link_options(litep2p_engine PRIVATE
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+    )
+    message(STATUS "Parser fuzzing ENABLED (libFuzzer + ASan/UBSan)")
+endif()
+
 # Create executable
 add_executable(litep2p_peer_${PLATFORM} ${DESKTOP_SOURCES})
 
@@ -395,6 +424,12 @@ target_link_libraries(session_manager_test PRIVATE litep2p_engine)
 add_executable(c_api_test tests/c_api_test.cpp)
 target_include_directories(c_api_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(c_api_test PRIVATE litep2p_engine)
+
+# Deterministic parser robustness regression (malformed-input corpus). Runs in
+# normal CI builds; complements the libFuzzer harnesses in desktop/fuzz/.
+add_executable(malformed_input_test tests/malformed_input_test.cpp)
+target_include_directories(malformed_input_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(malformed_input_test PRIVATE litep2p_engine)
 
 add_executable(wan_integration_runner tests/wan_integration_runner.cpp)
 target_include_directories(wan_integration_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -470,5 +505,33 @@ if(ENABLE_PROXY_MODULE)
 
     target_include_directories(proxy_peer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(proxy_peer_test PRIVATE litep2p_engine)
+endif()
+
+# ---------------------------------------------------------------------------
+# libFuzzer harnesses for the wire parsers (desktop/fuzz/). Build with:
+#   cmake -S desktop -B desktop/build-fuzz -DLITEP2P_FUZZING=ON \
+#         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+#   cmake --build desktop/build-fuzz --target fuzz_wire_codec fuzz_discovery \
+#         fuzz_noise_handshake
+# Then run, e.g.: ./desktop/build-fuzz/bin/fuzz_wire_codec -runs=100000
+# ---------------------------------------------------------------------------
+if(LITEP2P_FUZZING)
+    set(FUZZ_TARGETS fuzz_wire_codec fuzz_discovery fuzz_noise_handshake)
+    foreach(target IN LISTS FUZZ_TARGETS)
+        # EXCLUDE_FROM_ALL: building `all` never requires libFuzzer (Apple clang
+        # lacks the runtime); build each fuzz target explicitly.
+        add_executable(${target} EXCLUDE_FROM_ALL fuzz/${target}.cpp)
+        target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_link_libraries(${target} PRIVATE litep2p_engine)
+        target_compile_options(${target} PRIVATE
+            -fsanitize=fuzzer,address,undefined
+            -fno-omit-frame-pointer
+            -g
+        )
+        target_link_options(${target} PRIVATE
+            -fsanitize=fuzzer,address,undefined
+            -fno-omit-frame-pointer
+        )
+    endforeach()
 endif()
 

@@ -1,4 +1,5 @@
 #include "session_manager_p.h"
+#include "anomaly_reporter.h"
 #include "../../../corep2p/transport/include/quic_connection_manager.h"
 #include "../../../corep2p/transport/include/udp_connection_manager.h"
 #include "../../../corep2p/core/include/config_manager.h"
@@ -897,6 +898,57 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
         Telemetry::getInstance().inc_counter("engine_start_total");
     }
 
+    // AnomalyReporter (v0.4 field diagnostics): write an incident file for every
+    // anomaly (disconnect, connect failure, stall, runtime error) and optionally
+    // upload it to a collector server in production. Incidents land in
+    // <base_dir>/anomalies/ so they can be inspected via terminal / adb.
+    {
+        auto& cfg = ConfigManager::getInstance();
+        const auto engine_start_steady = std::chrono::steady_clock::now();
+
+        // Base dir: next to config.json (Android: filesDir; desktop: repo root),
+        // else next to the executable, else CWD (mirrors the peer-DB default).
+        std::string base_dir;
+        const std::string config_path = cfg.getConfigPath();
+        if (!config_path.empty()) {
+            try {
+                base_dir = std::filesystem::path(config_path).parent_path().string();
+            } catch (...) {
+                base_dir.clear();
+            }
+        }
+        if (base_dir.empty()) base_dir = get_executable_dir_best_effort();
+        if (base_dir.empty()) {
+            char cwd[PATH_MAX];
+            if (getcwd(cwd, sizeof(cwd)) != nullptr) base_dir = cwd;
+        }
+
+        AnomalyReporter::Config acfg;
+        acfg.enabled = cfg.isAnomalyReporterEnabled();
+        acfg.base_dir = base_dir;
+        acfg.subdir = cfg.getAnomalyDirectory();
+        acfg.max_files = cfg.getAnomalyMaxFiles();
+        acfg.upload_enabled = cfg.isAnomalyUploadEnabled();
+        acfg.upload_url = cfg.getAnomalyUploadUrl();
+        acfg.upload_interval_ms = cfg.getAnomalyUploadIntervalMs();
+        acfg.include_telemetry = cfg.anomalyIncludeTelemetry();
+#ifdef LITEP2P_VERSION_STRING
+        acfg.engine_version = LITEP2P_VERSION_STRING;
+#else
+        acfg.engine_version = "0.4.0";
+#endif
+        acfg.peer_id = peer_id;
+        AnomalyReporter::getInstance().configure(acfg);
+        AnomalyReporter::getInstance().setUptimeProvider([engine_start_steady]() {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - engine_start_steady)
+                .count();
+        });
+        if (AnomalyReporter::getInstance().isEnabled()) {
+            LOG_INFO("SM: AnomalyReporter enabled (dir=" + AnomalyReporter::getInstance().directory() + ")");
+        }
+    }
+
     // Variable to hold signaling FD for single-thread mode registration
     int single_thread_signaling_fd = -1;
 
@@ -1345,7 +1397,14 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
             LOG_WARN("SM: Using ephemeral listener port " + std::to_string(actual_port) + " (same-device coexistence)");
         }
         discovery->setConnectionPort(actual_port);
-        discovery->start(actual_port, peer_id);
+        // LAN discovery is optional (network.discovery_enabled). When disabled
+        // the engine runs purely on signaling/peer-DB/direct endpoints — also
+        // the hermetic-test path (no socket, no foreign announcements).
+        if (ConfigManager::getInstance().isDiscoveryEnabled()) {
+            discovery->start(actual_port, peer_id);
+        } else {
+            LOG_INFO("SM: LAN discovery disabled by config");
+        }
 
         // NAT detection in separate thread (multi-threaded mode)
         if (comms_mode != "TCP") {
@@ -3340,6 +3399,13 @@ void SessionManager::Impl::set_network_info(bool is_wifi, bool is_available) {
             } else {
                 LOG_WARN("SM: Failed to restart UDP socket after network change");
                 Telemetry::getInstance().inc_counter("network_change_socket_restart_failed_total");
+                {
+                    AnomalyReporter::Event ev;
+                    ev.type = "runtime_error";
+                    ev.detail = "UDP socket failed to restart after a network interface change";
+                    ev.extras.emplace_back("subsystem", "transport");
+                    AnomalyReporter::getInstance().report(ev);
+                }
             }
         }
 

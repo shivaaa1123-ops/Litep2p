@@ -91,12 +91,16 @@ jobs:
   #   file_transfer_test    — chunking/resume round-trips on local files
   #   overlay_test          — LPX2 onion routing, mailboxes, replay/TTL
   #   proxy_test            — LPX1 tunnel framing over loopback
+  #   session_manager_test  — session/peer-FSM suite. HERMETIC since v0.4:
+  #                           network.discovery_port is config-driven and the
+  #                           test binds a unique per-run port, and the
+  #                           dynamic port_range is disabled, so no foreign
+  #                           LAN broadcasts can reach the FSM.
+  #   malformed_input_test  — deterministic parser-robustness regression
+  #                           (wire codec, discovery announce, Noise NK).
+  #                           Complements the libFuzzer harnesses (fuzz job).
   #
   # Excluded (deliberately):
-  #   session_manager_test  — known test-isolation failure on single-host
-  #                           runs (shared LAN broadcast Discovery singleton
-  #                           lets peers connect around the stale-endpoint
-  #                           assertion); re-enable once isolated.
   #   wan_integration_runner, message_size_runner — require real networks;
   #                           covered by the self-hosted SG/US workflows.
   #   quic_test             — requires vendored picoquic/picotls builds not
@@ -126,7 +130,9 @@ jobs:
             nat_traversal_test \
             file_transfer_test \
             overlay_test \
-            proxy_test
+            proxy_test \
+            session_manager_test \
+            malformed_input_test
 
       - name: Run C ABI conformance tests
         run: ./desktop/build-ci/bin/c_api_test
@@ -145,6 +151,54 @@ jobs:
 
       - name: Run proxy tests
         run: ./desktop/build-ci/bin/proxy_test
+
+      - name: Run session manager tests (hermetic)
+        run: ./desktop/build-ci/bin/session_manager_test
+
+      - name: Run malformed-input parser regression
+        run: ./desktop/build-ci/bin/malformed_input_test
+
+  # -------------------------------------------------------------------------
+  # Parser fuzzing: coverage-guided libFuzzer runs of the wire parsers
+  # (wire codec, discovery announcement, Noise NK handshake/decrypt). Ubuntu
+  # clang ships the libFuzzer runtime, unlike Apple clang. The fuzz targets
+  # are EXCLUDE_FROM_ALL; build/run them explicitly. Short `-runs` smoke on
+  # every push; extend the corpus/`-max_total_time` for nightly hardening.
+  # -------------------------------------------------------------------------
+  fuzz:
+    name: Parser fuzz (libFuzzer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libsodium-dev nlohmann-json3-dev
+
+      - name: Configure (fuzz build)
+        run: |
+          cmake -S desktop -B desktop/build-fuzz \
+            -DLITEP2P_FUZZING=ON \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build fuzz harnesses
+        run: |
+          cmake --build desktop/build-fuzz -j"$(nproc)" --target \
+            fuzz_wire_codec fuzz_discovery fuzz_noise_handshake
+
+      - name: Fuzz wire codec
+        run: ./desktop/build-fuzz/bin/fuzz_wire_codec -runs=20000 -max_len=4096
+
+      - name: Fuzz discovery announcement parser
+        run: ./desktop/build-fuzz/bin/fuzz_discovery -runs=20000 -max_len=4096
+
+      - name: Fuzz Noise NK handshake/decrypt
+        run: ./desktop/build-fuzz/bin/fuzz_noise_handshake -runs=20000 -max_len=4096
 
   # ---------------------------------------------------------------------------
   # Publish: only on tags `v*`. Produces the Maven artifacts (AAR + POM +

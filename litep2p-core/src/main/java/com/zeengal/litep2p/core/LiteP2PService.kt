@@ -15,6 +15,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import org.json.JSONObject
 import java.util.concurrent.Executors
 
 /**
@@ -111,6 +112,9 @@ open class LiteP2PService : Service() {
                 acquireLocks()
                 Log.i(TAG, "Starting engine (${config.commsMode})")
 
+                // Field diagnostics: identify this device in incident logs.
+                pushAnomalyDeviceInfo()
+
                 // init() refuses while RUNNING/STARTING — e.g. a sticky
                 // restart racing a still-alive engine. Clear and retry once.
                 if (LiteP2P.init(config) == EngineResult.INVALID_STATE) {
@@ -156,6 +160,26 @@ open class LiteP2PService : Service() {
                 releaseLocks()
                 finishService()
             }
+        }
+    }
+
+    /**
+     * Identifies this device in incident logs (AnomalyReporter): brand, model,
+     * Android version, primary ABI and SDK level. Uses only public Build fields.
+     */
+    private fun pushAnomalyDeviceInfo() {
+        try {
+            val json = JSONObject().apply {
+                put("brand", Build.MANUFACTURER)
+                put("model", Build.MODEL)
+                put("os", "Android " + Build.VERSION.RELEASE)
+                put("abi", Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown")
+                put("sdk", Build.VERSION.SDK_INT)
+            }.toString()
+            LiteP2P.setAnomalyDeviceInfo(json)
+            Log.i(TAG, "Pushed anomaly device info: $json")
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to push anomaly device info: ${t.message}")
         }
     }
 
