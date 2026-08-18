@@ -296,6 +296,7 @@ private:
     // State
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_shutting_down{false};
+    mutable std::mutex m_lifecycle_mutex;
     
     // Socket health
     SocketHealth m_socket_health;
@@ -308,7 +309,12 @@ private:
     // Peer recovery state
     mutable std::mutex m_peers_mutex;
     std::unordered_map<std::string, PeerRecoveryState> m_peer_states;
-    std::queue<std::string> m_recovery_queue;
+    struct RecoveryWork {
+        std::string peer_id;
+        std::chrono::steady_clock::time_point due_time;
+    };
+    std::vector<RecoveryWork> m_recovery_queue;
+    std::unordered_set<std::string> m_recovery_queued;
     
     // Statistics
     mutable std::mutex m_stats_mutex;

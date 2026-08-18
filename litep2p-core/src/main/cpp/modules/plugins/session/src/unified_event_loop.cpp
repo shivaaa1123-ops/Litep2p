@@ -387,16 +387,22 @@ void UnifiedEventLoop::processPendingEvents() {
 
 void UnifiedEventLoop::processTimers() {
     auto now = std::chrono::steady_clock::now();
-    
-    // Process scheduled events
+
+    // Never invoke handlers while holding m_scheduled_mutex. Handlers commonly
+    // schedule or cancel events and must be allowed to re-enter the scheduler.
+    std::vector<SessionEvent> due_events;
     {
         std::lock_guard<std::mutex> lock(m_scheduled_mutex);
-        while (!m_scheduled_events.empty() && 
+        while (!m_scheduled_events.empty() &&
                m_scheduled_events.front().due_time <= now) {
-            if (m_event_handler) {
-                m_event_handler(m_scheduled_events.front().event);
-            }
+            due_events.push_back(std::move(m_scheduled_events.front().event));
             m_scheduled_events.erase(m_scheduled_events.begin());
+        }
+    }
+
+    for (const auto& event : due_events) {
+        if (m_event_handler) {
+            m_event_handler(event);
         }
     }
     

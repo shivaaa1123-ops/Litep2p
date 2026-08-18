@@ -1120,21 +1120,33 @@ main() {
     }
     trap cleanup EXIT INT TERM
     
-    # Run all tests (do not abort on first failure; we want full diagnostics + perf numbers).
-    test_1_basic_startup || true
-    test_2_port_binding || true
-    test_3_duplicate_port || true
-    test_4_two_peer_discovery || true
-    test_5_message_passing || true
-    test_6_error_recovery || true
-    test_7_performance_metrics || true
-    test_8_stress_test || true
-    test_9_invalid_inputs || true
-    test_10_concurrent_peers || true
-    # Enhanced mesh tests with different protocols
-    test_11_mesh_protocol_restart UDP || true
-    test_11_mesh_protocol_restart TCP || true
-    test_11_mesh_protocol_restart QUIC || true
+    # Run every test for complete diagnostics, but preserve each test's status.
+    # Do not use `|| true`: it makes a failing test indistinguishable from a
+    # passing test to callers that only inspect the process exit code.
+    local suite_exit=0
+    run_suite_test() {
+        local test_name="$1"
+        shift
+        if ! "$@"; then
+            log_error "${test_name} returned a failure status"
+            suite_exit=1
+        fi
+    }
+
+    run_suite_test "basic startup" test_1_basic_startup
+    run_suite_test "port binding" test_2_port_binding
+    run_suite_test "duplicate port" test_3_duplicate_port
+    run_suite_test "two peer discovery" test_4_two_peer_discovery
+    run_suite_test "message passing" test_5_message_passing
+    run_suite_test "error recovery" test_6_error_recovery
+    run_suite_test "performance metrics" test_7_performance_metrics
+    run_suite_test "stress test" test_8_stress_test
+    run_suite_test "invalid inputs" test_9_invalid_inputs
+    run_suite_test "concurrent peers" test_10_concurrent_peers
+    # Enhanced mesh tests with different protocols.
+    run_suite_test "UDP mesh restart" test_11_mesh_protocol_restart UDP
+    run_suite_test "TCP mesh restart" test_11_mesh_protocol_restart TCP
+    run_suite_test "QUIC mesh restart" test_11_mesh_protocol_restart QUIC
     
     # Final cleanup
     cleanup
@@ -1160,14 +1172,11 @@ main() {
     echo "Pass rate: ${pass_rate}%"
     echo ""
     
-    if [ $TESTS_FAILED -eq 0 ]; then
+    if [ "$suite_exit" -eq 0 ] && [ "$TESTS_FAILED" -eq 0 ] && [ "$TESTS_TOTAL" -gt 0 ]; then
         echo -e "${GREEN}✓ All tests passed!${NC}"
         exit 0
-    elif [ $pass_rate -ge 70 ]; then
-        echo -e "${YELLOW}⚠ Some tests failed, but pass rate is acceptable (${pass_rate}%)${NC}"
-        exit 0
     else
-        echo -e "${RED}✗ Multiple tests failed (pass rate: ${pass_rate}%)${NC}"
+        echo -e "${RED}✗ Test suite failed (pass rate: ${pass_rate}%, failed: ${TESTS_FAILED})${NC}"
         exit 1
     fi
 }

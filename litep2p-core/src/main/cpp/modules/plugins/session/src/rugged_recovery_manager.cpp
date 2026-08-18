@@ -6,7 +6,6 @@
 #include <sstream>
 #include <iomanip>
 #include <random>
-#include <thread>
 #include <algorithm>
 
 namespace recovery {
@@ -28,6 +27,7 @@ void RuggedRecoveryManager::initialize(
     ReconnectPeerCallback reconnect_peer,
     GetPeerNetworkIdCallback get_network_id
 ) {
+    std::lock_guard<std::mutex> lifecycle_lock(m_lifecycle_mutex);
     if (m_initialized.load(std::memory_order_acquire)) {
         LOG_WARN("RuggedRecoveryManager: Already initialized");
         return;
@@ -38,6 +38,21 @@ void RuggedRecoveryManager::initialize(
     m_restart_socket = std::move(restart_socket);
     m_reconnect_peer = std::move(reconnect_peer);
     m_get_network_id = std::move(get_network_id);
+
+    // A manager may be stopped and started again by its owner.  Clear all
+    // terminal state from the previous lifetime before publishing initialized.
+    m_shutting_down.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> messages_lock(m_messages_mutex);
+        m_pending_messages.clear();
+        m_seen_message_ids.clear();
+    }
+    {
+        std::lock_guard<std::mutex> peers_lock(m_peers_mutex);
+        m_peer_states.clear();
+        m_recovery_queue.clear();
+        m_recovery_queued.clear();
+    }
     
     // Initialize socket health
     m_socket_health.is_healthy.store(true, std::memory_order_release);
@@ -49,24 +64,46 @@ void RuggedRecoveryManager::initialize(
 }
 
 void RuggedRecoveryManager::shutdown() {
+    std::unique_lock<std::mutex> lifecycle_lock(m_lifecycle_mutex);
     if (!m_initialized.load(std::memory_order_acquire)) {
         return;
     }
     
     m_shutting_down.store(true, std::memory_order_release);
+    // Publish the shutdown barrier before draining callbacks.  This prevents
+    // another thread from accepting new reliable work while callbacks run.
+    m_initialized.store(false, std::memory_order_release);
     
-    // Fail all pending messages
+    // Detach callbacks under the lock, then invoke them after unlocking. An
+    // application callback may synchronously call back into this manager.
+    std::vector<std::function<void(DeliveryStatus, DeliveryPath)>> callbacks;
+    std::vector<DeliveryPath> callback_paths;
     {
         std::lock_guard<std::mutex> lock(m_messages_mutex);
         for (auto& kv : m_pending_messages) {
             if (kv.second.on_complete) {
-                kv.second.on_complete(DeliveryStatus::FAILED_PEER_GONE, kv.second.current_path);
+                callbacks.push_back(std::move(kv.second.on_complete));
+                callback_paths.push_back(kv.second.current_path);
             }
         }
         m_pending_messages.clear();
     }
+
+    {
+        std::lock_guard<std::mutex> lock(m_peers_mutex);
+        m_recovery_queue.clear();
+        m_recovery_queued.clear();
+    }
+
+    // All internal state is now quiescent.  Release the lifecycle barrier
+    // before invoking application callbacks so they may safely re-enter or
+    // reinitialize this manager.
+    lifecycle_lock.unlock();
+
+    for (size_t i = 0; i < callbacks.size(); ++i) {
+        callbacks[i](DeliveryStatus::FAILED_PEER_GONE, callback_paths[i]);
+    }
     
-    m_initialized.store(false, std::memory_order_release);
     LOG_INFO("RuggedRecoveryManager: Shutdown complete");
 }
 
@@ -95,8 +132,11 @@ std::string RuggedRecoveryManager::send_reliable(
     bool require_ack,
     std::function<void(DeliveryStatus, DeliveryPath)> on_complete
 ) {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    std::unique_lock<std::mutex> lifecycle_lock(m_lifecycle_mutex);
+    if (!m_initialized.load(std::memory_order_acquire) ||
+        m_shutting_down.load(std::memory_order_acquire)) {
         LOG_WARN("RuggedRecoveryManager: Not initialized, cannot send reliable message");
+        lifecycle_lock.unlock();
         if (on_complete) {
             on_complete(DeliveryStatus::FAILED_PEER_GONE, DeliveryPath::DIRECT_UDP);
         }
@@ -133,6 +173,7 @@ std::string RuggedRecoveryManager::send_reliable(
         std::lock_guard<std::mutex> lock(m_messages_mutex);
         m_pending_messages[message_id] = record;
     }
+    lifecycle_lock.unlock();
     
     // Send via appropriate path
     send_via_path(record);
@@ -184,43 +225,44 @@ void RuggedRecoveryManager::send_via_path(MessageDeliveryRecord& record) {
 }
 
 bool RuggedRecoveryManager::process_ack(const std::string& message_id) {
-    std::lock_guard<std::mutex> lock(m_messages_mutex);
-    
-    auto it = m_pending_messages.find(message_id);
-    if (it == m_pending_messages.end()) {
-        return false;
+    DeliveryStatus status;
+    DeliveryPath path;
+    std::function<void(DeliveryStatus, DeliveryPath)> callback;
+    std::string peer_id;
+    {
+        std::lock_guard<std::mutex> lock(m_messages_mutex);
+        auto it = m_pending_messages.find(message_id);
+        if (it == m_pending_messages.end()) return false;
+
+        MessageDeliveryRecord& record = it->second;
+        status = (record.current_path == DeliveryPath::SIGNALING_RELAY)
+                     ? DeliveryStatus::RELAYED : DeliveryStatus::DELIVERED;
+        path = record.current_path;
+        peer_id = record.peer_id;
+        callback = std::move(record.on_complete);
+        m_pending_messages.erase(it);
     }
-    
-    MessageDeliveryRecord& record = it->second;
-    record.status = (record.current_path == DeliveryPath::SIGNALING_RELAY) 
-                    ? DeliveryStatus::RELAYED 
-                    : DeliveryStatus::DELIVERED;
-    
-    // Update peer stats
+
     {
         std::lock_guard<std::mutex> peer_lock(m_peers_mutex);
-        auto& peer_state = get_or_create_peer_state(record.peer_id);
-        peer_state.record_success(record.current_path == DeliveryPath::SIGNALING_RELAY);
-    }
-    
-    // Callback
-    if (record.on_complete) {
-        record.on_complete(record.status, record.current_path);
+        auto& peer_state = get_or_create_peer_state(peer_id);
+        peer_state.record_success(path == DeliveryPath::SIGNALING_RELAY);
     }
     
     // Update stats
     {
         std::lock_guard<std::mutex> stats_lock(m_stats_mutex);
         m_stats.messages_delivered_total++;
-        if (record.current_path == DeliveryPath::SIGNALING_RELAY) {
+        if (path == DeliveryPath::SIGNALING_RELAY) {
             m_stats.messages_relayed_total++;
         }
     }
+
+    if (callback) callback(status, path);
     
     LOG_INFO("RuggedRecoveryManager: ACK received for message " + message_id + 
-             " after " + std::to_string(record.attempt_count) + " attempts");
+             " for peer " + peer_id);
     
-    m_pending_messages.erase(it);
     return true;
 }
 
@@ -326,11 +368,9 @@ void RuggedRecoveryManager::handle_network_change(bool is_wifi, bool is_availabl
         return;
     }
     
-    // Network available - start recovery sequence
-    // Step 1: Wait for interface to stabilize
-    std::this_thread::sleep_for(std::chrono::milliseconds(POST_NETWORK_CHANGE_SETTLE_MS));
-    
-    // Step 2: Restart socket with verification
+    // Network available - restart immediately. Interface stabilization is
+    // represented by the normal retry/recovery state machine; never block the
+    // maintenance/event-loop thread with a fixed sleep.
     bool socket_ok = restart_socket_verified();
     if (!socket_ok) {
         LOG_WARN("RuggedRecoveryManager: Socket restart failed after network change");
@@ -345,7 +385,9 @@ void RuggedRecoveryManager::handle_network_change(bool is_wifi, bool is_availabl
         }
     }
     
-    // Step 4: Re-send all pending reliable messages via relay (guaranteed path)
+    // Step 4: Snapshot pending messages under the lock, then perform transport
+    // callbacks after unlocking. Transport callbacks may re-enter recovery.
+    std::vector<MessageDeliveryRecord> relay_records;
     {
         std::lock_guard<std::mutex> lock(m_messages_mutex);
         for (auto& kv : m_pending_messages) {
@@ -353,10 +395,14 @@ void RuggedRecoveryManager::handle_network_change(bool is_wifi, bool is_availabl
             if (record.status == DeliveryStatus::PENDING) {
                 record.current_path = DeliveryPath::SIGNALING_RELAY;
                 record.last_attempt = std::chrono::steady_clock::now();
-                send_via_path(record);
-                LOG_INFO("RuggedRecoveryManager: Re-sent pending message " + record.message_id + " via relay");
+                relay_records.push_back(record);
             }
         }
+    }
+
+    for (auto& record : relay_records) {
+        send_via_path(record);
+        LOG_INFO("RuggedRecoveryManager: Re-sent pending message " + record.message_id + " via relay");
     }
     
     m_network_recovery_in_progress.store(false, std::memory_order_release);
@@ -380,37 +426,23 @@ bool RuggedRecoveryManager::restart_socket_verified() {
                      std::to_string(attempt + 1) + "/" + 
                      std::to_string(SOCKET_RESTART_MAX_RETRIES) + " failed");
             
-            std::this_thread::sleep_for(std::chrono::milliseconds(100 * (attempt + 1)));
+            // Retry is driven by the caller's next maintenance tick. Do not
+            // sleep here, because this method may run on the event loop.
             continue;
         }
         
-        // Verify socket is working by waiting for any successful operation
-        int64_t start_ms = steady_now_ms();
-        while (steady_now_ms() - start_ms < SOCKET_RESTART_VERIFY_TIMEOUT_MS) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(SOCKET_RESTART_VERIFY_INTERVAL_MS));
-            
-            // Check if we've had any successful sends/receives since restart
-            int64_t restart_time = m_socket_health.last_restart_ms.load(std::memory_order_acquire);
-            int64_t last_send = m_socket_health.last_send_success_ms.load(std::memory_order_acquire);
-            int64_t last_recv = m_socket_health.last_recv_success_ms.load(std::memory_order_acquire);
-            
-            if (last_send > restart_time || last_recv > restart_time) {
-                // Socket verified working
-                m_socket_health.is_healthy.store(true, std::memory_order_release);
-                m_socket_health.consecutive_send_failures.store(0, std::memory_order_release);
-                
-                {
-                    std::lock_guard<std::mutex> lock(m_stats_mutex);
-                    m_stats.socket_restarts_total++;
-                }
-                
-                LOG_INFO("RuggedRecoveryManager: Socket restart verified successfully");
-                return true;
-            }
+        // A successful restart means the socket was created, configured, and
+        // bound successfully. Packet-level health is tracked asynchronously by
+        // report_socket_send/report_socket_recv; waiting here would stall the
+        // event loop for several seconds.
+        m_socket_health.is_healthy.store(true, std::memory_order_release);
+        m_socket_health.consecutive_send_failures.store(0, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lock(m_stats_mutex);
+            m_stats.socket_restarts_total++;
         }
-        
-        LOG_WARN("RuggedRecoveryManager: Socket restart verification timeout (attempt " + 
-                 std::to_string(attempt + 1) + ")");
+        LOG_INFO("RuggedRecoveryManager: Socket restart completed; health verification is asynchronous");
+        return true;
     }
     
     // All attempts failed
@@ -453,7 +485,14 @@ void RuggedRecoveryManager::report_socket_recv(bool success) {
 
 void RuggedRecoveryManager::schedule_peer_recovery(const std::string& peer_id) {
     std::lock_guard<std::mutex> lock(m_peers_mutex);
-    m_recovery_queue.push(peer_id);
+    if (peer_id.empty() || m_recovery_queued.count(peer_id) != 0) {
+        return;
+    }
+
+    const auto due_time = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(RECONNECT_BURST_INTERVAL_MS);
+    m_recovery_queue.push_back({peer_id, due_time});
+    m_recovery_queued.insert(peer_id);
     
     {
         std::lock_guard<std::mutex> stats_lock(m_stats_mutex);
@@ -497,12 +536,14 @@ void RuggedRecoveryManager::tick() {
 void RuggedRecoveryManager::process_pending_retries() {
     std::vector<MessageDeliveryRecord> records_to_retry;
     std::vector<std::string> records_to_remove;
+    std::vector<std::pair<std::function<void(DeliveryStatus, DeliveryPath)>,
+                          DeliveryPath>> completion_callbacks;
     
     auto now_time = std::chrono::steady_clock::now();
     
     {
         std::lock_guard<std::mutex> lock(m_messages_mutex);
-        
+
         for (auto& kv : m_pending_messages) {
             MessageDeliveryRecord& record = kv.second;
             
@@ -522,11 +563,10 @@ void RuggedRecoveryManager::process_pending_retries() {
             if (record.attempt_count >= MESSAGE_ACK_MAX_RETRIES) {
                 // All retries exhausted
                 record.status = DeliveryStatus::FAILED_TIMEOUT;
-                
                 if (record.on_complete) {
-                    record.on_complete(record.status, record.current_path);
+                    completion_callbacks.emplace_back(std::move(record.on_complete),
+                                                      record.current_path);
                 }
-                
                 // Update peer stats
                 {
                     std::lock_guard<std::mutex> peer_lock(m_peers_mutex);
@@ -560,6 +600,10 @@ void RuggedRecoveryManager::process_pending_retries() {
         for (const auto& id : records_to_remove) {
             m_pending_messages.erase(id);
         }
+    }
+
+    for (auto& callback : completion_callbacks) {
+        callback.first(DeliveryStatus::FAILED_TIMEOUT, callback.second);
     }
     
     // Send retries (outside lock)
@@ -621,23 +665,26 @@ void RuggedRecoveryManager::process_recovery_queue() {
     }
     
     std::vector<std::string> peers_to_recover;
+    const auto now = std::chrono::steady_clock::now();
     
     {
         std::lock_guard<std::mutex> lock(m_peers_mutex);
-        int count = 0;
-        while (!m_recovery_queue.empty() && count < PARALLEL_RECONNECT_LIMIT) {
-            peers_to_recover.push_back(m_recovery_queue.front());
-            m_recovery_queue.pop();
-            count++;
+        auto it = m_recovery_queue.begin();
+        while (it != m_recovery_queue.end() &&
+               static_cast<int>(peers_to_recover.size()) < PARALLEL_RECONNECT_LIMIT) {
+            if (it->due_time <= now) {
+                peers_to_recover.push_back(it->peer_id);
+                m_recovery_queued.erase(it->peer_id);
+                it = m_recovery_queue.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
     
     for (const auto& peer_id : peers_to_recover) {
         LOG_INFO("RuggedRecoveryManager: Processing recovery for peer " + peer_id);
         m_reconnect_peer(peer_id);
-        
-        // Small delay between reconnects to avoid storming
-        std::this_thread::sleep_for(std::chrono::milliseconds(RECONNECT_BURST_INTERVAL_MS));
     }
 }
 
@@ -663,6 +710,11 @@ RuggedRecoveryManager::Stats RuggedRecoveryManager::get_stats() const {
 }
 
 std::string RuggedRecoveryManager::get_status_json() const {
+    size_t pending_messages = 0;
+    {
+        std::lock_guard<std::mutex> messages_lock(m_messages_mutex);
+        pending_messages = m_pending_messages.size();
+    }
     std::lock_guard<std::mutex> lock(m_stats_mutex);
     
     std::stringstream ss;
@@ -677,7 +729,7 @@ std::string RuggedRecoveryManager::get_status_json() const {
        << "\"network_changes_handled\":" << m_stats.network_changes_handled << ","
        << "\"peer_recoveries_triggered\":" << m_stats.peer_recoveries_triggered << ","
        << "\"socket_healthy\":" << (m_socket_health.is_healthy.load() ? "true" : "false") << ","
-       << "\"pending_messages\":" << m_pending_messages.size()
+       << "\"pending_messages\":" << pending_messages
        << "}";
     
     return ss.str();

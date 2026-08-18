@@ -143,6 +143,7 @@ Prerequisites: JDK 17, Android SDK (compileSdk 36), NDK `26.1.10909125`
 
 # JVM unit tests (pure-Kotlin wire mapping)
 ./gradlew :litep2p-core:testMultiThreadDebugUnitTest
+./gradlew :litep2p-core:testSingleThreadDebugUnitTest
 ```
 
 The AAR packages `arm64-v8a`, `armeabi-v7a`, and `x86_64` (32-bit `x86` is
@@ -169,19 +170,20 @@ cmake --build desktop/build -j"$(nproc)"
 | `LiteP2PCoreTest` (JVM) | `./gradlew :litep2p-core:test…UnitTest` | Kotlin enums/wire mapping vs the C ABI |
 | `c_api_test` | `desktop/tests/` | Public C ABI end-to-end (lifecycle, config, disconnect, file-transfer errors, overlay) |
 | `crypto_test`, `nat_traversal_test`, `file_transfer_test`, `overlay_test`, `proxy_test` | `desktop/tests/` | Engine module unit/integration tests (hermetic, loopback/in-memory) |
-| `session_manager_test` | `desktop/tests/` | SessionManager lifecycle/FSM tests (see known issue below) |
+| `quic_test` | `desktop/tests/` | Optional real-QUIC loopback handshake/datagram test; built only with `LITEP2P_ENABLE_REAL_QUIC=ON` and picoquic/picotls available |
+| `session_manager_test` | `desktop/tests/` | SessionManager lifecycle/FSM tests; LAN discovery and external subsystems are disabled for hermetic execution |
 | `wan_integration_runner`, stress suite | self-hosted CI (`litep2p-sg`/`litep2p-us`) | Real WAN connectivity, packet loss, reconnect churn |
 | `tools/harness/` | scripts | e2e messaging, Android connectivity matrices, soak tests |
 
 CI (`.github/workflows/build-and-publish.yml`) builds both Android flavors
-for all ABIs, runs the JVM unit tests and the desktop test suite on every
-push/PR, and publishes Maven artifacts to GitHub Releases on `v*` tags.
-
-> **Known issue:** `session_manager_test` → `test_udp_endpoint_upgrade_while_connecting_prefers_local`
-> fails on single-host runs: the two in-process `SessionManager` instances
-> share the global LAN broadcast `Discovery` singleton (fixed UDP port 30000),
-> so peer A discovers peer B over broadcast and connects despite the stale
-> public endpoint the test asserts against. Tracked for a test-isolation fix.
+for all configured ABIs, runs both flavor JVM unit-test suites, builds and
+runs the standard desktop regression set and fuzz smoke tests on every
+push/PR. A real-QUIC desktop build runs `quic_test` separately when its
+vendored dependencies are enabled. Publishing is tag-gated and requires the
+Android, desktop, and fuzz jobs to pass before Maven artifacts are attached to
+a GitHub Release on `v*` tags. WAN and stress suites remain scheduled or
+manually dispatched because they require dedicated self-hosted infrastructure;
+they are operational validation, not enforced tag-release gates.
 
 ## Repository layout
 

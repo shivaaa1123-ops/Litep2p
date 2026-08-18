@@ -91,11 +91,10 @@ jobs:
   #   file_transfer_test    — chunking/resume round-trips on local files
   #   overlay_test          — LPX2 onion routing, mailboxes, replay/TTL
   #   proxy_test            — LPX1 tunnel framing over loopback
-  #   session_manager_test  — session/peer-FSM suite. HERMETIC since v0.4:
-  #                           network.discovery_port is config-driven and the
-  #                           test binds a unique per-run port, and the
-  #                           dynamic port_range is disabled, so no foreign
-  #                           LAN broadcasts can reach the FSM.
+  #   session_manager_test  — session/peer-FSM suite. Hermetic: the test
+  #                           disables LAN discovery and external subsystems.
+  #   quic_test              — optional real QUIC loopback handshake/datagram
+  #                           test; requires a real-QUIC-enabled build.
   #   malformed_input_test  — deterministic parser-robustness regression
   #                           (wire codec, discovery announce, Noise NK).
   #                           Complements the libFuzzer harnesses (fuzz job).
@@ -103,8 +102,9 @@ jobs:
   # Excluded (deliberately):
   #   wan_integration_runner, message_size_runner — require real networks;
   #                           covered by the self-hosted SG/US workflows.
-  #   quic_test             — requires vendored picoquic/picotls builds not
-  #                           present on standard runners.
+  #                           Real QUIC is intentionally outside this standard
+  #                           job because its optional dependencies are not
+  #                           installed on standard runners.
   # -------------------------------------------------------------------------
   desktop-c-test:
     name: Desktop C ABI tests
@@ -210,7 +210,7 @@ jobs:
   publish:
     name: Publish Maven artifacts
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [android, desktop-c-test]
+    needs: [android, desktop-c-test, fuzz]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -249,13 +249,50 @@ jobs:
       - name: Build + publish to Maven Local (validates and produces artifacts)
         run: |
           ./gradlew \
+            :litep2p-core:externalNativeBuildMultiThreadDebug \
+            :litep2p-core:assembleMultiThreadRelease \
+            :litep2p-core:assembleSingleThreadRelease \
+            :litep2p-core:multiThreadReleaseSourcesJar \
+            :litep2p-core:singleThreadReleaseSourcesJar \
+            :litep2p-core:dokkaJar \
             :litep2p-core:publishMultiThreadReleasePublicationToMavenLocal \
             :litep2p-core:publishSingleThreadReleasePublicationToMavenLocal
 
       - name: Stage release artifacts
         run: |
+          set -euo pipefail
+          SDK_VERSION="${GITHUB_REF_NAME#v}"
+          MAVEN_ROOT="$HOME/.m2/repository/com/zeengal"
+          for artifact in litep2p-core litep2p-core-singleThread; do
+            version_dir="$MAVEN_ROOT/$artifact/$SDK_VERSION"
+            if [[ ! -d "$version_dir" ]]; then
+              echo "Missing Maven publication directory: $version_dir"
+              exit 1
+            fi
+            for suffix in ".aar" "-sources.jar" "-javadoc.jar" ".pom"; do
+              file="$version_dir/$artifact-$SDK_VERSION${suffix}"
+              if [[ ! -s "$file" ]]; then
+                echo "Missing or empty required artifact: $file"
+                exit 1
+              fi
+            done
+          done
           mkdir -p release-artifacts
-          cp -rv "$HOME/.m2/repository/com/zeengal/litep2p-core/"* release-artifacts/
+          cp -rv "$MAVEN_ROOT/litep2p-core/$SDK_VERSION" release-artifacts/
+          cp -rv "$MAVEN_ROOT/litep2p-core-singleThread/$SDK_VERSION" release-artifacts/
+
+      - name: Verify staged release artifacts
+        run: |
+          set -euo pipefail
+          count="$(find release-artifacts -type f | wc -l | tr -d ' ')"
+          if [[ "$count" -lt 8 ]]; then
+            echo "Expected at least 8 non-empty artifacts, found $count"
+            find release-artifacts -type f -print
+            exit 1
+          fi
+          while IFS= read -r file; do
+            [[ -s "$file" ]] || { echo "Empty staged artifact: $file"; exit 1; }
+          done < <(find release-artifacts -type f)
 
       - name: Attach artifacts to GitHub Release
         uses: softprops/action-gh-release@v2

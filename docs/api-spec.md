@@ -126,8 +126,11 @@ Notes:
   a GPG key + Sonatype credentials (`~/.gradle/gradle.properties`). The POM
   already carries license/SCM/developer metadata required by Central.
 - **Automated CI:** `.github/workflows/build-and-publish.yml` builds both
-  flavors (all ABIs) + runs the JVM unit tests and the desktop C ABI suite on
-  standard runners for every push/PR, and on a `v<version>` tag produces the
+  flavors (all configured ABIs), runs both JVM unit-test suites, builds and
+  runs the standard desktop regression set, and runs fuzz smoke tests on
+  standard runners for every push/PR. The optional `quic_test` runs only in a
+  real-QUIC-enabled desktop build with picoquic/picotls available. On a
+  `v<version>` tag it produces the
   Maven artifacts and attaches them to a GitHub Release.
 
 **Option A — vendor the module into your project.** Copy the `litep2p-core/`
