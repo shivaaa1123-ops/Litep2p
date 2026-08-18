@@ -67,6 +67,11 @@
         "peer_expiration_timeout_ms": 30000,
         "max_queued_messages": 100,
         "max_pending_sends": 1000,
+        /* Hard caps for internal asynchronous work. New best-effort events or
+           recovery requests are rejected when full; the engine logs counters
+           rather than allowing a prolonged outage to consume unbounded RAM. */
+        "max_queued_events": 4096,
+        "max_recovery_queue_entries": 1024,
         "max_message_size": 10485760,
         "max_handshake_retries": 3
     },

@@ -171,6 +171,7 @@ struct PeerRecoveryState {
 class RuggedRecoveryManager {
 public:
     using SendCallback = std::function<void(const std::string& network_id, const std::string& message)>;
+    using TcpSendCallback = std::function<bool(const std::string& peer_id, const std::string& message)>;
     using RelayCallback = std::function<void(const std::string& peer_id, const std::string& message)>;
     using RestartSocketCallback = std::function<bool()>;
     using ReconnectPeerCallback = std::function<void(const std::string& peer_id)>;
@@ -182,6 +183,7 @@ public:
     // Initialization
     void initialize(
         SendCallback send_direct,
+        TcpSendCallback send_tcp,
         RelayCallback send_relay,
         RestartSocketCallback restart_socket,
         ReconnectPeerCallback reconnect_peer,
@@ -280,6 +282,7 @@ public:
         int64_t path_escalations_total = 0;
         int64_t network_changes_handled = 0;
         int64_t peer_recoveries_triggered = 0;
+        int64_t recovery_queue_dropped_total = 0;
     };
     
     Stats get_stats() const;
@@ -288,6 +291,7 @@ public:
 private:
     // Callbacks
     SendCallback m_send_direct;
+    TcpSendCallback m_send_tcp;
     RelayCallback m_send_relay;
     RestartSocketCallback m_restart_socket;
     ReconnectPeerCallback m_reconnect_peer;
@@ -311,10 +315,12 @@ private:
     std::unordered_map<std::string, PeerRecoveryState> m_peer_states;
     struct RecoveryWork {
         std::string peer_id;
+        uint64_t generation = 0;
         std::chrono::steady_clock::time_point due_time;
     };
     std::vector<RecoveryWork> m_recovery_queue;
     std::unordered_set<std::string> m_recovery_queued;
+    std::unordered_map<std::string, uint64_t> m_recovery_generation;
     
     // Statistics
     mutable std::mutex m_stats_mutex;

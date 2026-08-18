@@ -95,6 +95,11 @@ public:
     // v0.4 backpressure: max plain-send events allowed in the engine event
     // queue before litep2p_send() returns LITEP2P_ERR_QUEUE_FULL.
     int getMaxPendingSends() const;
+    // Hard upper bound for internal event-loop work.  Reaching this limit drops
+    // new best-effort work rather than allowing an outage to exhaust memory.
+    int getMaxQueuedEvents() const;
+    // Hard upper bound for scheduled recovery requests.
+    int getMaxRecoveryQueueEntries() const;
 
     // Event Manager
     int getEventQueueWaitTimeoutMs() const;

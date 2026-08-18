@@ -574,9 +574,7 @@ SessionManager::Impl::Impl(std::shared_ptr<ISessionDependenciesFactory> factory)
             [this](const std::string& origin_peer_id, const std::string& payload) {
                 // Overlay-delivered messages surface through the normal
                 // application message callback, tagged with the ORIGIN's id.
-                if (m_message_received_cb) {
-                    m_message_received_cb(origin_peer_id, payload);
-                }
+                invoke_message_received_callback(origin_peer_id, payload);
             });
 #if HAVE_NOISE_PROTOCOL
         // Static keys from the Noise key store drive LPX2 sealing.
@@ -1515,6 +1513,24 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
             [this](const std::string& network_id, const std::string& message) {
                 send_message_to_peer(network_id, message);
             },
+            [this](const std::string& peer_id, const std::string& message) -> bool {
+                if (m_shutting_down.load(std::memory_order_acquire) || !m_tcpConnectionManager) return false;
+                std::string network_id;
+                {
+                    std::lock_guard<std::mutex> lock(m_peers_mutex);
+                    const Peer* peer = find_peer_by_id(peer_id);
+                    if (!peer) return false;
+                    network_id = peer->network_id;
+                }
+                const size_t colon = network_id.rfind(':');
+                if (colon == std::string::npos) return false;
+                const std::string ip = network_id.substr(0, colon);
+                int port = 0;
+                try { port = std::stoi(network_id.substr(colon + 1)); } catch (...) { return false; }
+                if (ip.empty() || port < 1 || port > 65535 || !m_tcpConnectionManager->connectToPeer(ip, port)) return false;
+                m_tcpConnectionManager->sendMessageToPeer(network_id, message);
+                return true;
+            },
             // Send relay callback
             [this](const std::string& peer_id, const std::string& message) {
                 if (m_signaling_client && m_signaling_client->isConnected()) {
@@ -2314,7 +2330,18 @@ void SessionManager::Impl::sendMessageToPeer(const std::string& peer_id, const s
 
 void SessionManager::Impl::setMessageReceivedCallback(std::function<void(const std::string&, const std::string&)> cb) {
     LOG_INFO("SM: Message received callback registered");
-    m_message_received_cb = cb;
+    std::lock_guard<std::mutex> lock(m_message_received_cb_mutex);
+    m_message_received_cb = std::move(cb);
+}
+
+void SessionManager::Impl::invoke_message_received_callback(const std::string& peer_id,
+                                                            const std::string& message) {
+    std::function<void(const std::string&, const std::string&)> callback;
+    {
+        std::lock_guard<std::mutex> lock(m_message_received_cb_mutex);
+        callback = m_message_received_cb;
+    }
+    if (callback && !m_shutting_down.load(std::memory_order_acquire)) callback(peer_id, message);
 }
 
 void SessionManager::Impl::set_battery_level_public(int percent, bool is_charging) {
@@ -6152,9 +6179,7 @@ void SessionManager::Impl::handle_signaling_v04_message(const json& data) {
             }
 
             const std::string payload = reliable_base64_decode(b64);
-            if (m_message_received_cb) {
-                m_message_received_cb(from, payload);
-            }
+            invoke_message_received_callback(from, payload);
         }
         return;
     }

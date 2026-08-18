@@ -117,6 +117,14 @@ void EventManager::pushEvent(SessionEvent event) {
     {
         NATIVELOGW("EM_NATIVE: pushEvent - acquiring lock");
         std::lock_guard<std::mutex> lock(m_eventMutex);
+        const size_t max_events = static_cast<size_t>(ConfigManager::getInstance().getMaxQueuedEvents());
+        if (m_eventQueue.size() >= max_events) {
+            const uint64_t dropped = m_droppedEvents.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (dropped == 1 || (dropped % 100) == 0) {
+                LOG_WARN("EM: event queue full; dropped=" + std::to_string(dropped));
+            }
+            return;
+        }
         m_eventQueue.push(event);
         queue_size = m_eventQueue.size();
         NATIVELOGW("EM_NATIVE: pushEvent - releasing lock");

@@ -949,9 +949,9 @@ namespace detail {
                                 // Dedup: fire onMessageReceived at most once per msg_id.
                                 const bool dup = m_sm->m_reliable_send_manager &&
                                                  m_sm->m_reliable_send_manager->is_duplicate(msg_id);
-                                if (!dup && m_sm->m_message_received_cb) {
+                                if (!dup) {
                                     const std::string body = reliable_base64_decode(body_b64);
-                                    m_sm->m_message_received_cb(peer_id, body);
+                                    m_sm->invoke_message_received_callback(peer_id, body);
                                 }
                                 break;
                             }
@@ -1003,9 +1003,7 @@ namespace detail {
                                 }
 
                                 // Forward only the body to the normal app callback (keeps UI compatibility).
-                                if (m_sm->m_message_received_cb) {
-                                    m_sm->m_message_received_cb(peer_id, body);
-                                }
+                                m_sm->invoke_message_received_callback(peer_id, body);
                                 break;
                             }
                         } catch (...) {
@@ -1031,14 +1029,9 @@ namespace detail {
                 LOG_INFO("MH: Received application data from peer " + peer_id);
                 LOG_INFO("MH: Message length: " + std::to_string(payload.length()));
                 LOG_INFO("MH: Message content: [" + payload + "]");
-                // Call the message received callback if registered
-                if (m_sm->m_message_received_cb) {
-                    LOG_INFO("MH: Message callback registered - invoking");
-                    m_sm->m_message_received_cb(peer_id, payload);
-                    LOG_INFO("MH: Message callback completed successfully");
-                } else {
-                    LOG_WARN("MH: No message received callback registered - message will be lost!");
-                }
+                LOG_INFO("MH: Invoking application message callback if registered");
+                m_sm->invoke_message_received_callback(peer_id, payload);
+                LOG_INFO("MH: Application message callback completed");
                 LOG_INFO("========================================");
                 break;
 

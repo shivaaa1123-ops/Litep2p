@@ -390,6 +390,18 @@ int ConfigManager::getMaxPendingSends() const {
     return jsonGetOr<int>(m_config, {"peer_management", "max_pending_sends"}, 1000);
 }
 
+int ConfigManager::getMaxQueuedEvents() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 4096;
+    return std::max(64, jsonGetOr<int>(m_config, {"peer_management", "max_queued_events"}, 4096));
+}
+
+int ConfigManager::getMaxRecoveryQueueEntries() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 1024;
+    return std::max(16, jsonGetOr<int>(m_config, {"peer_management", "max_recovery_queue_entries"}, 1024));
+}
+
 int ConfigManager::getEventQueueWaitTimeoutMs() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return 100;

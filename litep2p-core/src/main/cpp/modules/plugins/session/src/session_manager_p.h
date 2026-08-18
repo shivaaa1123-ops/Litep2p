@@ -84,6 +84,7 @@ public:
     bool disconnectFromPeer(const std::string& peer_id);
     void sendMessageToPeer(const std::string& peer_id, const std::string& message);
     void setMessageReceivedCallback(std::function<void(const std::string&, const std::string&)> cb);
+    void invoke_message_received_callback(const std::string& peer_id, const std::string& message);
     bool isPeerConnected(const std::string& peer_id) const;
     std::string getPeerFsmState(const std::string& peer_id) const;
     std::string getPeerConnectionType(const std::string& peer_id) const;
@@ -317,6 +318,7 @@ private:
     std::unordered_map<std::string, Peer> m_peers; // Key: peer.id
     std::function<void(const std::vector<Peer>&)> m_peer_update_cb;
     std::function<void(const std::string&, const std::string&)> m_message_received_cb;  // peer_id, message
+    mutable std::mutex m_message_received_cb_mutex;
     std::string m_localPeerId;
     // Process-lifetime identifier used to detect restarts across CONTROL_CONNECT.
     // (Noise sessions cannot survive process restarts even if static keys persist.)

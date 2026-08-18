@@ -70,6 +70,7 @@ private:
     std::queue<SessionEvent> m_eventQueue;
     std::mutex m_eventMutex;
     std::condition_variable m_eventCv;
+    std::atomic<uint64_t> m_droppedEvents{0};
 
     // Allows waking the timer thread immediately on shutdown.
     std::mutex m_timerMutex;

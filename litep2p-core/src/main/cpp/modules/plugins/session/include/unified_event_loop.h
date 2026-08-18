@@ -118,6 +118,7 @@ private:
     // Event queue
     std::queue<SessionEvent> m_event_queue;
     std::mutex m_event_mutex;
+    std::atomic<uint64_t> m_dropped_events{0};
 
     // Scheduled events (sorted by due time)
     std::vector<ScheduledEvent> m_scheduled_events;

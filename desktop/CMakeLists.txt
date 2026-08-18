@@ -43,6 +43,20 @@ option(SINGLE_THREAD_MODE "Enable single-thread mode for reduced resource usage"
 #   cmake -S desktop -B desktop/build-fuzz -DLITEP2P_FUZZING=ON \
 #         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 option(LITEP2P_FUZZING "Build libFuzzer harnesses for the wire parsers" OFF)
+option(LITEP2P_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(LITEP2P_TSAN "Enable ThreadSanitizer (cannot be combined with other sanitizers)" OFF)
+
+if(LITEP2P_SANITIZERS AND LITEP2P_TSAN)
+    message(FATAL_ERROR "LITEP2P_SANITIZERS and LITEP2P_TSAN cannot be enabled together")
+endif()
+if(LITEP2P_SANITIZERS)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+if(LITEP2P_TSAN)
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=thread)
+endif()
 
 # ============================================================================
 # BUILD TARGET SELECTION - Pass -DBUILD_TARGET=DESKTOP to build for desktop

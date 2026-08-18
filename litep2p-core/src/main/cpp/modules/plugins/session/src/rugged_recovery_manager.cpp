@@ -1,5 +1,6 @@
 #include "rugged_recovery_manager.h"
 #include "logger.h"
+#include "config_manager.h"
 #include "wire_codec.h"
 #include "message_types.h"
 
@@ -22,6 +23,7 @@ RuggedRecoveryManager::~RuggedRecoveryManager() {
 
 void RuggedRecoveryManager::initialize(
     SendCallback send_direct,
+    TcpSendCallback send_tcp,
     RelayCallback send_relay,
     RestartSocketCallback restart_socket,
     ReconnectPeerCallback reconnect_peer,
@@ -34,6 +36,7 @@ void RuggedRecoveryManager::initialize(
     }
     
     m_send_direct = std::move(send_direct);
+    m_send_tcp = std::move(send_tcp);
     m_send_relay = std::move(send_relay);
     m_restart_socket = std::move(restart_socket);
     m_reconnect_peer = std::move(reconnect_peer);
@@ -52,6 +55,7 @@ void RuggedRecoveryManager::initialize(
         m_peer_states.clear();
         m_recovery_queue.clear();
         m_recovery_queued.clear();
+        m_recovery_generation.clear();
     }
     
     // Initialize socket health
@@ -218,8 +222,11 @@ void RuggedRecoveryManager::send_via_path(MessageDeliveryRecord& record) {
             break;
             
         case DeliveryPath::TCP_FALLBACK:
-            // TODO: Implement TCP fallback
-            LOG_WARN("RuggedRecoveryManager: TCP fallback not yet implemented");
+            if (m_send_tcp && m_send_tcp(record.peer_id, record.message_content)) {
+                LOG_INFO("RuggedRecoveryManager: Sent via TCP fallback to " + record.peer_id);
+            } else {
+                LOG_WARN("RuggedRecoveryManager: TCP fallback unavailable for " + record.peer_id);
+            }
             break;
     }
 }
@@ -488,10 +495,17 @@ void RuggedRecoveryManager::schedule_peer_recovery(const std::string& peer_id) {
     if (peer_id.empty() || m_recovery_queued.count(peer_id) != 0) {
         return;
     }
+    if (m_recovery_queue.size() >= static_cast<size_t>(ConfigManager::getInstance().getMaxRecoveryQueueEntries())) {
+        std::lock_guard<std::mutex> stats_lock(m_stats_mutex);
+        ++m_stats.recovery_queue_dropped_total;
+        LOG_WARN("RuggedRecoveryManager: recovery queue full; dropping " + peer_id);
+        return;
+    }
+    const uint64_t generation = ++m_recovery_generation[peer_id];
 
     const auto due_time = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(RECONNECT_BURST_INTERVAL_MS);
-    m_recovery_queue.push_back({peer_id, due_time});
+    m_recovery_queue.push_back({peer_id, generation, due_time});
     m_recovery_queued.insert(peer_id);
     
     {
@@ -664,7 +678,7 @@ void RuggedRecoveryManager::process_recovery_queue() {
         return;
     }
     
-    std::vector<std::string> peers_to_recover;
+    std::vector<RecoveryWork> peers_to_recover;
     const auto now = std::chrono::steady_clock::now();
     
     {
@@ -673,7 +687,7 @@ void RuggedRecoveryManager::process_recovery_queue() {
         while (it != m_recovery_queue.end() &&
                static_cast<int>(peers_to_recover.size()) < PARALLEL_RECONNECT_LIMIT) {
             if (it->due_time <= now) {
-                peers_to_recover.push_back(it->peer_id);
+                peers_to_recover.push_back(*it);
                 m_recovery_queued.erase(it->peer_id);
                 it = m_recovery_queue.erase(it);
             } else {
@@ -682,9 +696,16 @@ void RuggedRecoveryManager::process_recovery_queue() {
         }
     }
     
-    for (const auto& peer_id : peers_to_recover) {
-        LOG_INFO("RuggedRecoveryManager: Processing recovery for peer " + peer_id);
-        m_reconnect_peer(peer_id);
+    for (const auto& work : peers_to_recover) {
+        bool current = false;
+        {
+            std::lock_guard<std::mutex> lock(m_peers_mutex);
+            auto it = m_recovery_generation.find(work.peer_id);
+            current = it != m_recovery_generation.end() && it->second == work.generation;
+        }
+        if (!current || m_shutting_down.load(std::memory_order_acquire)) continue;
+        LOG_INFO("RuggedRecoveryManager: Processing recovery for peer " + work.peer_id);
+        m_reconnect_peer(work.peer_id);
     }
 }
 
@@ -728,6 +749,7 @@ std::string RuggedRecoveryManager::get_status_json() const {
        << "\"path_escalations_total\":" << m_stats.path_escalations_total << ","
        << "\"network_changes_handled\":" << m_stats.network_changes_handled << ","
        << "\"peer_recoveries_triggered\":" << m_stats.peer_recoveries_triggered << ","
+       << "\"recovery_queue_dropped_total\":" << m_stats.recovery_queue_dropped_total << ","
        << "\"socket_healthy\":" << (m_socket_health.is_healthy.load() ? "true" : "false") << ","
        << "\"pending_messages\":" << pending_messages
        << "}";
