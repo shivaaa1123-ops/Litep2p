@@ -1094,31 +1094,45 @@ void detail::MaintenanceManager::detectStalledPeers() {
     std::lock_guard<std::mutex> lock(m_sm->m_peers_mutex);
     for (const auto& kv : m_sm->m_peer_contexts) {
         const PeerContext& ctx = kv.second;
-        const int state_int = static_cast<int>(ctx.state);
         const bool is_transient = (ctx.state == PeerState::CONNECTING || ctx.state == PeerState::HANDSHAKING);
-        if (!is_transient) {
+
+        // A recovered peer ends its episode.
+        if (ctx.state == PeerState::READY || ctx.state == PeerState::CONNECTED) {
+            m_stall_episode_start.erase(ctx.peer_id);
             m_reported_stall_state.erase(ctx.peer_id);
             continue;
         }
+        if (!is_transient) continue;  // DISCOVERED/DEGRADED/FAILED: not actively trying right now
+
+        // An episode starts the first time we see the peer actively trying.
+        const auto start_it = m_stall_episode_start.find(ctx.peer_id);
+        if (start_it == m_stall_episode_start.end()) {
+            m_stall_episode_start[ctx.peer_id] = now;
+            continue;
+        }
+
+        // The episode ages across the engine's own retry cycles (CONNECTING ->
+        // DEGRADED -> CONNECTING); it only ends on READY/CONNECTED. A peer that
+        // never recovers within the threshold is a genuine field anomaly.
         const auto stuck_for = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   now - ctx.last_state_change)
+                                   now - start_it->second)
                                    .count();
         if (stuck_for < threshold_ms) continue;
 
-        // Report once per (peer, state) episode — not on every maintenance tick.
-        const auto it = m_reported_stall_state.find(ctx.peer_id);
-        if (it != m_reported_stall_state.end() && it->second == state_int) {
+        // Report once per episode — not on every maintenance tick.
+        if (m_reported_stall_state.find(ctx.peer_id) != m_reported_stall_state.end()) {
             continue;
         }
-        m_reported_stall_state[ctx.peer_id] = state_int;
+        m_reported_stall_state[ctx.peer_id] = 1;
 
         AnomalyReporter::Event ev;
         ev.type = "stall_not_recovered";
         ev.peer_id = ctx.peer_id;
         ev.network_id = ctx.network_id;
-        ev.detail = "Peer stuck in " + m_sm->state_to_string(ctx.state) + " for " +
+        ev.detail = "Peer failed to reach READY within " +
                     std::to_string(stuck_for) + " ms (threshold " +
-                    std::to_string(threshold_ms) + " ms); recovery did not complete";
+                    std::to_string(threshold_ms) + " ms) despite engine retries; current state " +
+                    m_sm->state_to_string(ctx.state);
         ev.extras.emplace_back("state", m_sm->state_to_string(ctx.state));
         ev.extras.emplace_back("stuck_ms", std::to_string(stuck_for));
         ev.extras.emplace_back("threshold_ms", std::to_string(threshold_ms));

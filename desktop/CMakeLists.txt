@@ -431,6 +431,11 @@ add_executable(malformed_input_test tests/malformed_input_test.cpp)
 target_include_directories(malformed_input_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(malformed_input_test PRIVATE litep2p_engine)
 
+# Live diagnostic: drives the AnomalyReporter stall detector (see stall_probe.cpp).
+add_executable(stall_probe tools/stall_probe.cpp)
+target_include_directories(stall_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(stall_probe PRIVATE litep2p_engine)
+
 add_executable(wan_integration_runner tests/wan_integration_runner.cpp)
 target_include_directories(wan_integration_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(wan_integration_runner PRIVATE litep2p_engine)

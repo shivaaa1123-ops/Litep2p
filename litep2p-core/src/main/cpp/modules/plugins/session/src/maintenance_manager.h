@@ -35,5 +35,10 @@ namespace detail {
         void detectStalledPeers();
         // Tracks which stalled (peer, state) episodes have already been reported.
         std::unordered_map<std::string, int> m_reported_stall_state;
+        // First observed time of the current non-READY episode per peer.
+        // An episode spans CONNECTING/HANDSHAKING plus the engine's own retry
+        // cycles (CONNECTING -> DEGRADED -> CONNECTING); it ends only when the
+        // peer reaches READY/CONNECTED.
+        std::unordered_map<std::string, std::chrono::steady_clock::time_point> m_stall_episode_start;
     };
 }
