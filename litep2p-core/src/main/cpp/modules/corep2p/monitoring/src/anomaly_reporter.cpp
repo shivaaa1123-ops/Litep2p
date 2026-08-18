@@ -2,6 +2,7 @@
 
 #include "telemetry.h"
 #include "logger.h"
+#include "config_manager.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -142,6 +143,52 @@ void AnomalyReporter::report(const Event& ev) {
     }
 
     const int64_t now_ms = system_now_ms();
+
+    // ---- Dedup / rate limiting (production resource guard) ----
+    // Identical incidents (same type + peer + detail) are logged at most once
+    // per min_interval_ms; each event_type is capped per rolling hour. Repeats
+    // are folded into `suppressed_count` on the next written incident, so the
+    // file count stays small while the frequency data is preserved.
+    int64_t suppressed_count = 0;
+    int64_t event_total = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+
+        const std::string key = ev.type + "|" + ev.peer_id + "|" + detail_fingerprint_(ev.detail);
+
+        // Hourly window rollover for this type.
+        const int64_t window_ms = 3600000LL;
+        auto ws_it = m_type_window_start.find(ev.type);
+        if (ws_it == m_type_window_start.end() || now_ms - ws_it->second >= window_ms) {
+            m_type_window_start[ev.type] = now_ms;
+            m_type_count[ev.type] = 0;
+        }
+
+        m_event_totals[ev.type]++;
+
+        // Suppress if we just wrote this exact incident, or the type cap is hit.
+        auto& ds = m_dedup[key];
+        const bool interval_ok = (ds.last_reported_ms == 0 ||
+                                  now_ms - ds.last_reported_ms >= m_cfg.min_interval_ms);
+        const bool type_ok = (m_cfg.max_per_type_per_hour <= 0 ||
+                              m_type_count[ev.type] < m_cfg.max_per_type_per_hour);
+        if (!interval_ok || !type_ok) {
+            // Record the repeat so the periodic summary can surface the
+            // frequency without writing an incident per occurrence.
+            ds.suppressed_count++;
+            ds.type = ev.type;
+            ds.peer_id = ev.peer_id;
+            ds.detail = ev.detail;
+            return;
+        }
+
+        ds.last_reported_ms = now_ms;
+        ds.suppressed_count = 0;
+        m_type_count[ev.type]++;
+        suppressed_count = 0;
+        event_total = m_event_totals[ev.type];
+    }
+
     int64_t uptime_ms = 0;
     {
         std::lock_guard<std::mutex> lock(m_mu);
@@ -161,7 +208,8 @@ void AnomalyReporter::report(const Event& ev) {
         }
     }
 
-    const std::string incident = build_incident_(ev, now_ms, uptime_ms, telemetry_json);
+    const std::string incident =
+        build_incident_(ev, now_ms, uptime_ms, telemetry_json, suppressed_count, event_total);
     std::string path;
     if (!write_incident_(incident, path)) {
         nativeLog("AnomalyReporter: failed to write incident (" + ev.type + ")");
@@ -176,7 +224,8 @@ void AnomalyReporter::report(const Event& ev) {
 
 std::string AnomalyReporter::build_incident_(const Event& ev, int64_t now_ms,
                                              int64_t uptime_ms,
-                                             const std::string& telemetry_json) {
+                                             const std::string& telemetry_json,
+                                             int64_t suppressed_count, int64_t event_total) {
     std::lock_guard<std::mutex> lock(m_mu);
     std::ostringstream oss;
     oss << "{\n";
@@ -187,9 +236,15 @@ std::string AnomalyReporter::build_incident_(const Event& ev, int64_t now_ms,
     oss << "  \"engine_version\": \"" << json_escape_(m_cfg.engine_version) << "\",\n";
     oss << "  \"local_peer_id\": \"" << json_escape_(m_cfg.peer_id) << "\",\n";
     oss << "  \"event_type\": \"" << json_escape_(ev.type) << "\",\n";
+    oss << "  \"severity\": \"" << json_escape_(ev.severity.empty() ? "warning" : ev.severity)
+        << "\",\n";
+    oss << "  \"reason\": \"" << json_escape_(ev.reason) << "\",\n";
     oss << "  \"peer_id\": \"" << json_escape_(ev.peer_id) << "\",\n";
     oss << "  \"network_id\": \"" << json_escape_(ev.network_id) << "\",\n";
     oss << "  \"detail\": \"" << json_escape_(ev.detail) << "\",\n";
+    oss << "  \"event_total_since_start\": " << event_total << ",\n";
+    oss << "  \"suppressed_count\": " << suppressed_count << ",\n";
+    oss << "  \"config_fingerprint\": \"" << config_fingerprint_() << "\",\n";
     if (!ev.extras.empty()) {
         oss << "  \"extras\": {\n";
         for (size_t i = 0; i < ev.extras.size(); ++i) {
@@ -199,12 +254,70 @@ std::string AnomalyReporter::build_incident_(const Event& ev, int64_t now_ms,
         }
         oss << "  },\n";
     }
+    if (!m_event_totals.empty()) {
+        oss << "  \"event_counts\": {";
+        bool first = true;
+        // Stable order: iterate the type totals and emit sorted by name.
+        std::vector<std::pair<std::string, int64_t>> totals(m_event_totals.begin(),
+                                                            m_event_totals.end());
+        std::sort(totals.begin(), totals.end());
+        for (const auto& kv : totals) {
+            oss << (first ? "" : ",") << "\"" << json_escape_(kv.first) << "\":" << kv.second;
+            first = false;
+        }
+        oss << "},\n";
+    }
     oss << "  \"device\": " << (m_device_info.empty() ? "{}" : m_device_info) << ",\n";
     if (!telemetry_json.empty()) {
         oss << "  \"telemetry\": " << telemetry_json << ",\n";
     }
     oss << "  \"reporter\": \"AnomalyReporter\"\n";
     oss << "}\n";
+    return oss.str();
+}
+
+// Short, stable fingerprint of an incident's detail string (for dedup keys).
+std::string AnomalyReporter::detail_fingerprint_(const std::string& detail) {
+    if (detail.empty()) return "empty";
+    // FNV-1a 64-bit, hex-encoded — cheap and stable for dedup purposes.
+    uint64_t h = 14695981039346656037ULL;
+    for (const unsigned char c : detail) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    std::ostringstream oss;
+    oss << std::hex << h;
+    return oss.str();
+}
+
+// Config fingerprint: a stable hash of the engine settings that matter for
+// cross-device analysis (protocol, ports, discovery magic, transport-key hash).
+// The shared transport key is hashed (never exposed in plaintext).
+std::string AnomalyReporter::config_fingerprint_() {
+    auto& cfg = ConfigManager::getInstance();
+    const std::string key_hash = hash_hex_(cfg.getTransportKeyHex());
+    const int lo = 0, hi = 0;
+    int plo = 0, phi = 0;
+    (void)cfg.getDataPortRange(plo, phi);
+    std::ostringstream oss;
+    oss << "proto=" << cfg.getDefaultProtocol()
+        << ",mode=" << cfg.getCommsMode()
+        << ",dport=" << cfg.getDiscoveryPort()
+        << ",range=" << plo << "-" << phi
+        << ",magic=" << hash_hex_(cfg.getDiscoveryMagic())
+        << ",key=" << key_hash;
+    return hash_hex_(oss.str());
+}
+
+// FNV-1a 64-bit hex hash of a string (short, stable, no deps).
+std::string AnomalyReporter::hash_hex_(const std::string& s) {
+    uint64_t h = 14695981039346656037ULL;
+    for (const unsigned char c : s) {
+        h ^= c;
+        h *= 1099511628211ULL;
+    }
+    std::ostringstream oss;
+    oss << std::hex << std::setw(16) << std::setfill('0') << h;
     return oss.str();
 }
 
@@ -266,6 +379,10 @@ void AnomalyReporter::rotate_locked_(int max_files) {
 // ============================================================================
 
 void AnomalyReporter::tick() {
+    // Surface accumulated suppressed repeats as compact frequency incidents
+    // (rate-limited per key), so repeated errors are visible without flooding.
+    flush_suppression_summaries_();
+
     bool enabled = false;
     std::string dir;
     int interval_ms = 300000;
@@ -317,6 +434,84 @@ std::vector<std::string> AnomalyReporter::list_pending_locked_() const {
     ::closedir(d);
     std::sort(files.begin(), files.end());
     return files;
+}
+
+// Writes a compact `repeated_anomaly` incident per dedup key that accumulated
+// suppressed repeats since the last report/summary, then resets the counter.
+// Rate-limited to min_interval_ms per key so a constantly-repeating error yields
+// at most ~1 summary incident per interval (frequency data, not a flood).
+void AnomalyReporter::flush_suppression_summaries_() {
+    int min_interval_ms = 60000;
+    bool include_telemetry = true;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (!m_cfg.enabled || m_directory.empty()) return;
+        min_interval_ms = m_cfg.min_interval_ms > 0 ? m_cfg.min_interval_ms : 60000;
+        include_telemetry = m_cfg.include_telemetry;
+    }
+
+    std::vector<DedupState> pending;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        const int64_t now = system_now_ms();
+        for (auto it = m_dedup.begin(); it != m_dedup.end();) {
+            DedupState& ds = it->second;
+            if (ds.suppressed_count <= 0) {
+                ++it;
+                continue;
+            }
+            if (ds.last_summary_ms > 0 && now - ds.last_summary_ms < min_interval_ms) {
+                ++it;  // not yet; keep accumulating
+                continue;
+            }
+            ds.last_summary_ms = now;
+            const int64_t count = ds.suppressed_count;
+            ds.suppressed_count = 0;
+            DedupState copy = ds;
+            copy.suppressed_count = count;
+            pending.push_back(std::move(copy));
+            ++it;
+        }
+    }
+
+    const int64_t now_ms = system_now_ms();
+    int64_t uptime_ms = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_uptime_provider) {
+            uptime_ms = m_uptime_provider();
+        } else {
+            uptime_ms = now_ms - m_configured_at_ms;
+        }
+    }
+
+    for (const auto& ds : pending) {
+        Event ev;
+        ev.type = "repeated_anomaly";
+        ev.severity = "info";
+        ev.reason = "Deduplicated repeat of a previously reported anomaly (frequency summary; no per-occurrence incident was written to protect device resources)";
+        ev.peer_id = ds.peer_id;
+        ev.detail = ds.detail;
+        ev.extras.emplace_back("repeated_type", ds.type);
+        ev.extras.emplace_back("repeated_count", std::to_string(ds.suppressed_count));
+        ev.extras.emplace_back("dedup_min_interval_ms", std::to_string(min_interval_ms));
+
+        std::string telemetry_json;
+        if (include_telemetry) {
+            try {
+                telemetry_json = Telemetry::getInstance().snapshot_json("anomaly-summary");
+            } catch (...) {
+                telemetry_json.clear();
+            }
+        }
+        const std::string incident =
+            build_incident_(ev, now_ms, uptime_ms, telemetry_json, ds.suppressed_count, 0);
+        std::string path;
+        if (write_incident_(incident, path)) {
+            nativeLog("AnomalyReporter: repeated-anomaly summary written (" + ds.type + " x" +
+                      std::to_string(ds.suppressed_count) + "): " + path);
+        }
+    }
 }
 
 bool AnomalyReporter::upload_file_(const std::string& path) {

@@ -26,6 +26,7 @@
 #include "peer.h"
 #include "logger.h"
 #include "telemetry.h"
+#include "anomaly_reporter.h"
 #include "config_manager.h"
 #include "device_utils.h"
 #include "constants.h"
@@ -800,6 +801,17 @@ litep2p_result_t litep2p_send(const char* peer_id, const uint8_t* data, uint32_t
     // 1000). Callers should back off / retry or switch to litep2p_send_reliable().
     const int max_pending = ConfigManager::getInstance().getMaxPendingSends();
     if (max_pending > 0 && g_engine->pendingSendCount() >= max_pending) {
+        // Field diagnostics: the app is outrunning the engine (or a peer is
+        // unresponsive and the queue is backing up). Rate-limited, so a
+        // sustained overload yields one incident + suppressed_count.
+        AnomalyReporter::Event ev;
+        ev.type = "resource_pressure";
+        ev.severity = "warning";
+        ev.reason = "The pending-send queue hit its configured cap (peer_management.max_pending_sends); the app is sending faster than the engine/network can drain";
+        ev.peer_id = peer_id;
+        ev.detail = "send queue full (max_pending_sends=" + std::to_string(max_pending) + ")";
+        ev.extras.emplace_back("subsystem", "send_path");
+        AnomalyReporter::getInstance().report(ev);
         return LITEP2P_ERR_QUEUE_FULL;
     }
     // LITEP2P_OK means "accepted into the send path", not "delivered".

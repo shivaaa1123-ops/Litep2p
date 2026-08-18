@@ -55,7 +55,9 @@ FSMResult PeerStateMachine::handle_event(PeerContext& peer, PeerEvent event) {
 
         // ---- Field diagnostics: report anomalies to the AnomalyReporter ----
         // (Disconnect / connect-failure / handshake-failure / terminal failure.)
-        // Graceful SHUTDOWN transitions are expected and skipped.
+        // Graceful SHUTDOWN transitions are expected and skipped. Repeated
+        // identical events are deduplicated by the reporter (min_interval_ms +
+        // per-type hourly cap), so a flapping peer does not flood the device.
         if (event != PeerEvent::SHUTDOWN && AnomalyReporter::getInstance().isEnabled()) {
             AnomalyReporter::Event ev;
             ev.peer_id = peer.peer_id;
@@ -67,12 +69,18 @@ FSMResult PeerStateMachine::handle_event(PeerContext& peer, PeerEvent event) {
             if (result.new_state == PeerState::FAILED) {
                 if (event == PeerEvent::RETRY_EXHAUSTED || event == PeerEvent::CONNECT_FAILED) {
                     ev.type = "connect_failed";
+                    ev.severity = "warning";
+                    ev.reason = "Peer FSM reached terminal FAILED after connect retries were exhausted";
                     ev.detail = "FSM reached terminal FAILED state: " + fsm;
                 } else if (event == PeerEvent::HANDSHAKE_FAILED) {
                     ev.type = "handshake_failed";
+                    ev.severity = "warning";
+                    ev.reason = "Peer FSM reached terminal FAILED after handshake retries were exhausted";
                     ev.detail = "FSM reached terminal FAILED state: " + fsm;
                 } else {
                     ev.type = "peer_failed";
+                    ev.severity = "warning";
+                    ev.reason = "Peer FSM reached terminal FAILED state";
                     ev.detail = "FSM reached terminal FAILED state: " + fsm;
                 }
                 ev.extras.emplace_back("previous_state", state_to_string(old_state));
@@ -82,6 +90,8 @@ FSMResult PeerStateMachine::handle_event(PeerContext& peer, PeerEvent event) {
                        (old_state == PeerState::READY || old_state == PeerState::CONNECTED ||
                         old_state == PeerState::DEGRADED || old_state == PeerState::HANDSHAKING)) {
                 ev.type = "peer_disconnected";
+                ev.severity = "warning";
+                ev.reason = "A previously connected peer dropped without a graceful shutdown";
                 ev.detail = "Unexpected peer disconnect: " + fsm;
                 ev.extras.emplace_back("previous_state", state_to_string(old_state));
                 ev.extras.emplace_back("trigger_event", event_to_string(event));

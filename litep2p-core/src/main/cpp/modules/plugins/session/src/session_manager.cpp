@@ -932,6 +932,8 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
         acfg.upload_url = cfg.getAnomalyUploadUrl();
         acfg.upload_interval_ms = cfg.getAnomalyUploadIntervalMs();
         acfg.include_telemetry = cfg.anomalyIncludeTelemetry();
+        acfg.min_interval_ms = cfg.getAnomalyMinIntervalMs();
+        acfg.max_per_type_per_hour = cfg.getAnomalyMaxPerTypePerHour();
 #ifdef LITEP2P_VERSION_STRING
         acfg.engine_version = LITEP2P_VERSION_STRING;
 #else
@@ -3402,6 +3404,8 @@ void SessionManager::Impl::set_network_info(bool is_wifi, bool is_available) {
                 {
                     AnomalyReporter::Event ev;
                     ev.type = "runtime_error";
+                    ev.severity = "critical";
+                    ev.reason = "The engine's UDP listener could not be rebound after a network interface change; connectivity to existing peers is at risk";
                     ev.detail = "UDP socket failed to restart after a network interface change";
                     ev.extras.emplace_back("subsystem", "transport");
                     AnomalyReporter::getInstance().report(ev);
@@ -4512,6 +4516,18 @@ void SessionManager::Impl::ensure_signaling_connected_async(bool force) {
                         break;
                     }
                     LOG_WARN("SM: Signaling reconnect failed");
+                }
+                {
+                    // Field diagnostics: the signaling server is unreachable.
+                    // Rate-limited (same detail folds repeats into suppressed_count).
+                    AnomalyReporter::Event ev;
+                    ev.type = "runtime_error";
+                    ev.severity = "warning";
+                    ev.reason = "The engine could not (re)connect to the signaling server; discovery/bootstrap degraded";
+                    ev.detail = "Signaling reconnect failed: " + url;
+                    ev.extras.emplace_back("subsystem", "signaling");
+                    ev.extras.emplace_back("attempt", std::to_string(attempt_seq));
+                    AnomalyReporter::getInstance().report(ev);
                 }
 
                 // If we're in fast-retry mode, keep trying for a bounded window.

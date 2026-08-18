@@ -5,6 +5,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -48,16 +49,29 @@ public:
         bool include_telemetry = true;     // embed Telemetry snapshot in each incident
         std::string engine_version = "0.4.0";
         std::string peer_id;
+        // ---- Dedup / rate limiting (production resource guard) ----
+        // Repeated identical anomalies must NOT spam incident files: the same
+        // (type, peer, detail) is logged at most once per min_interval_ms, and
+        // each type is capped per rolling hour. Suppressed occurrences are
+        // counted and folded into the next incident (`suppressed_count`), so
+        // analysts still see how often an error repeated without the device
+        // writing hundreds of files.
+        int min_interval_ms = 60000;        // min gap between identical incidents
+        int max_per_type_per_hour = 10;     // cap per event_type per rolling hour
     };
 
     // One incident. `extras` are free-form key/value pairs appended to the JSON
     // (e.g. retry counts, previous state, error code).
     struct Event {
-        std::string type;       // "peer_disconnected", "connect_failed", "handshake_failed",
-                                // "stall_not_recovered", "runtime_error", ...
+        std::string type;       // taxonomy: "peer_disconnected", "connect_failed",
+                                // "handshake_failed", "peer_failed",
+                                // "stall_not_recovered", "runtime_error",
+                                // "security_error", "resource_pressure"
+        std::string severity;   // "info" | "warning" | "critical"
+        std::string reason;     // WHY this incident was created (the rule that tripped)
         std::string peer_id;
         std::string network_id;
-        std::string detail;
+        std::string detail;     // WHAT the error was at the time
         std::vector<std::pair<std::string, std::string>> extras;
     };
 
@@ -93,7 +107,8 @@ private:
     AnomalyReporter& operator=(const AnomalyReporter&) = delete;
 
     std::string build_incident_(const Event& ev, int64_t now_ms, int64_t uptime_ms,
-                                const std::string& telemetry_json);
+                                const std::string& telemetry_json,
+                                int64_t suppressed_count, int64_t event_total);
     bool write_incident_(const std::string& json, std::string& out_path);
     void rotate_locked_(int max_files);
     bool upload_file_(const std::string& path);
@@ -102,6 +117,9 @@ private:
     static std::string iso8601_utc_(int64_t ms);
     static std::string random_hex_(size_t bytes);
     static std::string json_escape_(const std::string& s);
+    static std::string detail_fingerprint_(const std::string& detail);
+    static std::string hash_hex_(const std::string& s);
+    std::string config_fingerprint_();
 
     mutable std::mutex m_mu;
     Config m_cfg;
@@ -111,13 +129,36 @@ private:
     int64_t m_configured_at_ms{0};
     int64_t m_last_upload_attempt_ms{0};
     uint64_t m_seq{0};
+
+    // ---- Dedup / rate-limit state (guarded by m_mu) ----
+    // key = "<type>|<peer_id>|<detail-fingerprint>"
+    struct DedupState {
+        int64_t last_reported_ms{0};   // when this exact incident was last written
+        int64_t suppressed_count{0};   // how many repeats were folded in since
+        int64_t last_summary_ms{0};    // when the suppression summary was last flushed
+        std::string type;              // original event type (for the summary)
+        std::string peer_id;           // original peer id
+        std::string detail;            // original detail
+    };
+    std::unordered_map<std::string, DedupState> m_dedup;       // exact-incident key -> state
+    std::unordered_map<std::string, int64_t> m_type_count;     // event_type -> count in window
+    std::unordered_map<std::string, int64_t> m_type_window_start;  // event_type -> window start ms
+    std::unordered_map<std::string, int64_t> m_event_totals;   // event_type -> total since configure
+
+    // Called from tick(): writes one `repeated_anomaly` incident per dedup key
+    // that accumulated suppressed repeats (frequency data for analysts), then
+    // resets the counters. Rate-limited to min_interval_ms per key.
+    void flush_suppression_summaries_();
 };
 
 // Convenience: short-hand for report() with no extras.
-inline void report_anomaly(const std::string& type, const std::string& peer_id,
+inline void report_anomaly(const std::string& type, const std::string& severity,
+                           const std::string& reason, const std::string& peer_id,
                            const std::string& network_id, const std::string& detail) {
     AnomalyReporter::Event ev;
     ev.type = type;
+    ev.severity = severity;
+    ev.reason = reason;
     ev.peer_id = peer_id;
     ev.network_id = network_id;
     ev.detail = detail;

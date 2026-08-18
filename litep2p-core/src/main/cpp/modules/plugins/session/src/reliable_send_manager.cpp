@@ -1,5 +1,6 @@
 #include "reliable_send_manager.h"
 #include "logger.h"
+#include "anomaly_reporter.h"
 
 #include <nlohmann/json.hpp>
 
@@ -133,6 +134,20 @@ bool ReliableSendManager::send_reliable(const std::string& peer_id, const std::s
         if (static_cast<int>(m_outbox.size()) >= m_max_messages) {
             LOG_WARN("RSM: outbox full (" + std::to_string(m_outbox.size()) +
                      "); rejecting " + msg_id);
+            // Field diagnostics: the durable reliable-message outbox is full
+            // (app is sending reliable messages faster than they can be
+            // delivered, or a peer is unreachable). Rate-limited.
+            {
+                AnomalyReporter::Event ev;
+                ev.type = "resource_pressure";
+                ev.severity = "warning";
+                ev.reason = "The durable reliable-message outbox hit its capacity; reliable sends are being rejected";
+                ev.peer_id = peer_id;
+                ev.detail = "reliable outbox full (max=" + std::to_string(m_max_messages) + ")";
+                ev.extras.emplace_back("subsystem", "reliable_send");
+                ev.extras.emplace_back("msg_id", msg_id);
+                AnomalyReporter::getInstance().report(ev);
+            }
             queue_full = true;
             status_cb = m_on_status;
         } else {

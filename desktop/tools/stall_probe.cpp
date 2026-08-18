@@ -40,6 +40,36 @@ int main(int argc, char* argv[]) {
     AnomalyReporter::getInstance().setDeviceInfo(
         "{\"brand\":\"desktop\",\"model\":\"stall-probe\",\"os\":\"macOS\",\"abi\":\"x86_64\"}");
 
+    // --dedup-test: fire the SAME anomaly 20x in a row; the reporter must write
+    // only one incident (dedup) and record the suppressed repeats.
+    if (argc > 2 && std::string(argv[2]) == "--dedup-test") {
+        AnomalyReporter::Config acfg;
+        acfg.enabled = true;
+        acfg.base_dir = "/tmp/ar_test";
+        acfg.subdir = "anomalies_dedup";
+        acfg.max_files = 20;
+        acfg.min_interval_ms = 60000;
+        acfg.max_per_type_per_hour = 10;
+        acfg.engine_version = "0.4.0";
+        acfg.peer_id = "dedup-probe";
+        AnomalyReporter::getInstance().configure(acfg);
+        for (int i = 0; i < 20; ++i) {
+            AnomalyReporter::Event ev;
+            ev.type = "connect_failed";
+            ev.severity = "warning";
+            ev.reason = "dedup test";
+            ev.peer_id = "peer-x";
+            ev.detail = "same detail every time";
+            AnomalyReporter::getInstance().report(ev);
+        }
+        // Periodic flush: the 19 suppressed repeats become ONE compact
+        // `repeated_anomaly` summary (frequency data, not a flood).
+        AnomalyReporter::getInstance().tick();
+        std::cout << "dedup test: incidents written = "
+                  << AnomalyReporter::getInstance().pendingFileCount() << std::endl;
+        return 0;
+    }
+
     SessionManager sm;
     sm.start(34501, peer_cb, "UDP", "stall-probe-peer");
     sm.addPeer("blackhole-peer", "203.0.113.9:30001");

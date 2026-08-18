@@ -7,6 +7,7 @@
 #include "message_types.h"
 #include "config_manager.h"
 #include "telemetry.h"
+#include "anomaly_reporter.h"
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -832,6 +833,22 @@ namespace detail {
                             de_fails = 0;
                             LOG_WARN("SM: Consecutive decrypt failures for " + peer_id +
                                      " - forcing session reset (stale keys/session desync)");
+                            {
+                                // Field diagnostics: consecutive auth failures mean
+                                // stale keys, key mismatch, or on-path tampering.
+                                // Deduplicated by the reporter, so a peer that keeps
+                                // desyncing yields one incident with suppressed_count.
+                                AnomalyReporter::Event ev;
+                                ev.type = "security_error";
+                                ev.severity = "warning";
+                                ev.reason = "Consecutive Noise authentication failures forced a session reset (stale keys, transport-key mismatch, or on-path tampering)";
+                                ev.peer_id = peer_id;
+                                ev.network_id = event.network_id;
+                                ev.detail = std::to_string(kDecryptFailThreshold) +
+                                            " consecutive decrypt failures; secure session reset";
+                                ev.extras.emplace_back("subsystem", "noise_nk");
+                                AnomalyReporter::getInstance().report(ev);
+                            }
                             {
                                 std::lock_guard<std::mutex> lock(m_sm->m_secure_session_mutex);
                                 m_sm->m_secure_session_manager->remove_session(peer_id);

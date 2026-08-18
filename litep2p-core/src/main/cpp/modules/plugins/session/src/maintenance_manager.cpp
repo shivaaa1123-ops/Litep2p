@@ -1127,6 +1127,8 @@ void detail::MaintenanceManager::detectStalledPeers() {
 
         AnomalyReporter::Event ev;
         ev.type = "stall_not_recovered";
+        ev.severity = "warning";
+        ev.reason = "A peer failed to reach the READY state within the configured threshold despite the engine's reconnect/handshake retries (non-recoverable in the field)";
         ev.peer_id = ctx.peer_id;
         ev.network_id = ctx.network_id;
         ev.detail = "Peer failed to reach READY within " +

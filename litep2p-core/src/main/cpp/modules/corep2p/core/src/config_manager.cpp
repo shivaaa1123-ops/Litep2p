@@ -588,6 +588,22 @@ int ConfigManager::getAnomalyStallThresholdMs() const {
     return jsonGetOr<int>(m_config, {"anomaly_reporter", "stall_threshold_ms"}, 60000);
 }
 
+int ConfigManager::getAnomalyMinIntervalMs() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 60000;
+    int v = jsonGetOr<int>(m_config, {"anomaly_reporter", "min_interval_ms"}, 60000);
+    if (v < 0) v = 0;
+    return v;
+}
+
+int ConfigManager::getAnomalyMaxPerTypePerHour() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_config.is_object()) return 10;
+    int v = jsonGetOr<int>(m_config, {"anomaly_reporter", "max_per_type_per_hour"}, 10);
+    if (v < 0) v = 0;  // 0 = unlimited
+    return v;
+}
+
 bool ConfigManager::isNATTraversalEnabled() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_config.is_object()) return true;

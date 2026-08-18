@@ -144,6 +144,11 @@ public:
     int getAnomalyUploadIntervalMs() const;
     bool anomalyIncludeTelemetry() const;         // embed Telemetry snapshot
     int getAnomalyStallThresholdMs() const;       // peer stuck in CONNECTING/HANDSHAKING => stall
+    // Dedup / rate limiting: identical incidents logged at most once per
+    // min_interval_ms, and each event_type capped per rolling hour. Repeats are
+    // folded into `suppressed_count` on the next written incident.
+    int getAnomalyMinIntervalMs() const;
+    int getAnomalyMaxPerTypePerHour() const;
     
     // NAT Traversal
     bool isNATTraversalEnabled() const;

@@ -15,7 +15,10 @@
         "discovery_port": 30000,
         "listen_backlog": 5,
         "select_max_retries": 3,
-        "port_range": [31000, 32000]
+        "port_range": [
+            31000,
+            32000
+        ]
     },
     "communication": {
         "default_protocol": "UDP",
@@ -75,9 +78,18 @@
             "realm": "TURN_REALM"
         },
         "stun_servers": [
-            {"hostname": "stun.l.google.com", "port": 19302},
-            {"hostname": "stun1.l.google.com", "port": 19302},
-            {"hostname": "stun.stunprotocol.org", "port": 3478}
+            {
+                "hostname": "stun.l.google.com",
+                "port": 19302
+            },
+            {
+                "hostname": "stun1.l.google.com",
+                "port": 19302
+            },
+            {
+                "hostname": "stun.stunprotocol.org",
+                "port": 3478
+            }
         ],
         "peer_discovery": {
             "enabled": true,
@@ -120,6 +132,8 @@
         "upload_url": "",
         "upload_interval_ms": 300000,
         "include_telemetry": true,
-        "stall_threshold_ms": 60000
+        "stall_threshold_ms": 60000,
+        "min_interval_ms": 60000,
+        "max_per_type_per_hour": 10
     }
 }

@@ -1688,6 +1688,8 @@ chat application is most likely to care about:
 | `anomaly_reporter.upload_interval_ms` | `300000` | Upload attempt cadence (5 min) |
 | `anomaly_reporter.include_telemetry` | `true` | Embed the telemetry snapshot in every incident |
 | `anomaly_reporter.stall_threshold_ms` | `60000` | A peer stuck in CONNECTING/HANDSHAKING past this → `stall_not_recovered` incident |
+| `anomaly_reporter.min_interval_ms` | `60000` | Dedup: the same (type+peer+detail) incident logged at most once per window; repeats fold into `suppressed_count` / a `repeated_anomaly` summary |
+| `anomaly_reporter.max_per_type_per_hour` | `10` | Dedup: cap incidents per `event_type` per rolling hour (0 = unlimited) |
 | `reconnect_policy.mode` | `"auto"` | Initial reconnect aggressiveness |
 | `battery_optimizer.enabled` | `true` | Battery-aware scheduling |
 | `logging.level` | `"debug"` | Engine log verbosity |
@@ -1722,15 +1724,41 @@ rotated to `max_files`. Inspect from a terminal or with
   "engine_version": "0.4.0",
   "local_peer_id": "…",
   "event_type": "peer_disconnected | connect_failed | handshake_failed | "
-                "peer_failed | stall_not_recovered | runtime_error",
+                "peer_failed | stall_not_recovered | runtime_error | "
+                "security_error | resource_pressure | repeated_anomaly",
+  "severity": "info | warning | critical",
+  "reason": "why this incident was created (the rule that tripped)",
   "peer_id": "…",
   "network_id": "ip:port",
-  "detail": "…",
+  "detail": "what the error was at that time",
+  "event_total_since_start": 3,
+  "suppressed_count": 19,
+  "config_fingerprint": "stable hash of protocol/ports/magic/transport-key",
   "extras": { "previous_state": "READY", "trigger_event": "DISCONNECT_DETECTED" },
+  "event_counts": { "peer_disconnected": 1, "connect_failed": 2 },
   "device": { "brand": "…", "model": "…", "os": "…", "abi": "…" },
   "telemetry": { "ts_ms": …, "uptime_ms": …, "counters": {…}, "gauges": {…} }
 }
 ```
+
+**Trigger taxonomy** (each carries a `reason` + `severity`):
+
+| event_type | severity | Trigger |
+|---|---|---|
+| `peer_disconnected` | warning | READY/CONNECTED peer dropped unexpectedly |
+| `connect_failed` / `handshake_failed` / `peer_failed` | warning | FSM reached terminal FAILED (retries exhausted) |
+| `stall_not_recovered` | warning | Peer failed to reach READY within `stall_threshold_ms` despite retries |
+| `runtime_error` | warning/critical | Socket restart failure, discovery bind failure, signaling reconnect failure |
+| `security_error` | warning | Consecutive Noise decrypt failures forced a session reset (stale keys / mismatch / tampering) |
+| `resource_pressure` | warning | Send queue full (`max_pending_sends`) or durable reliable outbox full |
+| `repeated_anomaly` | info | Dedup summary: N suppressed repeats of an earlier anomaly |
+
+**Dedup / rate limiting** (keeps files small on devices): the same
+(type+peer+detail) incident is written at most once per `min_interval_ms`
+(default 60s), and each type is capped per rolling hour
+(`max_per_type_per_hour`, default 10). Suppressed repeats accumulate and are
+flushed as a compact `repeated_anomaly` frequency summary — analysts still see
+*how often* an error repeated without the device writing hundreds of files.
 
 Triggers: FSM transitions to `FAILED` (connect/handshake failure) and
 `DISCONNECTED` (unexpected drop from READY/CONNECTED/DEGRADED/HANDSHAKING), a

@@ -2,6 +2,7 @@
 #include "logger.h"
 #include "constants.h"
 #include "config_manager.h"
+#include "anomaly_reporter.h"
 #include <sodium.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -199,6 +200,16 @@ public:
                 nativeLog("Discovery Error: Failed to bind socket after " + std::to_string(max_bind_attempts) + " attempts.");
                 close(m_sock);
                 m_sock = -1;
+                {
+                    AnomalyReporter::Event ev;
+                    ev.type = "runtime_error";
+                    ev.severity = "critical";
+                    ev.reason = "The LAN discovery socket could not bind after retries; peers will not be discovered on the LAN";
+                    ev.detail = "Discovery bind failed (port " +
+                                std::to_string(m_discovery_port) + ")";
+                    ev.extras.emplace_back("subsystem", "discovery");
+                    AnomalyReporter::getInstance().report(ev);
+                }
                 return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -246,6 +257,16 @@ public:
             nativeLog("Discovery Error: Failed to bind socket in event-loop mode.");
             close(m_sock);
             m_sock = -1;
+            {
+                AnomalyReporter::Event ev;
+                ev.type = "runtime_error";
+                ev.severity = "critical";
+                ev.reason = "The LAN discovery socket could not bind in event-loop mode; peers will not be discovered on the LAN";
+                ev.detail = "Discovery bind failed (event-loop, port " +
+                            std::to_string(m_discovery_port) + ")";
+                ev.extras.emplace_back("subsystem", "discovery");
+                AnomalyReporter::getInstance().report(ev);
+            }
             return -1;
         }
 

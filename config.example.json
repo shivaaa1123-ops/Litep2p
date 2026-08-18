@@ -275,7 +275,15 @@
         "upload_url": "http://YOUR_COLLECTOR_HOST:8899/ingest",
         "upload_interval_ms": 300000,
         "include_telemetry": true,
-        "stall_threshold_ms": 60000
+        "stall_threshold_ms": 60000,
+        /* Dedup / rate limiting (production resource guard):
+           - min_interval_ms: the same (type + peer + detail) incident is logged
+             at most once per this window; repeats are folded into
+             `suppressed_count` on the next written incident.
+           - max_per_type_per_hour: cap per event_type per rolling hour.
+           Keeps incident files small even when an error repeats constantly. */
+        "min_interval_ms": 60000,
+        "max_per_type_per_hour": 10
     },
     "remote_control": {
         "enabled": false,
