@@ -442,6 +442,11 @@ add_executable(crash_probe tools/crash_probe.cpp)
 target_include_directories(crash_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(crash_probe PRIVATE litep2p_engine)
 
+# Post-crash symbolizer: resolves crash_*.json backtraces via atos/addr2line.
+add_executable(symbolize_crash tools/symbolize_crash.cpp)
+target_include_directories(symbolize_crash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(symbolize_crash PRIVATE litep2p_engine)
+
 add_executable(wan_integration_runner tests/wan_integration_runner.cpp)
 target_include_directories(wan_integration_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(wan_integration_runner PRIVATE litep2p_engine)

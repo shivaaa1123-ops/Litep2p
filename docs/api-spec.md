@@ -1807,6 +1807,14 @@ built-in async-signal-safe handler captures them:
 - `crash_*` files are picked up by the same uploader (with the
   `X-LiteP2P-Crash: 1` header) — a crash report is delivered to the collector
   by the **next engine start**, the standard crash-reporting pattern.
+- **Symbolization**: each report also carries `module_base` + `module_path`
+  (the engine module captured at install via `dladdr`), so the raw backtrace
+  return addresses can be resolved offline. The bundled `symbolize_crash` tool
+  (desktop) runs `atos` (macOS) / `addr2line` (Linux) per frame:
+  `./desktop/build_fixcheck/bin/symbolize_crash <crash.json|dir/> [--json]`.
+  Backtraces are captured from the signal context (`ucontext` PC + frame-pointer
+  chain), so they show the actual crash site — not the handler's own frames.
+  Build with `-g` for `file:line`; without it, function names still resolve.
 
 ---
 

@@ -1,15 +1,23 @@
 #include "crash_handler.h"
 
+// ucontext_t/REG_* require the X/Open feature macro on macOS (and POSIX on
+// Linux). Must be defined before any system header is included.
+#if !defined(_XOPEN_SOURCE)
+#define _XOPEN_SOURCE 700
+#endif
+
 #include <atomic>
 #include <cstring>
 #include <mutex>
 #include <string>
 
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unwind.h>
 #include <unistd.h>
 
@@ -26,6 +34,14 @@ namespace {
 // The resolved crash directory, pre-formatted for the handler's open().
 char g_dir_path[512];
 size_t g_dir_len = 0;
+
+// The engine module's load base + path, captured once at install() via
+// dladdr() (async-signal-safe to READ later — the handler only copies these
+// pre-formatted values into the report). The symbolizer computes
+// offset = return_address - module_base and resolves it with
+// atos/addr2line against the module binary.
+void* g_module_base = nullptr;
+char g_module_path[1024] = "";
 
 // Monotonic sequence for unique filenames. `volatile` + simple increment; only
 // the crashing thread runs this, so no atomicity is needed for uniqueness.
@@ -154,10 +170,77 @@ _Unwind_Reason_Code unwind_cb(struct _Unwind_Context* ctx, void* arg) {
     return _URC_NO_REASON;
 }
 
-void write_backtrace(int fd) {
+// Capture the CRASHED thread's stack from the signal context.
+// _Unwind_Backtrace from a handler running on an alternate signal stack would
+// only unwind the handler's own frames — useless for diagnosis. Instead we seed
+// the walk with the crash PC + frame pointer from ucontext and follow the
+// standard frame-pointer chain ([fp+0]=prev fp, [fp+8]=return address on both
+// x86_64 and aarch64). Dereferences are range-guarded to avoid a nested fault.
+#if defined(__x86_64__)
+uintptr_t crash_pc_from_ctx(void* uc) {
+    auto* u = static_cast<ucontext_t*>(uc);
+#if defined(__APPLE__)
+    return static_cast<uintptr_t>(u->uc_mcontext->__ss.__rip);
+#else
+    return static_cast<uintptr_t>(u->uc_mcontext.gregs[REG_RIP]);
+#endif
+}
+uintptr_t crash_fp_from_ctx(void* uc) {
+    auto* u = static_cast<ucontext_t*>(uc);
+#if defined(__APPLE__)
+    return static_cast<uintptr_t>(u->uc_mcontext->__ss.__rbp);
+#else
+    return static_cast<uintptr_t>(u->uc_mcontext.gregs[REG_RBP]);
+#endif
+}
+#elif defined(__aarch64__)
+uintptr_t crash_pc_from_ctx(void* uc) {
+    auto* u = static_cast<ucontext_t*>(uc);
+#if defined(__APPLE__)
+    return static_cast<uintptr_t>(u->uc_mcontext->__ss.__pc);
+#else
+    return static_cast<uintptr_t>(u->uc_mcontext.pc);
+#endif
+}
+uintptr_t crash_fp_from_ctx(void* uc) {
+    auto* u = static_cast<ucontext_t*>(uc);
+#if defined(__APPLE__)
+    return static_cast<uintptr_t>(u->uc_mcontext->__ss.__fp);
+#else
+    return static_cast<uintptr_t>(u->uc_mcontext.regs[29]);
+#endif
+}
+#else
+uintptr_t crash_pc_from_ctx(void*) { return 0; }
+uintptr_t crash_fp_from_ctx(void*) { return 0; }
+#endif
+
+void capture_crash_frames(void* uc, BacktraceFrameBuffer& out) {
+    out.count = 0;
+    uintptr_t pc = crash_pc_from_ctx(uc);
+    uintptr_t fp = crash_fp_from_ctx(uc);
+    if (pc == 0) {
+        // Platform unsupported / no context: fall back to current-stack unwind.
+        out.count = 0;
+        ::_Unwind_Backtrace(unwind_cb, &out);
+        return;
+    }
+    // First frame = the instruction that faulted.
+    out.frames[out.count++] = reinterpret_cast<const void*>(pc);
+    for (int i = 0; fp != 0 && fp < 0x00007ffffffff000ULL && fp > 0x1000 && out.count < 16; ++i) {
+        const auto* frame = reinterpret_cast<const uintptr_t*>(fp);
+        const uintptr_t ret = frame[1];  // return address
+        const uintptr_t next = frame[0]; // previous frame pointer
+        if (ret == 0) break;
+        out.frames[out.count++] = reinterpret_cast<const void*>(ret);
+        fp = next;
+    }
+}
+
+void write_backtrace(int fd, void* uctx) {
     BacktraceFrameBuffer buf{};
     buf.count = 0;
-    ::_Unwind_Backtrace(unwind_cb, &buf);
+    capture_crash_frames(uctx, buf);
     write_str(fd, ",\"backtrace\":[");
     for (int i = 0; i < buf.count; ++i) {
         if (i > 0) write_str(fd, ",");
@@ -209,6 +292,21 @@ void CrashHandler::install(const std::string& dir) {
     std::memcpy(g_dir_path, dir.data(), g_dir_len);
     g_dir_path[g_dir_len] = '\0';
 
+    // Capture the engine module's base + path for post-crash symbolization.
+    // dladdr() is safe here (install-time, not in the signal handler). On
+    // desktop this is the peer executable; on Android it is liblitep2p.so —
+    // exactly the module whose frames dominate the backtrace.
+    {
+        Dl_info info;
+        if (::dladdr(reinterpret_cast<void*>(&CrashHandler::getInstance), &info) != 0) {
+            g_module_base = info.dli_fbase;
+            if (info.dli_fname) {
+                std::strncpy(g_module_path, info.dli_fname, sizeof(g_module_path) - 1);
+                g_module_path[sizeof(g_module_path) - 1] = '\0';
+            }
+        }
+    }
+
     // Alternate signal stack so we can still write a report on stack overflow.
     static char alt_stack[65536];
     stack_t ss;
@@ -243,7 +341,7 @@ void CrashHandler::uninstall() {
     m_installed.store(false, std::memory_order_release);
 }
 
-void CrashHandler::onCrash(int sig, void*, void*) {
+void CrashHandler::onCrash(int sig, void*, void* uctx) {
     // Build the report path first (async-signal-safe, no allocation).
     char path[600];
     const size_t plen = build_path(path, sizeof(path));
@@ -272,7 +370,14 @@ void CrashHandler::onCrash(int sig, void*, void*) {
     write_str(fd, "\",\"crash_epoch_s\":");
     write_u64_dec(fd, static_cast<unsigned long long>(::time(nullptr)));
 
-    write_backtrace(fd);
+    // Module identity for post-crash symbolization: base + binary path.
+    write_str(fd, ",\"module_base\":\"");
+    write_ptr_hex(fd, g_module_base);
+    write_str(fd, "\",\"module_path\":\"");
+    write_str(fd, g_module_path);
+    write_str(fd, "\"");
+
+    write_backtrace(fd, uctx);
 
     // Splice the pre-formatted context (uptime/device/telemetry/etc.).
     const size_t clen = crash_ctx::length.load(std::memory_order_acquire);
