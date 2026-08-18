@@ -149,6 +149,12 @@ private:
     // that accumulated suppressed repeats (frequency data for analysts), then
     // resets the counters. Rate-limited to min_interval_ms per key.
     void flush_suppression_summaries_();
+
+    // Refreshes the crash-handler shared context buffer (pre-formatted JSON
+    // inner object: uptime/device/fingerprint/telemetry/event-counts) so a
+    // native crash report carries the same rich context as an incident.
+    void refresh_crash_context_();
+    int64_t m_last_crash_ctx_refresh_ms{0};
 };
 
 // Convenience: short-hand for report() with no extras.

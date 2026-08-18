@@ -136,6 +136,7 @@ set(CORE_SOURCES
     ../litep2p-core/src/main/cpp/modules/corep2p/core/src/logger.cpp
     ../litep2p-core/src/main/cpp/modules/corep2p/core/src/device_utils.cpp
     ../litep2p-core/src/main/cpp/modules/corep2p/monitoring/src/anomaly_reporter.cpp
+    ../litep2p-core/src/main/cpp/modules/corep2p/monitoring/src/crash_handler.cpp
 )
 
 # Session Manager and related components
@@ -435,6 +436,11 @@ target_link_libraries(malformed_input_test PRIVATE litep2p_engine)
 add_executable(stall_probe tools/stall_probe.cpp)
 target_include_directories(stall_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(stall_probe PRIVATE litep2p_engine)
+
+# Live diagnostic: validates native crash capture + next-run upload (see crash_probe.cpp).
+add_executable(crash_probe tools/crash_probe.cpp)
+target_include_directories(crash_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(crash_probe PRIVATE litep2p_engine)
 
 add_executable(wan_integration_runner tests/wan_integration_runner.cpp)
 target_include_directories(wan_integration_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

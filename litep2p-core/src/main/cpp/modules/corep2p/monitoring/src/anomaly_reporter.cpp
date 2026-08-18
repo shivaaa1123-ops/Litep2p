@@ -3,6 +3,7 @@
 #include "telemetry.h"
 #include "logger.h"
 #include "config_manager.h"
+#include "crash_handler.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -92,18 +93,28 @@ AnomalyReporter& AnomalyReporter::getInstance() {
 }
 
 void AnomalyReporter::configure(const Config& cfg) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    m_cfg = cfg;
-    m_configured_at_ms = system_now_ms();
-    if (!m_cfg.base_dir.empty()) {
-        m_directory = m_cfg.base_dir;
-        if (m_directory.back() != '/') m_directory += '/';
-        m_directory += m_cfg.subdir;
-    } else {
-        m_directory = m_cfg.subdir;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        m_cfg = cfg;
+        m_configured_at_ms = system_now_ms();
+        if (!m_cfg.base_dir.empty()) {
+            m_directory = m_cfg.base_dir;
+            if (m_directory.back() != '/') m_directory += '/';
+            m_directory += m_cfg.subdir;
+        } else {
+            m_directory = m_cfg.subdir;
+        }
+        mkdirs(m_directory);
+        rotate_locked_(m_cfg.max_files);
     }
-    mkdirs(m_directory);
-    rotate_locked_(m_cfg.max_files);
+
+    // Native crash capture: a SIGSEGV/SIGABRT/etc. writes a `crash_*.json`
+    // report with the same rich context (uptime/device/telemetry) via the
+    // shared crash context buffer, then re-raises so the process still dies
+    // with correct signal semantics. Reports are uploaded by the next run.
+    // (Called OUTSIDE the m_mu lock — refresh_crash_context_ locks it itself.)
+    CrashHandler::getInstance().install(m_directory);
+    refresh_crash_context_();
 }
 
 bool AnomalyReporter::isEnabled() const {
@@ -352,6 +363,13 @@ bool AnomalyReporter::write_incident_(const std::string& json, std::string& out_
     return true;
 }
 
+// A pending file is either a graceful anomaly incident or a native crash
+// report (both live in the same directory; crash_* files are written by the
+// signal handler and uploaded by the next run).
+static bool is_pending_report_name(const std::string& name) {
+    return name.rfind("anomaly_", 0) == 0 || name.rfind("crash_", 0) == 0;
+}
+
 void AnomalyReporter::rotate_locked_(int max_files) {
     if (max_files <= 0 || m_directory.empty()) return;
     std::vector<std::string> files;
@@ -360,7 +378,7 @@ void AnomalyReporter::rotate_locked_(int max_files) {
     struct dirent* e = nullptr;
     while ((e = ::readdir(d)) != nullptr) {
         const std::string name = e->d_name;
-        if (name.rfind("anomaly_", 0) == 0) {
+        if (is_pending_report_name(name)) {
             files.push_back(m_directory + "/" + name);
         }
     }
@@ -379,6 +397,21 @@ void AnomalyReporter::rotate_locked_(int max_files) {
 // ============================================================================
 
 void AnomalyReporter::tick() {
+    // Keep the crash-handler context reasonably fresh (cheap, rate-limited).
+    bool refresh_ctx = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        const int64_t now = system_now_ms();
+        if (m_last_crash_ctx_refresh_ms == 0 ||
+            now - m_last_crash_ctx_refresh_ms >= 5000) {
+            m_last_crash_ctx_refresh_ms = now;
+            refresh_ctx = true;
+        }
+    }
+    if (refresh_ctx) {
+        refresh_crash_context_();  // locks m_mu itself
+    }
+
     // Surface accumulated suppressed repeats as compact frequency incidents
     // (rate-limited per key), so repeated errors are visible without flooding.
     flush_suppression_summaries_();
@@ -427,7 +460,7 @@ std::vector<std::string> AnomalyReporter::list_pending_locked_() const {
     struct dirent* e = nullptr;
     while ((e = ::readdir(d)) != nullptr) {
         const std::string name = e->d_name;
-        if (name.rfind("anomaly_", 0) == 0) {
+        if (is_pending_report_name(name)) {
             files.push_back(m_directory + "/" + name);
         }
     }
@@ -565,6 +598,9 @@ bool AnomalyReporter::upload_file_(const std::string& path) {
     req << "Content-Length: " << body.size() << "\r\n";
     req << "Connection: close\r\n";
     req << "X-LiteP2P-Anomaly: 1\r\n";
+    if (path.find("/crash_") != std::string::npos) {
+        req << "X-LiteP2P-Crash: 1\r\n";
+    }
     req << "\r\n";
     const std::string head = req.str();
     const bool sent_head = ::send(sock, head.data(), head.size(), 0) == static_cast<ssize_t>(head.size());
@@ -638,5 +674,61 @@ std::string AnomalyReporter::json_escape_(const std::string& s) {
         }
     }
     return oss.str();
+}
+
+
+// Refreshes the crash-handler shared context buffer with a pre-formatted JSON
+// object body (no braces): uptime, engine version, peer id, device info,
+// config fingerprint, per-type event totals and the latest telemetry snapshot.
+// The signal handler splices this into the crash report using only
+// async-signal-safe calls, so a native fault still yields rich field data.
+void AnomalyReporter::refresh_crash_context_() {
+    std::string ctx;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_directory.empty()) return;
+        int64_t uptime_ms = 0;
+        const int64_t now_ms = system_now_ms();
+        if (m_uptime_provider) {
+            uptime_ms = m_uptime_provider();
+        } else {
+            uptime_ms = now_ms - m_configured_at_ms;
+        }
+
+        std::string telemetry_json;
+        try {
+            telemetry_json = Telemetry::getInstance().snapshot_json("crash-ctx");
+        } catch (...) {
+            telemetry_json.clear();
+        }
+
+        std::ostringstream oss;
+        oss << "\"timestamp_utc\":\"" << iso8601_utc_(now_ms) << "\",";
+        oss << "\"engine_uptime_ms\":" << uptime_ms << ",";
+        oss << "\"engine_version\":\"" << json_escape_(m_cfg.engine_version) << "\",";
+        oss << "\"local_peer_id\":\"" << json_escape_(m_cfg.peer_id) << "\",";
+        oss << "\"config_fingerprint\":\"" << config_fingerprint_() << "\",";
+        oss << "\"device\":" << (m_device_info.empty() ? "{}" : m_device_info) << ",";
+        if (!m_event_totals.empty()) {
+            oss << "\"event_counts\":{";
+            bool first = true;
+            std::vector<std::pair<std::string, int64_t>> totals(m_event_totals.begin(),
+                                                                m_event_totals.end());
+            std::sort(totals.begin(), totals.end());
+            for (const auto& kv : totals) {
+                oss << (first ? "" : ",") << "\"" << json_escape_(kv.first) << "\":" << kv.second;
+                first = false;
+            }
+            oss << "},";
+        }
+        if (!telemetry_json.empty()) {
+            oss << "\"telemetry\":" << telemetry_json;
+        } else {
+            oss << "\"telemetry\":{}";
+        }
+        ctx = oss.str();
+    }
+
+    CrashHandler::getInstance().updateContext(ctx);
 }
 

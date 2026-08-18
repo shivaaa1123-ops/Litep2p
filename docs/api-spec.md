@@ -1774,6 +1774,40 @@ retried; `max_files` caps the backlog. The uploader speaks plain HTTP on both
 platforms (HTTPS lands with the TLS phase). On Android, the SDK automatically
 pushes device info (brand/model/Android version/ABI) via `LiteP2P.setAnomalyDeviceInfo`.
 
+### 9.3 Native crash reporting (hard faults)
+
+Hard native crashes (segfaults, aborts, bus errors, illegal instructions,
+`std::terminate` → SIGABRT) cannot go through the graceful reporting path. A
+built-in async-signal-safe handler captures them:
+
+- Installed automatically when `anomaly_reporter.enabled` is true; uses an
+  alternate signal stack so even stack-overflow crashes are reportable.
+- On `SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL/SIGTRAP/SIGSYS` it writes
+  `crash_<pid>_<seq>.json` into the same incidents directory using only
+  async-signal-safe calls (open/write/close), then **re-raises the signal with
+  the default action** so the process still dies with correct signal semantics
+  and core-dump behavior.
+- The report contains the signal, a best-effort backtrace (return addresses
+  via the platform unwinder), and a **crash_context** snapshot that the engine
+  keeps fresh every ~5s (uptime, device info, config fingerprint, telemetry
+  gauges/counters, event counts):
+
+```json
+{
+  "schema": "litep2p-crash/1",
+  "crash_id": "…", "signal": 11, "signame": "SIGSEGV", "crash_epoch_s": 1787017665,
+  "backtrace": ["0x…", "0x…"],
+  "crash_context": { "timestamp_utc": "…", "engine_uptime_ms": 42328,
+                     "engine_version": "0.4.0", "local_peer_id": "…",
+                     "config_fingerprint": "…", "device": {…},
+                     "event_counts": {…}, "telemetry": {…} }
+}
+```
+
+- `crash_*` files are picked up by the same uploader (with the
+  `X-LiteP2P-Crash: 1` header) — a crash report is delivered to the collector
+  by the **next engine start**, the standard crash-reporting pattern.
+
 ---
 
 ## 10. Identity and addressing
