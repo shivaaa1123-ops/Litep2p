@@ -86,6 +86,39 @@ interface LiteP2PListener {
     fun onTransferCompleted(transferId: String, success: Boolean, error: String?) {}
 
     /* ------------------------------------------------------------------ */
+    /* Voice calls (realtime audio)                                        */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * An incoming voice-call offer arrived. Nothing is captured or played
+     * until the callee explicitly calls [LiteP2P.acceptVoiceCall], or
+     * [LiteP2P.declineVoiceCall] to refuse.
+     */
+    fun onVoiceCallOffered(offer: VoiceCallOffer) {}
+
+    /**
+     * A call state change (both sides).
+     *
+     * @param callId The call id (from [LiteP2P.startVoiceCall] or the original
+     *   [VoiceCallOffer]).
+     * @param peerId The peer on the other end.
+     * @param state One of [VoiceCallState].
+     * @param detail Human-readable detail: "connected", "declined by peer",
+     *   "ended", "ring timeout", ...
+     */
+    fun onVoiceCallStateChanged(callId: String, peerId: String, state: VoiceCallState, detail: String?) {}
+
+    /**
+     * An incoming audio frame for an active call.
+     *
+     * @param callId The active call id.
+     * @param peerId The peer sending this frame.
+     * @param data Codec bytes (PCM S16LE with the default profile). Valid only
+     *   for the duration of this callback.
+     */
+    fun onVoiceFrameReceived(callId: String, peerId: String, data: ByteArray) {}
+
+    /* ------------------------------------------------------------------ */
     /* v0.4: reliable messaging / presence / directory / invites            */
     /* ------------------------------------------------------------------ */
 

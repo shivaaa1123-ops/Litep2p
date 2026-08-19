@@ -11,6 +11,7 @@ package com.zeengal.litep2p.core
  * available instead of relying on [EngineResult.UNSUPPORTED] at call time.
  *
  * @property fileTransfer file-transfer module compiled in (offer/accept model).
+ * @property voiceCall realtime voice-call module compiled in.
  * @property overlay multi-hop overlay module compiled in (censorship-resistance).
  * @property proxy proxy/relay module compiled in.
  * @property encryption Noise NK protocol compiled in.
@@ -19,6 +20,7 @@ package com.zeengal.litep2p.core
  */
 data class LiteP2PCapabilities(
     val fileTransfer: Boolean,
+    val voiceCall: Boolean,
     val overlay: Boolean,
     val proxy: Boolean,
     val encryption: Boolean,
@@ -32,11 +34,13 @@ data class LiteP2PCapabilities(
         const val FLAG_ENCRYPTION: Int = 1 shl 3
         const val FLAG_DISCOVERY: Int = 1 shl 4
         const val FLAG_TELEMETRY: Int = 1 shl 5
+        const val FLAG_VOICE_CALL: Int = 1 shl 6
 
         /** Decodes the `LITEP2P_FEATURE_*` bitmask returned by the native engine. */
         @JvmStatic
         fun fromFlags(flags: Int): LiteP2PCapabilities = LiteP2PCapabilities(
             fileTransfer = flags and FLAG_FILE_TRANSFER != 0,
+            voiceCall = flags and FLAG_VOICE_CALL != 0,
             overlay = flags and FLAG_OVERLAY != 0,
             proxy = flags and FLAG_PROXY != 0,
             encryption = flags and FLAG_ENCRYPTION != 0,

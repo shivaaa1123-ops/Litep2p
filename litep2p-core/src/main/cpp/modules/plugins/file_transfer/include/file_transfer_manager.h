@@ -172,20 +172,26 @@ public:
         uint32_t path_eval_interval_sec;
         uint32_t congestion_check_interval_ms;
         uint32_t initial_rate_limit_kbps;
+        // Ruggedness: mark a transfer FAILED when it has made no chunk/ack
+        // progress for this many milliseconds (surfaces the failure instead of
+        // retransmitting a permanently-doomed chunk forever). 0 = disabled.
+        uint32_t stall_timeout_ms;
         
         TransferConfig() : 
             max_concurrent_transfers(MAX_CONCURRENT_TRANSFERS),
             chunk_size_kb(CHUNK_SIZE / 1024),
             path_eval_interval_sec(30),
             congestion_check_interval_ms(2000),
-            initial_rate_limit_kbps(INITIAL_RATE_LIMIT_KBPS) {}
+            initial_rate_limit_kbps(INITIAL_RATE_LIMIT_KBPS),
+            stall_timeout_ms(TRANSFER_STALL_TIMEOUT_MS) {}
             
         TransferConfig(uint32_t max_transfers, uint32_t chunk_kb) :
             max_concurrent_transfers(max_transfers),
             chunk_size_kb(chunk_kb),
             path_eval_interval_sec(30),
             congestion_check_interval_ms(2000),
-            initial_rate_limit_kbps(INITIAL_RATE_LIMIT_KBPS) {}
+            initial_rate_limit_kbps(INITIAL_RATE_LIMIT_KBPS),
+            stall_timeout_ms(TRANSFER_STALL_TIMEOUT_MS) {}
     };
 
     explicit FileTransferManager(const TransferConfig& cfg = TransferConfig());
@@ -618,6 +624,8 @@ private:
     // Configurable evaluation intervals (seconds / milliseconds)
     uint32_t m_path_eval_interval_sec{30};
     uint32_t m_congestion_check_interval_ms{2000};
+    // Ruggedness: no-progress threshold (ms) before a transfer is declared FAILED.
+    uint32_t m_stall_timeout_ms{TRANSFER_STALL_TIMEOUT_MS};
     
     // ==================== INTERNAL METHODS ====================
     
@@ -648,6 +656,14 @@ private:
      * applies pacing/window limits.
      */
     void send_worker_loop();
+
+    /**
+     * Fail a transfer with a hard terminal state and surface it to callers.
+     * Clears the sender's chunk queues (keeps the checkpoint/.part so the
+     * transfer can be resumed later) and fires the completion callback with
+     * success=false and the given error.
+     */
+    bool fail_transfer(const std::string& transfer_id, const std::string& error);
     
     /**
      * Load file into chunks
@@ -669,7 +685,14 @@ private:
      * Adjust rate limit based on congestion
      */
     void adjust_rate_limit(CongestionLevel level);
-    
+
+    /**
+     * Loss-responsive adaptation hook: convert a batch of chunk retransmissions
+     * (lost_chunks out of an in-flight window) into a congestion sample and feed
+     * it through report_congestion() so the AIMD rate limit reacts to real loss.
+     */
+    void report_chunk_loss(uint32_t lost_chunks, uint32_t window);
+
     /**
      * Estimate congestion from metrics
      */

@@ -21,5 +21,9 @@ enum class MessageType : uint8_t {
     OVERLAY_FRAME        = 0x32,
 
     // High-volume frames (not batched) for file transfer.
-    FILE_TRANSFER        = 0x20
+    FILE_TRANSFER        = 0x20,
+
+    // Realtime voice-call frames (control + audio, not batched). Frames are
+    // fire-and-forget: the app tolerates loss instead of retransmitting.
+    VOICE_STREAM         = 0x21
 };

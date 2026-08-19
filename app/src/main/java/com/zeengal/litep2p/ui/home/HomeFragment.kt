@@ -9,6 +9,7 @@ import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.zeengal.litep2p.EngineController
+import com.zeengal.litep2p.MainActivity
 import com.zeengal.litep2p.R
 import com.zeengal.litep2p.hook.P2P
 
@@ -26,6 +27,16 @@ class HomeFragment : Fragment() {
         val root = inflater.inflate(R.layout.fragment_home, container, false)
 
         peersAdapter = PeersAdapter()
+        // File-transfer action on the peer cards is handled by the host activity
+        // (it owns the ActivityResultLauncher for the system photo picker).
+        peersAdapter.onSendFile = { peer ->
+            (requireActivity() as? MainActivity)?.openFilePickerForPeer(peer.id)
+        }
+        // Voice-call action on the peer cards is also handled by the host
+        // activity (it owns the RECORD_AUDIO permission request + call UI).
+        peersAdapter.onCall = { peer ->
+            (requireActivity() as? MainActivity)?.startVoiceCallToPeer(peer.id)
+        }
         val recyclerView: RecyclerView = root.findViewById(R.id.peersRecycler)
         recyclerView.layoutManager = LinearLayoutManager(context)
         recyclerView.adapter = peersAdapter

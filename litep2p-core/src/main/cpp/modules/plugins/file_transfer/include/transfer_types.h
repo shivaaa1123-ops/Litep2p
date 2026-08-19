@@ -74,12 +74,24 @@ enum class FtControlType : uint8_t {
 constexpr uint32_t CHUNK_SIZE = 32 * 1024;              // 32KB chunks
 constexpr uint32_t MAX_CONCURRENT_TRANSFERS = 100;      // Max transfers at once
 constexpr uint32_t MAX_CHUNKS_IN_FLIGHT = 16;           // Sliding window for chunks
-constexpr uint32_t INITIAL_RATE_LIMIT_KBPS = 1024;      // 1 Mbps initial
+constexpr uint32_t INITIAL_RATE_LIMIT_KBPS = 8192;      // 8 Mbps initial (tunable via TransferConfig)
 constexpr uint32_t MIN_RATE_LIMIT_KBPS = 64;            // 64 Kbps minimum
 constexpr uint32_t MAX_RATE_LIMIT_KBPS = 100000;        // 100 Mbps maximum
 constexpr uint32_t CHECKPOINT_INTERVAL = 10;            // Save checkpoint every 10 chunks
 constexpr uint32_t PATH_EVAL_INTERVAL_SEC = 5;          // Evaluate paths every 5 seconds
 constexpr uint32_t CONGESTION_CHECK_INTERVAL_MS = 100;  // Check congestion every 100ms
+
+// ---------------------------------------------------------------------------
+// RELIABILITY / RUGGEDNESS CONSTANTS
+// ---------------------------------------------------------------------------
+// A lost chunk is retransmitted after a short base delay, growing slightly with
+// each attempt, so transient loss recovers in ~1s rather than stalling the whole
+// sliding window for 5s. A transfer with no chunk/ack progress for longer than
+// the stall timeout is declared FAILED (and surfaced to callers) instead of
+// retransmitting a permanently-doomed chunk forever.
+constexpr uint32_t CHUNK_RETRANSMIT_BASE_MS = 1000;     // first retransmit delay for a lost chunk
+constexpr uint32_t CHUNK_RETRANSMIT_BACKOFF_MS = 300;   // extra delay per prior retry (adaptive)
+constexpr uint32_t TRANSFER_STALL_TIMEOUT_MS = 15000;   // no-progress threshold that fails a transfer
 
 // ============================================================================
 // STRUCTURES - Congestion Metrics

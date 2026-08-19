@@ -127,6 +127,104 @@ static bool test_roundtrip_basic(const std::filesystem::path& workdir) {
     return true;
 }
 
+static bool test_stall_failure(const std::filesystem::path& workdir) {
+    // A transfer whose chunks can never be delivered (no outbound transport)
+    // must be declared FAILED by the stall watchdog instead of hanging forever.
+    const auto src = workdir / "src_stall.bin";
+
+    std::error_code ec;
+    std::filesystem::remove(src, ec);
+    std::filesystem::remove(src.string() + ".checkpoint", ec);
+
+    TEST_ASSERT(write_random_file(src, 2 * 1024 * 1024, 789), "Failed to create source file");
+
+    FileTransferManager::TransferConfig cfg;
+    cfg.initial_rate_limit_kbps = 100000; // 100 Mbps
+    cfg.stall_timeout_ms = 400;           // aggressive watchdog for the test
+    FileTransferManager sender(cfg);
+
+    // No outbound callback is registered: outbound "transport" is unpluggable,
+    // so no chunk is ever delivered and no ACK ever returns.
+    sender.register_network_path("peer-stall", "peer-stall", "127.0.0.1", 12345, 10, 10000);
+
+    bool completion_cb_fired = false;
+    bool completion_success = true;
+    std::string completion_error;
+    sender.on_transfer_complete([&](const std::string&, bool success, const std::string& error) {
+        completion_cb_fired = true;
+        completion_success = success;
+        completion_error = error;
+    });
+
+    const std::string transfer_id = sender.send_file(src.string(), "peer-stall", "", 0);
+    TEST_ASSERT(!transfer_id.empty(), "send_file returned empty transfer id");
+
+    // Watchdog must fail the stuck transfer within a bounded time.
+    TEST_ASSERT(wait_for_state(sender, transfer_id, TransferState::FAILED, std::chrono::seconds(5)),
+                "Sender did not FAIL a stalled transfer via the watchdog");
+
+    TEST_ASSERT(completion_cb_fired, "Completion callback was not fired on stall failure");
+    TEST_ASSERT(!completion_success, "Completion callback should report failure on stall");
+    TEST_ASSERT(completion_error.find("stalled") != std::string::npos,
+                "Completion error should mention the stall; got: " + completion_error);
+
+    sender.stop();
+
+    // The checkpoint must survive a failure so a later send can resume.
+    TEST_ASSERT(std::filesystem::exists(src.string() + ".checkpoint"),
+                "Sender checkpoint should be retained after a stall failure for resume");
+
+    return true;
+}
+
+static bool test_loss_responsive_rate(const std::filesystem::path& workdir) {
+    // Loss-responsive rate adaptation: when chunks are lost (never ACKed), the
+    // sender retransmits them and must throttle its rate limit down via the
+    // congestion AMID path, so a lossy path self-clocks rather than blasting.
+    const auto src = workdir / "src_loss.bin";
+
+    std::error_code ec;
+    std::filesystem::remove(src, ec);
+    std::filesystem::remove(src.string() + ".checkpoint", ec);
+
+    TEST_ASSERT(write_random_file(src, 512 * 1024, 555), "Failed to create source file");
+
+    FileTransferManager::TransferConfig cfg;
+    cfg.initial_rate_limit_kbps = 8192;   // 8 Mbps
+    cfg.stall_timeout_ms = 0;             // disable the watchdog for this test
+    FileTransferManager sender(cfg);
+    sender.register_network_path("peer-loss", "peer-loss", "127.0.0.1", 12345, 10, 10000);
+
+    // Black-hole outbound: chunks are "sent" but never delivered/ACKed, so the
+    // sender must detect loss via retransmit timeouts (~1s) and back off.
+    sender.set_outbound_message_callback([](const std::string&, const std::string&) { /* drop */ });
+
+    const std::string transfer_id = sender.send_file(src.string(), "peer-loss", "", 0);
+    TEST_ASSERT(!transfer_id.empty(), "send_file returned empty transfer id");
+
+    const uint32_t initial_rate = sender.get_adaptive_rate_limit();
+    TEST_ASSERT(initial_rate == static_cast<uint32_t>(cfg.initial_rate_limit_kbps),
+                "Unexpected initial rate limit");
+
+    // Poll until the rate drops below the initial limit (retransmit-driven loss).
+    bool backed_off = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (sender.get_adaptive_rate_limit() < initial_rate) {
+            backed_off = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    TEST_ASSERT(backed_off,
+                "Rate limit did not adapt downward in response to chunk loss "
+                "(initial=" + std::to_string(initial_rate) + ")");
+
+    sender.stop();
+    return true;
+}
+
 static bool test_roundtrip_resume(const std::filesystem::path& workdir) {
     const auto src = workdir / "src_resume.bin";
     const auto dst = workdir / "dst_resume.bin";
@@ -240,6 +338,14 @@ int main() {
 
     if (test_roundtrip_basic(workdir)) {
         std::cout << "PASS: basic roundtrip" << std::endl;
+    }
+
+    if (test_stall_failure(workdir)) {
+        std::cout << "PASS: stall failure watchdog" << std::endl;
+    }
+
+    if (test_loss_responsive_rate(workdir)) {
+        std::cout << "PASS: loss-responsive rate adaptation" << std::endl;
     }
 
     if (test_roundtrip_resume(workdir)) {

@@ -86,6 +86,9 @@ object LiteP2P {
     /** True when the file-transfer module is compiled into this build. */
     fun supportsFileTransfer(): Boolean = capabilities.fileTransfer
 
+    /** True when the realtime voice-call module is compiled into this build. */
+    fun supportsVoiceCall(): Boolean = capabilities.voiceCall
+
     /** True when the multi-hop overlay module is compiled into this build. */
     fun supportsOverlay(): Boolean = capabilities.overlay
 
@@ -498,6 +501,65 @@ object LiteP2P {
     }
 
     /* ------------------------------------------------------------------ */
+    /* Voice calls (realtime audio)                                        */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Offers a realtime voice call to a connected peer.
+     *
+     * The engine is codec-agnostic: [codec] is opaque. The Android app uses
+     * "PCM_S16LE" (16 kHz mono, 16-bit signed little-endian) with
+     * [sampleRate]=16000, [channels]=1, [frameMs]=20. Frames are sent
+     * fire-and-forget — late/lost frames are dropped, never retransmitted.
+     *
+     * @return the call id on success, or null when the request was refused
+     *   (blank args, unknown/not-connected peer, module unavailable, or an
+     *   active call already exists with the peer).
+     */
+    fun startVoiceCall(
+        peerId: String,
+        codec: String = "PCM_S16LE",
+        sampleRate: Int = 16000,
+        channels: Int = 1,
+        frameMs: Int = 20
+    ): String? {
+        if (peerId.isBlank() || codec.isBlank() || sampleRate <= 0 ||
+            channels !in 1..2 || frameMs <= 0) return null
+        val id = LiteP2PNative.startVoiceCall(peerId, codec, sampleRate, channels, frameMs)
+        return id.ifEmpty { null }
+    }
+
+    /** Accepts an incoming [VoiceCallOffer]; the call goes IN_CALL and audio flows. */
+    fun acceptVoiceCall(callId: String): EngineResult {
+        if (callId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.acceptVoiceCall(callId))
+    }
+
+    /** Declines an incoming [VoiceCallOffer]. */
+    fun declineVoiceCall(callId: String): EngineResult {
+        if (callId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.declineVoiceCall(callId))
+    }
+
+    /** Ends a call (either side; caller/callee/connected). */
+    fun endVoiceCall(callId: String): EngineResult {
+        if (callId.isBlank()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.endVoiceCall(callId))
+    }
+
+    /**
+     * Sends one audio frame for an active call (fire-and-forget).
+     *
+     * @param data codec bytes; PCM S16LE 16 kHz mono gives 640 bytes per 20 ms
+     *   frame. Frames must stay small (≤ ~8 KB) so each rides one UDP datagram
+     *   without IP fragmentation.
+     */
+    fun sendVoiceFrame(callId: String, data: ByteArray): EngineResult {
+        if (callId.isBlank() || data.isEmpty()) return EngineResult.INVALID_ARG
+        return EngineResult.fromCode(LiteP2PNative.sendVoiceFrame(callId, data))
+    }
+
+    /* ------------------------------------------------------------------ */
     /* Proxy / relay                                                       */
     /* ------------------------------------------------------------------ */
 
@@ -676,6 +738,23 @@ object LiteP2P {
 
     internal fun dispatchTransferCompleted(transferId: String, success: Boolean, error: String?) {
         for (l in listeners) runCatching { l.onTransferCompleted(transferId, success, error) }
+    }
+
+    internal fun dispatchVoiceCallOffered(offer: VoiceCallOffer) {
+        for (l in listeners) runCatching { l.onVoiceCallOffered(offer) }
+    }
+
+    internal fun dispatchVoiceCallStateChanged(
+        callId: String,
+        peerId: String,
+        state: VoiceCallState,
+        detail: String?
+    ) {
+        for (l in listeners) runCatching { l.onVoiceCallStateChanged(callId, peerId, state, detail) }
+    }
+
+    internal fun dispatchVoiceFrameReceived(callId: String, peerId: String, data: ByteArray) {
+        for (l in listeners) runCatching { l.onVoiceFrameReceived(callId, peerId, data) }
     }
 
     internal fun dispatchDeliveryStatus(messageId: String, status: Int, reason: String) {

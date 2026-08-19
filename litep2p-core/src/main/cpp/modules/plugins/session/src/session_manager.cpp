@@ -395,6 +395,8 @@ SessionManager::Impl::Impl(std::shared_ptr<ISessionDependenciesFactory> factory)
     m_failsafe = m_factory->createTierSystemFailsafe();
     m_file_transfer_manager = m_factory->createFileTransferManager();
     wire_file_transfer_manager();
+    m_voice_call_manager = m_factory->createVoiceCallManager();
+    wire_voice_call_manager();
     m_event_manager = m_factory->createEventManager();
     LOG_INFO("SM: Creating TCP connection manager...");
     m_tcpConnectionManager = m_factory->createTcpConnectionManager();
@@ -1078,6 +1080,10 @@ void SessionManager::Impl::start(int port, std::function<void(const std::vector<
     if (!m_file_transfer_manager) {
         m_file_transfer_manager = m_factory->createFileTransferManager();
         wire_file_transfer_manager();
+    }
+    if (!m_voice_call_manager) {
+        m_voice_call_manager = m_factory->createVoiceCallManager();
+        wire_voice_call_manager();
     }
 
 #if HAVE_NOISE_PROTOCOL
@@ -2107,6 +2113,7 @@ void SessionManager::Impl::stop() {
     log_phase_ms("shutdown_peer_tier_manager", phase);
     
     m_file_transfer_manager.reset();
+    m_voice_call_manager.reset();
     LOG_INFO("SM: file_transfer_manager reset");
     m_session_cache.reset();
     LOG_INFO("SM: session_cache reset");
@@ -5626,6 +5633,10 @@ FileTransferManager* SessionManager::Impl::get_file_transfer_manager() {
     return m_file_transfer_manager.get();
 }
 
+VoiceCallManager* SessionManager::Impl::get_voice_call_manager() {
+    return m_voice_call_manager.get();
+}
+
 // ============================================================================
 // File transfer (offer/accept model) — public wrappers + Impl adapters
 // ============================================================================
@@ -5673,6 +5684,41 @@ void SessionManager::set_file_transfer_callbacks(FileTransferOfferCallback on_of
                                                  FileTransferCompleteCallback on_complete) {
     m_impl->set_file_transfer_callbacks(std::move(on_offer), std::move(on_progress),
                                         std::move(on_complete));
+}
+
+// ============================================================================
+// Voice calls (realtime audio) — public wrappers
+// ============================================================================
+
+std::string SessionManager::start_voice_call(const std::string& peer_id,
+                                             const std::string& codec,
+                                             uint16_t sample_rate, uint8_t channels,
+                                             uint8_t frame_ms) {
+    return m_impl->start_voice_call(peer_id, codec, sample_rate, channels, frame_ms);
+}
+
+bool SessionManager::accept_voice_call(const std::string& call_id) {
+    return m_impl->accept_voice_call(call_id);
+}
+
+bool SessionManager::decline_voice_call(const std::string& call_id) {
+    return m_impl->decline_voice_call(call_id);
+}
+
+bool SessionManager::end_voice_call(const std::string& call_id) {
+    return m_impl->end_voice_call(call_id);
+}
+
+bool SessionManager::send_voice_frame(const std::string& call_id, const uint8_t* data,
+                                      size_t len) {
+    return m_impl->send_voice_frame(call_id, data, len);
+}
+
+void SessionManager::set_voice_call_callbacks(VoiceCallOfferedCallback on_offered,
+                                              VoiceCallStateCallback on_state,
+                                              VoiceFrameCallback on_frame) {
+    m_impl->set_voice_call_callbacks(std::move(on_offered), std::move(on_state),
+                                     std::move(on_frame));
 }
 
 // ---------------- Impl adapters ----------------
@@ -5731,6 +5777,107 @@ void SessionManager::Impl::wire_file_transfer_manager() {
         }
         if (cb) cb(transfer_id, success, error);
     });
+}
+
+// ---------------- Voice call Impl adapters ----------------
+
+void SessionManager::Impl::set_voice_call_callbacks(
+    SessionManager::VoiceCallOfferedCallback on_offered,
+    SessionManager::VoiceCallStateCallback on_state,
+    SessionManager::VoiceFrameCallback on_frame) {
+    {
+        std::lock_guard<std::mutex> lock(m_voice_cb_mutex);
+        m_voice_offered_cb = std::move(on_offered);
+        m_voice_state_cb = std::move(on_state);
+        m_voice_frame_cb = std::move(on_frame);
+    }
+    // Re-apply forwarding onto the (possibly re-created) VoiceCallManager.
+    wire_voice_call_manager();
+}
+
+void SessionManager::Impl::wire_voice_call_manager() {
+    VoiceCallManager* vc = m_voice_call_manager.get();
+    if (!vc) return;
+
+    // Outbound VOICE_STREAM payloads -> session send path. Control frames and
+    // audio frames travel as MessageType::VOICE_STREAM (bypassing batching) and
+    // get Noise encryption when enabled — just like file-transfer frames.
+    vc->set_outbound_message_callback([this](const std::string& peer_id, const std::string& payload) {
+        const std::string frame = wire::encode_message(MessageType::VOICE_STREAM, payload);
+        this->sendMessageToPeer(peer_id, frame);
+    });
+
+    vc->on_call_offered([this](const std::string& call_id, const std::string& peer_id,
+                               const std::string& codec, uint16_t sample_rate,
+                               uint8_t channels, uint8_t frame_ms) {
+        SessionManager::VoiceCallOfferedCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_voice_cb_mutex);
+            cb = m_voice_offered_cb;
+        }
+        if (cb) cb(call_id, peer_id, codec, sample_rate, channels, frame_ms);
+    });
+
+    vc->on_call_state([this](const std::string& call_id, const std::string& peer_id,
+                             VoiceCallState state, const std::string& detail) {
+        SessionManager::VoiceCallStateCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_voice_cb_mutex);
+            cb = m_voice_state_cb;
+        }
+        if (cb) cb(call_id, peer_id, static_cast<int>(state), detail);
+    });
+
+    vc->on_frame_received([this](const std::string& call_id, const std::string& peer_id,
+                                 const uint8_t* data, size_t len) {
+        SessionManager::VoiceFrameCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_voice_cb_mutex);
+            cb = m_voice_frame_cb;
+        }
+        if (cb) cb(call_id, peer_id, data, len);
+    });
+}
+
+std::string SessionManager::Impl::start_voice_call(const std::string& peer_id,
+                                                   const std::string& codec,
+                                                   uint16_t sample_rate, uint8_t channels,
+                                                   uint8_t frame_ms) {
+    VoiceCallManager* vc = m_voice_call_manager.get();
+    if (!vc) {
+        LOG_WARN("SM: start_voice_call - voice call manager unavailable");
+        return "";
+    }
+    if (!isPeerConnected(peer_id)) {
+        LOG_WARN("SM: start_voice_call - peer not connected: " + peer_id);
+        return "";
+    }
+    return vc->start_call(peer_id, codec, sample_rate, channels, frame_ms);
+}
+
+bool SessionManager::Impl::accept_voice_call(const std::string& call_id) {
+    VoiceCallManager* vc = m_voice_call_manager.get();
+    if (!vc) return false;
+    return vc->accept_call(call_id);
+}
+
+bool SessionManager::Impl::decline_voice_call(const std::string& call_id) {
+    VoiceCallManager* vc = m_voice_call_manager.get();
+    if (!vc) return false;
+    return vc->decline_call(call_id);
+}
+
+bool SessionManager::Impl::end_voice_call(const std::string& call_id) {
+    VoiceCallManager* vc = m_voice_call_manager.get();
+    if (!vc) return false;
+    return vc->end_call(call_id);
+}
+
+bool SessionManager::Impl::send_voice_frame(const std::string& call_id, const uint8_t* data,
+                                            size_t len) {
+    VoiceCallManager* vc = m_voice_call_manager.get();
+    if (!vc) return false;
+    return vc->send_frame(call_id, data, len);
 }
 
 std::string SessionManager::Impl::send_file(const std::string& peer_id,

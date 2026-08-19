@@ -117,6 +117,22 @@ public:
     // and register the offer/progress/complete forwarding. Called from start().
     void wire_file_transfer_manager();
 
+    // Voice calls (realtime audio) — thin adapters over VoiceCallManager.
+    VoiceCallManager* get_voice_call_manager();
+    std::string start_voice_call(const std::string& peer_id, const std::string& codec,
+                                 uint16_t sample_rate, uint8_t channels, uint8_t frame_ms);
+    bool accept_voice_call(const std::string& call_id);
+    bool decline_voice_call(const std::string& call_id);
+    bool end_voice_call(const std::string& call_id);
+    bool send_voice_frame(const std::string& call_id, const uint8_t* data, size_t len);
+    void set_voice_call_callbacks(SessionManager::VoiceCallOfferedCallback on_offered,
+                                  SessionManager::VoiceCallStateCallback on_state,
+                                  SessionManager::VoiceFrameCallback on_frame);
+
+    // Wire VoiceCallManager's outbound callback into the session send path
+    // and register offered/state/frame forwarding. Called from start().
+    void wire_voice_call_manager();
+
 #if HAVE_NOISE_PROTOCOL
     NoiseNKManager* get_noise_nk_manager();
     NoiseKeyStore* get_noise_key_store();
@@ -346,6 +362,7 @@ private:
     std::unique_ptr<PeerTierManager> m_peer_tier_manager;
     std::unique_ptr<BroadcastDiscoveryManager> m_broadcast_discovery;
     std::unique_ptr<FileTransferManager> m_file_transfer_manager;
+    std::unique_ptr<VoiceCallManager> m_voice_call_manager;
     std::unique_ptr<EventManager> m_event_manager;
 
     // File transfer event callbacks (guarded by m_file_transfer_cb_mutex).
@@ -353,6 +370,12 @@ private:
     SessionManager::FileTransferProgressCallback m_ft_progress_cb;
     SessionManager::FileTransferCompleteCallback m_ft_complete_cb;
     mutable std::mutex m_file_transfer_cb_mutex;
+
+    // Voice call event callbacks (guarded by m_voice_cb_mutex).
+    SessionManager::VoiceCallOfferedCallback m_voice_offered_cb;
+    SessionManager::VoiceCallStateCallback m_voice_state_cb;
+    SessionManager::VoiceFrameCallback m_voice_frame_cb;
+    mutable std::mutex m_voice_cb_mutex;
     
     std::unique_ptr<detail::MessageHandler> m_message_handler;
     std::unique_ptr<detail::PeerLifecycleManager> m_peer_lifecycle_manager;

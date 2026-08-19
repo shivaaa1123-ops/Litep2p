@@ -6,6 +6,7 @@ import androidx.lifecycle.MutableLiveData
 import com.zeengal.litep2p.MessageTraceStore
 import com.zeengal.litep2p.core.CommsMode
 import com.zeengal.litep2p.core.EngineResult
+import com.zeengal.litep2p.core.FileTransferPriority
 import com.zeengal.litep2p.core.LiteP2P
 import com.zeengal.litep2p.core.LogLevel
 import com.zeengal.litep2p.core.PeerInfo
@@ -65,6 +66,31 @@ object P2P {
     fun sendMessage(peerId: String, message: ByteArray): EngineResult {
         return LiteP2P.send(peerId, message)
     }
+
+    // ------------------------------------------------------------------
+    // File transfer (offer/accept model, see LiteP2P §file transfer)
+    // ------------------------------------------------------------------
+
+    /** Offers [filePath] to a connected peer. Returns the transfer id or null. */
+    @JvmStatic
+    fun sendFile(peerId: String, filePath: String, priority: FileTransferPriority = FileTransferPriority.NORMAL): String? {
+        return LiteP2P.sendFile(peerId, filePath, priority)
+    }
+
+    /** Receiver accepts an incoming offer; the engine writes the file to [savePath]. */
+    @JvmStatic
+    fun acceptTransfer(transferId: String, savePath: String): EngineResult =
+        LiteP2P.acceptFileTransfer(transferId, savePath)
+
+    /** Receiver declines an incoming offer. */
+    @JvmStatic
+    fun declineTransfer(transferId: String): EngineResult =
+        LiteP2P.declineFileTransfer(transferId)
+
+    /** Cancels an active transfer (sender or receiver side). */
+    @JvmStatic
+    fun cancelTransfer(transferId: String): EngineResult =
+        LiteP2P.cancelTransfer(transferId)
 
     /**
      * UI should call this instead of [sendMessage] so we can show outgoing messages

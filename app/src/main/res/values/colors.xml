@@ -72,4 +72,7 @@
     <color name="log_info">#FF9DA7B3</color>
     <color name="log_warn">#FFD29922</color>
     <color name="log_error">#FFF85149</color>
+
+    <!-- Voice call: hang-up button -->
+    <color name="call_end_red">#FFD32F2F</color>
 </resources>

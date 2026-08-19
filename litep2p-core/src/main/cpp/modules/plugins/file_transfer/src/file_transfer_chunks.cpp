@@ -592,36 +592,49 @@ std::vector<uint32_t> FileTransferManager::get_chunks_to_retransmit(
     const std::string& transfer_id) {
 
     std::vector<uint32_t> to_retransmit;
+    uint32_t inflight_before = 0;
 
-    std::lock_guard<std::mutex> chunks_lock(m_chunks_mutex);
+    {
+        std::lock_guard<std::mutex> chunks_lock(m_chunks_mutex);
 
-    auto it = m_inflight_chunks.find(transfer_id);
-    if (it != m_inflight_chunks.end()) {
-        auto now = std::chrono::steady_clock::now();
-        
-        auto& inflight = it->second;
-        std::vector<std::shared_ptr<TransferChunk>> remaining_inflight;
-        auto& pending = m_pending_chunks[transfer_id];
-        
-        for (auto& chunk : inflight) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               now - chunk->sent_time)
-                               .count();
+        auto it = m_inflight_chunks.find(transfer_id);
+        if (it != m_inflight_chunks.end()) {
+            inflight_before = static_cast<uint32_t>(it->second.size());
+            auto now = std::chrono::steady_clock::now();
 
-            // Timeout = 5 seconds + 100ms per retry
-            int timeout_ms = 5000 + (chunk->retry_count * 100);
+            auto& inflight = it->second;
+            std::vector<std::shared_ptr<TransferChunk>> remaining_inflight;
+            auto& pending = m_pending_chunks[transfer_id];
 
-            if (elapsed > timeout_ms) {
-                to_retransmit.push_back(chunk->chunk_id);
-                chunk->retry_count++;
-                // Move back to pending queue for re-sending
-                pending.push_front(chunk);
-            } else {
-                remaining_inflight.push_back(chunk);
+            for (auto& chunk : inflight) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   now - chunk->sent_time)
+                                   .count();
+
+                // Adaptive retransmit delay: starts short (fast recovery from transient
+                // loss) and grows slightly per attempt. A permanently-lost chunk is
+                // left to the stall watchdog to declare the transfer FAILED.
+                int timeout_ms = static_cast<int>(CHUNK_RETRANSMIT_BASE_MS) +
+                                 static_cast<int>(chunk->retry_count * CHUNK_RETRANSMIT_BACKOFF_MS);
+
+                if (elapsed > timeout_ms) {
+                    to_retransmit.push_back(chunk->chunk_id);
+                    chunk->retry_count++;
+                    // Move back to pending queue for re-sending
+                    pending.push_front(chunk);
+                } else {
+                    remaining_inflight.push_back(chunk);
+                }
             }
+
+            inflight = std::move(remaining_inflight);
         }
-        
-        inflight = std::move(remaining_inflight);
+    }
+
+    // Loss-responsive congestion signal (outside the chunks lock to keep lock
+    // ordering clean): retransmissions are direct evidence of loss on the path.
+    if (!to_retransmit.empty()) {
+        report_chunk_loss(static_cast<uint32_t>(to_retransmit.size()), inflight_before);
     }
 
     return to_retransmit;

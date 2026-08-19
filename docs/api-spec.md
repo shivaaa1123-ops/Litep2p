@@ -683,6 +683,80 @@ litep2p_result_t litep2p_cancel_transfer(const char* transfer_id);
 - The Kotlin wrapper exposes the full offer/accept model — see
   [§5.6 File transfer (Kotlin)](#56-file-transfer-kotlin).
 
+### 4.10a Voice calls (optional module)
+
+Realtime audio calls between peers, using the same **offer/accept** idiom as
+file transfer. The engine is **codec-agnostic**: audio frames are opaque bytes
+owned by the application (the Android wrapper uses `PCM_S16LE`, 16 kHz mono).
+Frames are fire-and-forget (no ACK/retransmit) — realtime audio prefers
+dropping a late frame to replaying it.
+
+```c
+typedef struct litep2p_voice_offer {
+    char call_id[64];
+    char peer_id[128];
+    char codec[32];              /* opaque codec name, e.g. "PCM_S16LE" */
+    uint16_t sample_rate;        /* Hz, e.g. 16000 */
+    uint8_t channels;            /* 1 = mono, 2 = stereo */
+    uint8_t frame_ms;            /* audio frames per packet, e.g. 20 */
+} litep2p_voice_offer_t;
+
+#define LITEP2P_VOICE_STATE_IDLE      0
+#define LITEP2P_VOICE_STATE_OUTGOING  1
+#define LITEP2P_VOICE_STATE_RINGING   2
+#define LITEP2P_VOICE_STATE_IN_CALL   3
+#define LITEP2P_VOICE_STATE_ENDED     4
+
+typedef struct litep2p_voice_callbacks {
+    uint32_t struct_size;        /* = sizeof(litep2p_voice_callbacks) */
+    void* user_data;
+    void (*on_voice_call_offered)(void* user_data, const litep2p_voice_offer_t* offer);
+    void (*on_voice_call_state)(void* user_data, const char* call_id,
+                                const char* peer_id, int state, const char* detail);
+    void (*on_voice_frame)(void* user_data, const char* call_id,
+                           const char* peer_id, const uint8_t* data, uint32_t len);
+} litep2p_voice_callbacks_t;
+
+litep2p_result_t litep2p_set_voice_call_callbacks(const litep2p_voice_callbacks_t* callbacks);
+
+litep2p_result_t litep2p_start_voice_call(const char* peer_id, const char* codec,
+                                          uint16_t sample_rate, uint8_t channels,
+                                          uint8_t frame_ms,
+                                          char* out_call_id, uint32_t buf_len);
+litep2p_result_t litep2p_accept_voice_call(const char* call_id);
+litep2p_result_t litep2p_decline_voice_call(const char* call_id);
+litep2p_result_t litep2p_end_voice_call(const char* call_id);
+litep2p_result_t litep2p_send_voice_frame(const char* call_id,
+                                          const uint8_t* data, uint32_t len);
+```
+
+- `litep2p_start_voice_call` returns `NOT_FOUND` when the peer is not connected
+  or an active call with that peer already exists; on success `out_call_id`
+  receives the call id.
+- The callee is notified via `on_voice_call_offered`; **nothing is captured or
+  played back** until `litep2p_accept_voice_call` (or `decline_voice_call`).
+- `on_voice_call_state` fires on both sides for OUTGOING / IN_CALL / ENDED
+  (`detail`: "connected", "declined by peer", "ended", "ring timeout", "no
+  media activity", ...).
+- `litep2p_send_voice_frame` is fire-and-forget and only succeeds while the
+  call is `IN_CALL`; keep frames small (≤ ~8 KB) so each rides one UDP datagram
+  without IP fragmentation (the default 20 ms PCM frame is 640 B).
+- Unanswered offers auto-decline after 60 s; a connected call with no frames or
+  control traffic for 5 minutes ends locally ("no media activity") so a peer
+  that vanishes cannot orphan the call.
+- Frames travel as `MessageType::VOICE_STREAM` (bypassing batching, Noise-
+  encrypted when enabled) — exactly like file-transfer frames.
+- **WAN behavior:** frames are small (≤ ~8 KB; 640 B at the default profile) so
+  they ride single UDP datagrams without IP fragmentation, and the
+  fire-and-forget design tolerates loss instead of retransmitting (which would
+  add latency). The Android wrapper plays inbound audio through a jitter
+  buffer (holds ~5 frames / 100 ms before playback starts, cap ~12 frames),
+  so the higher packet-arrival jitter of WAN paths does not cause stutter.
+  An adaptive pacer then adjusts the playout period from buffer-depth error
+  (fast playout when the buffer is deep, slow when shallow, clamped to ±10%)
+  so playback tracks the remote peer's audio clock instead of overrunning or
+  underrunning on clock drift.
+
 ### 4.11 Proxy / relay (optional module)
 
 ```c
@@ -1280,6 +1354,45 @@ LiteP2P.cancelTransfer(transferId)
 - `sendFile` is only accepted for an **established session**; send on a peer
   that is not connected returns null. Check `LiteP2P.supportsFileTransfer()`
   first when the module may be compiled out.
+
+### 5.6a Voice calls (Kotlin)
+
+Realtime audio calls between peers. The engine is codec-agnostic; the wrapper
+uses **PCM S16LE, 16 kHz mono, 20 ms frames** (`VoiceCallStore` constants).
+Frames are fire-and-forget — late/lost frames are dropped, never retransmitted.
+
+```kotlin
+// Caller: offer a call to a connected peer. Returns the call id or null.
+val callId: String? = LiteP2P.startVoiceCall(peerId = "bob")   // PCM_S16LE 16k mono 20ms
+
+// Callee: accept/decline the incoming offer (onVoiceCallOffered).
+LiteP2P.acceptVoiceCall(offer.callId)
+LiteP2P.declineVoiceCall(offer.callId)
+
+// Either side hangs up, or streams one audio frame while IN_CALL.
+LiteP2P.endVoiceCall(callId)
+LiteP2P.sendVoiceFrame(callId, pcmFrame)   // 640 B per 20 ms @ 16 kHz mono
+```
+
+- The callee is notified via `LiteP2PListener.onVoiceCallOffered`; **nothing is
+  captured or played back** until `acceptVoiceCall`.
+- State changes arrive via `onVoiceCallStateChanged(callId, peerId, state,
+  detail)` — `state` is one of [VoiceCallState] (OUTGOING / RINGING / IN_CALL /
+  ENDED). Incoming audio frames arrive via `onVoiceFrameReceived`.
+- `LiteP2P.supportsVoiceCall()` reports whether the module is compiled in.
+- The Android app wires this to `AudioRecord`/`AudioTrack` (PCM), shows an
+  incoming-call dialog, an active-call overlay (duration, mute, end), and a
+  Call button on each ready peer (RECORD_AUDIO permission requested on first
+  use). Unanswered offers auto-decline after 60 s; calls with no media for 5
+  minutes auto-end so orphaned calls cannot pile up.
+- **WAN:** inbound frames feed a jitter buffer (`VoiceJitterBuffer`) with a
+  paced playout thread — ~5 frames (100 ms) are absorbed before playback
+  starts, and the oldest frames are dropped on overflow — so higher-latency
+  WAN links play smooth audio instead of stuttering on arrival jitter. A
+  `PlayoutPacer` then adapts the frame period from the buffer-depth error
+  (clamped to ±10%), so the playout locks onto the remote peer's audio clock
+  and the buffer stays near its target depth instead of drifting to over- or
+  underflow.
 
 ### 5.7 Feature detection (Kotlin)
 

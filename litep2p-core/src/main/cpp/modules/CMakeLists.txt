@@ -73,6 +73,7 @@ add_subdirectory(plugins/session)
 add_subdirectory(plugins/routing)
 add_subdirectory(plugins/optimization)
 add_subdirectory(plugins/file_transfer)
+add_subdirectory(plugins/voice_call)
 
 if(ENABLE_PROXY_MODULE)
     add_subdirectory(plugins/proxy)

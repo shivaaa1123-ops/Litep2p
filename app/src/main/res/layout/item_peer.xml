@@ -74,6 +74,48 @@
             app:iconTint="@color/text_secondary"
             android:textColor="@color/text_secondary" />
 
+        <!-- File-transfer action: only meaningful for ready peers (shown/hidden by
+             the adapter). Launches the system photo picker. -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/peerFileButton"
+            style="@style/Widget.LiteP2P.Button.Outlined"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:paddingHorizontal="14dp"
+            android:paddingVertical="6dp"
+            android:text="File"
+            android:visibility="gone"
+            app:icon="@drawable/ic_file"
+            app:iconPadding="6dp"
+            app:iconTint="@color/text_secondary"
+            android:textColor="@color/text_secondary" />
+
+        <!-- Voice-call action (LiteCall): only for ready peers. Starts a realtime
+             audio call; requires RECORD_AUDIO permission. -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/peerCallButton"
+            style="@style/Widget.LiteP2P.Button.Outlined"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="6dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:paddingHorizontal="14dp"
+            android:paddingVertical="6dp"
+            android:text="Call"
+            android:visibility="gone"
+            app:icon="@drawable/ic_phone"
+            app:iconPadding="6dp"
+            app:iconTint="@color/text_secondary"
+            android:textColor="@color/text_secondary" />
+
     </LinearLayout>
 
 </com.google.android.material.card.MaterialCardView>

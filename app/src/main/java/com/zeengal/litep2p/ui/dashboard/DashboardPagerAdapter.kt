@@ -6,14 +6,15 @@ import com.zeengal.litep2p.ui.logs.LogsFragment
 
 class DashboardPagerAdapter(fragment: Fragment) : FragmentStateAdapter(fragment) {
 
-    override fun getItemCount(): Int = 4
+    override fun getItemCount(): Int = 5
 
     override fun createFragment(position: Int): Fragment {
         return when (position) {
             0 -> LogsFragment()
             1 -> MessagesFragment()
-            2 -> TelemetryFragment()
-            3 -> ResourcesFragment()
+            2 -> TransfersFragment()
+            3 -> TelemetryFragment()
+            4 -> ResourcesFragment()
             else -> LogsFragment()
         }
     }

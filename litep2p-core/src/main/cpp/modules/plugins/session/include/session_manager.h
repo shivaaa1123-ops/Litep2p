@@ -172,6 +172,39 @@ public:
                                      FileTransferProgressCallback on_progress,
                                      FileTransferCompleteCallback on_complete);
 
+    // ==================== Voice calls (realtime audio) ====================
+    // Offer a call to a connected peer. `codec` is opaque to the engine
+    // (e.g. "PCM_S16LE"); sample_rate/channels/frame_ms describe the profile
+    // and are advertised to the callee. Returns the call id ("" on failure).
+    std::string start_voice_call(const std::string& peer_id, const std::string& codec,
+                                 uint16_t sample_rate, uint8_t channels, uint8_t frame_ms);
+
+    // Callee accepts/declines an incoming offer (delivered via the offer callback).
+    bool accept_voice_call(const std::string& call_id);
+    bool decline_voice_call(const std::string& call_id);
+
+    // Either side hangs up.
+    bool end_voice_call(const std::string& call_id);
+
+    // Send one audio frame (fire-and-forget; only valid while IN_CALL).
+    bool send_voice_frame(const std::string& call_id, const uint8_t* data, size_t len);
+
+    // Voice call event callbacks (offered/state/frame). May be (re-)registered
+    // at any time; invoked on engine threads. `state` is a VoiceCallState value.
+    using VoiceCallOfferedCallback =
+        std::function<void(const std::string& call_id, const std::string& peer_id,
+                           const std::string& codec, uint16_t sample_rate,
+                           uint8_t channels, uint8_t frame_ms)>;
+    using VoiceCallStateCallback =
+        std::function<void(const std::string& call_id, const std::string& peer_id,
+                           int state, const std::string& detail)>;
+    using VoiceFrameCallback =
+        std::function<void(const std::string& call_id, const std::string& peer_id,
+                           const uint8_t* data, size_t len)>;
+    void set_voice_call_callbacks(VoiceCallOfferedCallback on_offered,
+                                  VoiceCallStateCallback on_state,
+                                  VoiceFrameCallback on_frame);
+
     void set_battery_level(int batteryPercent, bool isCharging);
     void set_network_info(bool isWiFi, bool isNetworkAvailable);
     // Override reconnect policy behavior. Accepted values: "auto", "aggressive", "balanced", "power_saver".

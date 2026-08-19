@@ -228,6 +228,36 @@ internal object LiteP2PNative {
     external fun cancelTransfer(transferId: String): Int
 
     /* ------------------------------------------------------------------ */
+    /* Voice calls (realtime audio)                                        */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Offers a call to a connected peer. On success returns the call id;
+     * returns "" on failure (peer not connected / busy). Offer/state events
+     * are reported through NativeEvents.onVoiceCallOffered /
+     * onVoiceCallStateChanged.
+     */
+    external fun startVoiceCall(
+        peerId: String,
+        codec: String,
+        sampleRate: Int,
+        channels: Int,
+        frameMs: Int
+    ): String
+
+    /** Accepts an incoming call offer. */
+    external fun acceptVoiceCall(callId: String): Int
+
+    /** Declines an incoming call offer. */
+    external fun declineVoiceCall(callId: String): Int
+
+    /** Ends an active call (either side). */
+    external fun endVoiceCall(callId: String): Int
+
+    /** Sends one audio frame (fire-and-forget; only valid while IN_CALL). */
+    external fun sendVoiceFrame(callId: String, data: ByteArray): Int
+
+    /* ------------------------------------------------------------------ */
     /* Feature detection                                                   */
     /* ------------------------------------------------------------------ */
 

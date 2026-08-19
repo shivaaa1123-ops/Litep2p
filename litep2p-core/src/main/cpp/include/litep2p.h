@@ -62,6 +62,7 @@ const char* litep2p_version_string(void);
 #define LITEP2P_FEATURE_ENCRYPTION    (1u << 3)
 #define LITEP2P_FEATURE_DISCOVERY     (1u << 4)
 #define LITEP2P_FEATURE_TELEMETRY     (1u << 5)
+#define LITEP2P_FEATURE_VOICE_CALL    (1u << 6)
 
 /* Bitmask of LITEP2P_FEATURE_* for this build. */
 uint32_t litep2p_get_feature_flags(void);
@@ -343,6 +344,57 @@ litep2p_result_t litep2p_decline_file_transfer(const char* transfer_id);
 litep2p_result_t litep2p_pause_transfer(const char* transfer_id);
 litep2p_result_t litep2p_resume_transfer(const char* transfer_id);
 litep2p_result_t litep2p_cancel_transfer(const char* transfer_id);
+
+/* ------------------------------------------------------------------------ */
+/* Voice calls (§3.10a) — realtime audio between peers (optional module)      */
+/* ------------------------------------------------------------------------ */
+/* Call control mirrors the file-transfer offer/accept idiom. Audio frames   */
+/* are fire-and-forget (no ACK/retransmit): the app supplies and consumes    */
+/* raw codec bytes (e.g. PCM S16LE). The engine is codec-agnostic.            */
+
+typedef struct litep2p_voice_offer {
+    char call_id[64];
+    char peer_id[128];
+    char codec[32];              /* opaque codec name, e.g. "PCM_S16LE" */
+    uint16_t sample_rate;        /* Hz, e.g. 16000 */
+    uint8_t channels;            /* 1 = mono, 2 = stereo */
+    uint8_t frame_ms;            /* audio frames per packet, e.g. 20 */
+} litep2p_voice_offer_t;
+
+/* Call states delivered via on_voice_call_state (values match VoiceCallState). */
+#define LITEP2P_VOICE_STATE_IDLE      0
+#define LITEP2P_VOICE_STATE_OUTGOING  1
+#define LITEP2P_VOICE_STATE_RINGING   2
+#define LITEP2P_VOICE_STATE_IN_CALL   3
+#define LITEP2P_VOICE_STATE_ENDED     4
+
+typedef struct litep2p_voice_callbacks {
+    uint32_t struct_size;        /* = sizeof(litep2p_voice_callbacks) */
+    void* user_data;
+    /* Callee side: an incoming call offer; accept/decline it. */
+    void (*on_voice_call_offered)(void* user_data, const litep2p_voice_offer_t* offer);
+    /* Call state change on either side (state is LITEP2P_VOICE_STATE_*). */
+    void (*on_voice_call_state)(void* user_data, const char* call_id,
+                                const char* peer_id, int state, const char* detail);
+    /* Incoming audio frame. data is valid only for the duration of the call. */
+    void (*on_voice_frame)(void* user_data, const char* call_id,
+                           const char* peer_id, const uint8_t* data, uint32_t len);
+} litep2p_voice_callbacks_t;
+
+litep2p_result_t litep2p_set_voice_call_callbacks(const litep2p_voice_callbacks_t* callbacks);
+
+/* Offer a call to a connected peer. Returns the call id in out_call_id
+ * (buf_len >= 64) on success. */
+litep2p_result_t litep2p_start_voice_call(const char* peer_id, const char* codec,
+                                          uint16_t sample_rate, uint8_t channels,
+                                          uint8_t frame_ms,
+                                          char* out_call_id, uint32_t buf_len);
+litep2p_result_t litep2p_accept_voice_call(const char* call_id);
+litep2p_result_t litep2p_decline_voice_call(const char* call_id);
+litep2p_result_t litep2p_end_voice_call(const char* call_id);
+/* Fire-and-forget audio frame; only valid while the call is IN_CALL. */
+litep2p_result_t litep2p_send_voice_frame(const char* call_id,
+                                          const uint8_t* data, uint32_t len);
 
 /* ------------------------------------------------------------------------ */
 /* Proxy / relay (§3.11) — optional module                                   */

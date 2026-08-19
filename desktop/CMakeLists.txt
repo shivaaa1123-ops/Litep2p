@@ -104,6 +104,7 @@ add_compile_definitions(
     HAVE_JNI=0
     HAVE_NOISE_PROTOCOL=1
     HAVE_FILE_TRANSFER=1
+    HAVE_VOICE_CALL=1
 )
 
 if(SINGLE_THREAD_MODE)
@@ -249,6 +250,11 @@ set(FILE_TRANSFER_SOURCES
     ../litep2p-core/src/main/cpp/modules/plugins/file_transfer/src/file_transfer_checkpoint.cpp
 )
 
+# Voice calls
+set(VOICE_CALL_SOURCES
+    ../litep2p-core/src/main/cpp/modules/plugins/voice_call/src/voice_call_manager.cpp
+)
+
 # Core P2P
 set(CORE_P2P_SOURCES
     ../litep2p-core/src/main/cpp/modules/corep2p/core/src/config_manager.cpp
@@ -273,6 +279,7 @@ set(ENGINE_SOURCES
     ${OPTIMIZATION_SOURCES}
     ${ROUTING_SOURCES}
     ${FILE_TRANSFER_SOURCES}
+    ${VOICE_CALL_SOURCES}
     ${PROXY_SOURCES}
     ${OVERLAY_SOURCES}
     ${CORE_P2P_SOURCES}
@@ -305,6 +312,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/plugins/optimization/include
     ../litep2p-core/src/main/cpp/modules/plugins/routing/include
     ../litep2p-core/src/main/cpp/modules/plugins/file_transfer/include
+    ../litep2p-core/src/main/cpp/modules/plugins/voice_call/include
     ../litep2p-core/src/main/cpp/modules/plugins/proxy/include
     ../litep2p-core/src/main/cpp/modules/plugins/overlay/include
 )
@@ -427,6 +435,10 @@ target_link_libraries(nat_traversal_test PRIVATE litep2p_engine)
 add_executable(file_transfer_test tests/file_transfer_test.cpp)
 target_include_directories(file_transfer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(file_transfer_test PRIVATE litep2p_engine)
+
+add_executable(voice_call_test tests/voice_call_test.cpp)
+target_include_directories(voice_call_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(voice_call_test PRIVATE litep2p_engine)
 
 add_executable(crypto_test tests/crypto_test.cpp)
 target_include_directories(crypto_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

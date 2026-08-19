@@ -66,35 +66,66 @@ void FileTransferManager::set_rate_limit(uint32_t rate_kbps) {
 }
 
 void FileTransferManager::adjust_rate_limit(CongestionLevel level) {
+    // AIMD-style response: additive increase is handled by the congestion
+    // monitor when the path stays quiet; decreases here are *multiplicative* so
+    // the rate reacts meaningfully to loss instead of moving by a few Kbps.
     uint32_t new_limit = m_current_rate_limit_kbps.load();
 
     switch (level) {
         case CongestionLevel::LOW:
-            new_limit = std::min(new_limit + 100, MAX_RATE_LIMIT_KBPS);
+            // Gentle probe-up when a report explicitly says the path is clear.
+            new_limit = std::min(new_limit + 256, MAX_RATE_LIMIT_KBPS);
             LOG_DEBUG("FT: Congestion LOW - increasing rate limit to " +
                       std::to_string(new_limit) + " Kbps");
             break;
 
         case CongestionLevel::MODERATE:
-            new_limit = std::max(new_limit - 50, MIN_RATE_LIMIT_KBPS);
+            new_limit = std::max(static_cast<uint32_t>(new_limit * 0.80), MIN_RATE_LIMIT_KBPS);
             LOG_DEBUG("FT: Congestion MODERATE - reducing rate limit to " +
                       std::to_string(new_limit) + " Kbps");
             break;
 
         case CongestionLevel::HIGH:
-            new_limit = std::max(new_limit - 200, MIN_RATE_LIMIT_KBPS);
+            new_limit = std::max(static_cast<uint32_t>(new_limit * 0.50), MIN_RATE_LIMIT_KBPS);
             LOG_DEBUG("FT: Congestion HIGH - significantly reducing rate limit to " +
                       std::to_string(new_limit) + " Kbps");
             break;
 
         case CongestionLevel::SEVERE:
-            new_limit = MIN_RATE_LIMIT_KBPS;
-            LOG_WARN("FT: Congestion SEVERE - limiting rate to minimum " +
+            new_limit = std::max(static_cast<uint32_t>(new_limit * 0.25), MIN_RATE_LIMIT_KBPS);
+            LOG_WARN("FT: Congestion SEVERE - limiting rate to " +
                      std::to_string(new_limit) + " Kbps");
             break;
     }
 
     m_current_rate_limit_kbps.store(new_limit);
+}
+
+void FileTransferManager::report_chunk_loss(uint32_t lost_chunks, uint32_t window) {
+    // Loss-responsive adaptation: chunk retransmissions are the authoritative
+    // signal that data (or its ACK) was lost on the path. Convert a retransmit
+    // batch into a packet-loss sample and feed it through report_congestion(),
+    // which drives the AIMD rate limit. The denominator is floored at the full
+    // window so a small in-flight set early in a transfer does not over-report.
+    if (lost_chunks == 0) return;
+
+    const uint32_t effective_window = std::max(window, MAX_CHUNKS_IN_FLIGHT);
+    float loss_pct = 100.0f * static_cast<float>(lost_chunks) /
+                     static_cast<float>(effective_window);
+    if (loss_pct > 100.0f) loss_pct = 100.0f;
+
+    CongestionMetrics metrics;
+    metrics.level = CongestionLevel::HIGH;  // recomputed from history below
+    metrics.packet_loss_percent = loss_pct;
+    metrics.rtt_ms = 0.0f;
+    metrics.bandwidth_utilization_percent = 0.0f;
+    metrics.queue_depth = 0;
+    metrics.timestamp = std::chrono::steady_clock::now();
+
+    // No specific registered path on the session/Android path; an empty id is
+    // fine — report_congestion still updates the global rate via
+    // estimate_congestion().
+    report_congestion(std::string(), metrics);
 }
 
 CongestionLevel FileTransferManager::estimate_congestion() {
@@ -154,9 +185,11 @@ void FileTransferManager::congestion_monitor_loop() {
         if (elapsed_ms > 1000) {
             uint32_t current_limit = m_current_rate_limit_kbps.load();
             if (current_limit < MAX_RATE_LIMIT_KBPS) {
-                // Additive Increase: +50 Kbps per second
-                m_current_rate_limit_kbps.store(current_limit + 50);
-                // LOG_DEBUG("FT: AIMD Increase rate limit to " + std::to_string(current_limit + 50));
+                // Additive Increase: +256 Kbps per second (fast enough to recover
+                // to the multi-Mbps default after a multiplicative decrease).
+                uint32_t next = std::min(current_limit + 256, MAX_RATE_LIMIT_KBPS);
+                m_current_rate_limit_kbps.store(next);
+                // LOG_DEBUG("FT: AIMD Increase rate limit to " + std::to_string(next));
             }
             
             // Reset congestion level if it was high

@@ -32,7 +32,15 @@ import android.widget.ArrayAdapter
 import com.zeengal.litep2p.ui.home.HomeFragment
 import com.zeengal.litep2p.ui.dashboard.DashboardFragment
 import com.zeengal.litep2p.hook.P2P
+import com.zeengal.litep2p.core.EngineResult
 import com.zeengal.litep2p.core.LiteP2P
+import com.zeengal.litep2p.core.VoiceCallOffer
+import com.zeengal.litep2p.core.VoiceCallState
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import java.io.File
 import java.io.IOException
 import org.json.JSONArray
@@ -96,6 +104,37 @@ class MainActivity : AppCompatActivity() {
 
     private var autoStartConsumed = false
 
+    // ---- file transfer ----
+    // Peer id the next picked image should be sent to (set right before the picker opens).
+    private var pendingFilePeerId: String? = null
+    // System photo picker (PickVisualMedia falls back to GET_CONTENT on older devices).
+    private val imagePicker =
+        registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+            handlePickedImage(uri)
+        }
+
+    // ---- voice calls ----
+    // Peer id of the call requested while RECORD_AUDIO permission was pending.
+    private var pendingVoiceCallPeer: String? = null
+    private var activeCallDialog: androidx.appcompat.app.AlertDialog? = null
+    private var activeCallTimer: Runnable? = null
+    private var activeCallStatus: TextView? = null
+    // Runtime mic permission; the call is initiated on grant.
+    private val recordAudioPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val peerId = pendingVoiceCallPeer
+            pendingVoiceCallPeer = null
+            if (granted && peerId != null) {
+                initiateVoiceCall(peerId)
+            } else if (peerId != null) {
+                Toast.makeText(
+                    this,
+                    "Microphone permission is required for voice calls",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var lastPushedNetworkAvailable: Boolean? = null
@@ -138,6 +177,15 @@ class MainActivity : AppCompatActivity() {
         
         // Store instance for JNI callbacks
         instance = this
+
+        // File-transfer signal wiring: TransferStore broadcasts incoming offers
+        // and completion toasts; the activity surfaces them when foregrounded.
+        TransferStore.attach(applicationContext)
+        observeTransferSignals()
+
+        // Voice-call signal wiring: incoming-call dialogs, active-call overlay,
+        // and completion toasts.
+        observeVoiceCallSignals()
 
         supportFragmentManager.beginTransaction()
             .replace(R.id.home_fragment_container, HomeFragment())
@@ -274,6 +322,10 @@ class MainActivity : AppCompatActivity() {
             } else {
                 runningSinceMs = null
                 uptimeText.text = "--:--:--"
+                // Engine is no longer running: tear down any voice call gracefully
+                // (the native VoiceCallManager was destroyed with the session).
+                dismissActiveCallDialog()
+                VoiceCallEngine.stop()
             }
 
             updateButtonStates()
@@ -410,6 +462,10 @@ class MainActivity : AppCompatActivity() {
     private fun applyLaunchOptions(intent: Intent?) {
         if (intent == null) return
 
+        // Diagnostic: surface the full incoming launch intent so adb-driven
+        // automation (and this harness) can see exactly what extras arrive.
+        android.util.Log.d("MainActivity", "launch intent extras: ${intent.extras?.toString()}")
+
         try {
             val peerId = intent.getStringExtra(EXTRA_PEER_ID)
             if (!peerId.isNullOrBlank()) {
@@ -482,6 +538,70 @@ class MainActivity : AppCompatActivity() {
                     }
                 }, 100)
                 intent.removeExtra(EXTRA_CONNECT_TO_PEER)
+            }
+
+            // Auto-accept the next incoming file offer (harness/automation only).
+            if (intent.getBooleanExtra(EXTRA_AUTO_ACCEPT, false)) {
+                TransferStore.autoAcceptNext = true
+                android.util.Log.i("MainActivity", "EXTRA_AUTO_ACCEPT=true; next offer auto-accepted")
+            }
+
+            // Auto-accept the next incoming voice call (harness/automation only).
+            if (intent.getBooleanExtra(EXTRA_VC_AUTO_ACCEPT, false)) {
+                VoiceCallStore.autoAcceptNext = true
+                android.util.Log.i("MainActivity", "EXTRA_VC_AUTO_ACCEPT=true; next call auto-accepted")
+            }
+
+            // Voice call via adb for automated testing:
+            //   adb shell am start -n com.zeengal.litep2p/.MainActivity \
+            //     --es LITEP2P_VC_PEER "<peer_id>"
+            val vcPeer = intent.getStringExtra(EXTRA_VC_PEER)
+            if (!vcPeer.isNullOrBlank()) {
+                android.util.Log.i("MainActivity", "EXTRA_VC: calling peer '$vcPeer'")
+                handler.postDelayed({
+                    try {
+                        startVoiceCallToPeer(vcPeer)
+                    } catch (e: Exception) {
+                        android.util.Log.e("MainActivity", "Failed to call peer $vcPeer: ${e.message}", e)
+                    }
+                }, 100)
+                intent.removeExtra(EXTRA_VC_PEER)
+            }
+
+            // End the active voice call via adb (automated testing).
+            if (intent.getBooleanExtra(EXTRA_VC_END, false)) {
+                android.util.Log.i("MainActivity", "EXTRA_VC_END=true; ending active call")
+                handler.postDelayed({
+                    VoiceCallStore.endActiveCall()
+                }, 100)
+                intent.removeExtra(EXTRA_VC_END)
+            }
+
+            // File transfer via adb for automated testing (must be a readable abs path):
+            //   adb shell am start -n com.zeengal.litep2p/.MainActivity \
+            //     --es LITEP2P_FT_PEER "<peer_id>" --es LITEP2P_FT_FILE "<abs path>"
+            // (Keys deliberately do NOT reuse the message-sending extra names so
+            // the two automations cannot clear each other's extras.)
+            val ftPeer = intent.getStringExtra(EXTRA_FT_PEER)
+            val ftFile = intent.getStringExtra(EXTRA_FT_FILE)
+            android.util.Log.d("MainActivity", "FT check: to='$ftPeer' path='$ftFile'")
+            if (!ftPeer.isNullOrBlank() && !ftFile.isNullOrBlank()) {
+                android.util.Log.i("MainActivity", "EXTRA_FT: offering '$ftFile' to peer '$ftPeer'")
+                handler.postDelayed({
+                    try {
+                        val id = P2P.sendFile(ftPeer, ftFile)
+                        if (id != null) {
+                            TransferStore.trackOutgoing(id, ftPeer, ftFile)
+                            Toast.makeText(this, "Offering file…", Toast.LENGTH_SHORT).show()
+                        } else {
+                            android.util.Log.e("MainActivity", "FT sendFile returned null for '$ftFile' -> '$ftPeer'")
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.e("MainActivity", "Failed to send file to peer $ftPeer: ${e.message}", e)
+                    }
+                }, 100)
+                intent.removeExtra(EXTRA_FT_PEER)
+                intent.removeExtra(EXTRA_FT_FILE)
             }
         } catch (t: Throwable) {
             android.util.Log.w("MainActivity", "Failed to apply launch options: ${t.message}")
@@ -670,6 +790,282 @@ class MainActivity : AppCompatActivity() {
             android.util.Log.w("MainActivity", "Failed to patch telemetry defaults: ${t.message}")
         }
     }
+
+    // ------------------------------------------------------------------
+    // File transfer (Android UI for the engine's file-transfer module)
+    // ------------------------------------------------------------------
+
+    /** Public entry point used by the peers list to send a photo to [peerId]. */
+    fun openFilePickerForPeer(peerId: String) {
+        pendingFilePeerId = peerId
+        try {
+            imagePicker.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+            )
+        } catch (t: Throwable) {
+            android.util.Log.e("MainActivity", "Photo picker launch failed: ${t.message}")
+            pendingFilePeerId = null
+            Toast.makeText(this, "Photo picker unavailable: ${t.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** Picker result: stage a readable copy in private storage, then offer it to the peer. */
+    private fun handlePickedImage(uri: Uri?) {
+        val peerId = pendingFilePeerId ?: return
+        pendingFilePeerId = null
+        if (uri == null) return // user cancelled the picker
+
+        val srcName = queryDisplayName(uri) ?: "photo_${System.currentTimeMillis()}.jpg"
+        val base = srcName.substringBeforeLast('.', srcName).take(40)
+        val ext = srcName.substringAfterLast('.', "jpg").take(8)
+        val outDir = File(filesDir, "p2p_outgoing").apply { mkdirs() }
+        val target = File(outDir, "${base}_${System.currentTimeMillis()}.$ext")
+
+        Thread {
+            try {
+                contentResolver.openInputStream(uri)?.use { input ->
+                    target.outputStream().use { output -> input.copyTo(output) }
+                }
+                runOnUiThread { sendStagedFile(peerId, target) }
+            } catch (t: Throwable) {
+                android.util.Log.e("MainActivity", "Failed to stage picked image: ${t.message}", t)
+                runOnUiThread {
+                    Toast.makeText(this, "Failed to stage image: ${t.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun queryDisplayName(uri: Uri): String? = runCatching {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) c.getString(0) else null
+        }
+    }.getOrNull()
+
+    private fun sendStagedFile(peerId: String, file: File) {
+        val id = P2P.sendFile(peerId, file.absolutePath)
+        if (id != null) {
+            TransferStore.trackOutgoing(id, peerId, file.absolutePath)
+            Toast.makeText(
+                this,
+                "Offering ${file.name} (${formatBytes(file.length())})…",
+                Toast.LENGTH_SHORT
+            ).show()
+        } else {
+            Toast.makeText(
+                this,
+                "sendFile refused — peer not connected or engine unavailable",
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    /** Listens for incoming offers (dialog) and completion highlights (toast). */
+    private fun observeTransferSignals() {
+        TransferStore.offerSignal.observe(this) { offer ->
+            if (offer != null) {
+                showIncomingOfferDialog(offer)
+                TransferStore.consumeOfferSignal()
+            }
+        }
+        TransferStore.toastSignal.observe(this) { msg ->
+            if (msg != null) {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                TransferStore.consumeToastSignal()
+            }
+        }
+    }
+
+    /** Prompts accept/decline for an inbound file offer. */
+    private fun showIncomingOfferDialog(offer: TransferStore.TransferEvent) {
+        if (isFinishing || isDestroyed) return
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Incoming file: ${offer.fileName}")
+            .setMessage(
+                "${formatBytes(offer.sizeBytes)} from ${offer.peerId}\n" +
+                    "Accept to save it to the app's private storage (Files tab)."
+            )
+            .setPositiveButton("Accept") { _, _ ->
+                val rc = TransferStore.acceptOffer(offer)
+                if (rc == EngineResult.OK) {
+                    Toast.makeText(this, "Accepting ${offer.fileName}…", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "Accept failed: $rc", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("Decline") { _, _ ->
+                TransferStore.declineOffer(offer)
+                Toast.makeText(this, "Declined ${offer.fileName}", Toast.LENGTH_SHORT).show()
+            }
+            .setNeutralButton("Later", null)
+            .show()
+    }
+
+    private fun formatBytes(n: Long): String = when {
+        n >= 1024L * 1024L -> String.format(java.util.Locale.US, "%.1f MB", n / (1024.0 * 1024.0))
+        n >= 1024L -> String.format(java.util.Locale.US, "%.1f KB", n / 1024.0)
+        else -> "$n B"
+    }
+
+    // ------------------------------------------------------------------
+    // Voice calls (LiteCall — realtime audio between peers)
+    // ------------------------------------------------------------------
+
+    /** Public entry point used by the peers list to call [peerId]. */
+    fun startVoiceCallToPeer(peerId: String) {
+        if (!LiteP2P.supportsVoiceCall()) {
+            Toast.makeText(
+                this,
+                "Voice calls are not compiled into this engine build",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        if (VoiceCallStore.activeCall.value != null) {
+            Toast.makeText(this, "A call is already active", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingVoiceCallPeer = peerId
+            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        initiateVoiceCall(peerId)
+    }
+
+    private fun initiateVoiceCall(peerId: String) {
+        val callId = VoiceCallStore.startCall(peerId)
+        if (callId == null) {
+            Toast.makeText(
+                this,
+                "Call refused — peer not connected or engine unavailable",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+        Toast.makeText(this, "Calling ${shortPeer(peerId)}…", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Listens for incoming calls (dialog) and active-call lifecycle (overlay). */
+    private fun observeVoiceCallSignals() {
+        VoiceCallStore.incomingSignal.observe(this) { offer ->
+            if (offer != null) {
+                showIncomingCallDialog(offer)
+                VoiceCallStore.consumeIncomingSignal()
+            }
+        }
+        VoiceCallStore.activeCall.observe(this) { call ->
+            if (call != null) {
+                showActiveCallDialog(call)
+            } else {
+                dismissActiveCallDialog()
+            }
+        }
+        VoiceCallStore.toastSignal.observe(this) { msg ->
+            if (msg != null) {
+                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+                VoiceCallStore.consumeToastSignal()
+            }
+        }
+    }
+    /** Incoming-call dialog (callee side): Accept / Decline. */
+    private fun showIncomingCallDialog(offer: VoiceCallOffer) {
+        if (isFinishing || isDestroyed) return
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Incoming call")
+            .setMessage(
+                "${shortPeer(offer.peerId)}\n" +
+                    "${offer.codec} · ${offer.sampleRate} Hz · ${offer.frameMs} ms frames"
+            )
+            .setPositiveButton("Accept") { _, _ ->
+                val rc = VoiceCallStore.acceptOffer(offer)
+                if (rc != EngineResult.OK) {
+                    Toast.makeText(this, "Accept failed: $rc", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNegativeButton("Decline") { _, _ ->
+                VoiceCallStore.declineOffer(offer)
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    /** Active-call overlay: status, duration, mute, end. */
+    private fun showActiveCallDialog(call: VoiceCallStore.ActiveCall) {
+        if (isFinishing || isDestroyed) return
+        val existing = activeCallDialog
+        if (existing != null) {
+            activeCallStatus?.text = voiceStateLabel(call)
+            return
+        }
+
+        val view = layoutInflater.inflate(R.layout.dialog_active_call, null)
+        val status = view.findViewById<TextView>(R.id.callStatusText)
+        val duration = view.findViewById<TextView>(R.id.callDurationText)
+        val muteButton =
+            view.findViewById<com.google.android.material.button.MaterialButton>(R.id.callMuteButton)
+        val endButton =
+            view.findViewById<com.google.android.material.button.MaterialButton>(R.id.callEndButton)
+        activeCallStatus = status
+        status.text = voiceStateLabel(call)
+
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle("Call with ${shortPeer(call.peerId)}")
+            .setView(view)
+            .setCancelable(false)
+            .show()
+        activeCallDialog = dialog
+
+        muteButton.setOnClickListener {
+            val newMute = !VoiceCallEngine.muted
+            VoiceCallStore.setMuted(newMute)
+            muteButton.text = if (newMute) "Unmute" else "Mute"
+        }
+        endButton.setOnClickListener {
+            VoiceCallStore.endActiveCall()
+            dismissActiveCallDialog()
+        }
+
+        // Call-duration ticker.
+        val started = call.startedAtMs
+        val ticker = object : Runnable {
+            override fun run() {
+                val a = VoiceCallStore.activeCall.value
+                if (a == null) {
+                    dismissActiveCallDialog()
+                    return
+                }
+                val secs = (System.currentTimeMillis() - started) / 1000
+                duration.text = String.format(
+                    java.util.Locale.US, "%02d:%02d", secs / 60, secs % 60
+                )
+                handler.postDelayed(this, 1000)
+            }
+        }
+        activeCallTimer = ticker
+        handler.postDelayed(ticker, 1000)
+    }
+
+    private fun dismissActiveCallDialog() {
+        activeCallTimer?.let { handler.removeCallbacks(it) }
+        activeCallTimer = null
+        activeCallDialog?.dismiss()
+        activeCallDialog = null
+        activeCallStatus = null
+    }
+
+    private fun voiceStateLabel(call: VoiceCallStore.ActiveCall): String = when (call.state) {
+        VoiceCallState.OUTGOING -> "Ringing…"
+        VoiceCallState.RINGING -> "Incoming…"
+        VoiceCallState.IN_CALL -> "Connected"
+        else -> call.detail ?: ""
+    }
+
+    private fun shortPeer(id: String): String =
+        if (id.length > 12) id.take(12) + "…" else id
+
 
     override fun onDestroy() {
         super.onDestroy()
@@ -1039,6 +1435,21 @@ class MainActivity : AppCompatActivity() {
         // Explicit connect-to-peer via adb for automated testing:
         //   adb shell am start -n com.zeengal.litep2p/.MainActivity --es LITEP2P_CONNECT_TO_PEER "<peer_id>"
         private const val EXTRA_CONNECT_TO_PEER = "LITEP2P_CONNECT_TO_PEER"
+        // File transfer via adb for automated testing (must be a readable abs path):
+        //   adb shell am start -n com.zeengal.litep2p/.MainActivity \
+        //     --es LITEP2P_FT_PEER "<peer_id>" --es LITEP2P_FT_FILE "<abs path>"
+        private const val EXTRA_FT_PEER = "LITEP2P_FT_PEER"
+        private const val EXTRA_FT_FILE = "LITEP2P_FT_FILE"
+        // Auto-accept the next incoming file offer (harness automation only).
+        private const val EXTRA_AUTO_ACCEPT = "LITEP2P_AUTO_ACCEPT"
+        // Voice call via adb for automated testing:
+        //   adb shell am start -n com.zeengal.litep2p/.MainActivity --es LITEP2P_VC_PEER "<peer_id>"
+        private const val EXTRA_VC_PEER = "LITEP2P_VC_PEER"
+        // Auto-accept the next incoming voice call (harness automation only).
+        private const val EXTRA_VC_AUTO_ACCEPT = "LITEP2P_VC_AUTO_ACCEPT"
+        // End the active voice call via adb:
+        //   adb shell am start -n com.zeengal.litep2p/.MainActivity --ez LITEP2P_VC_END true
+        private const val EXTRA_VC_END = "LITEP2P_VC_END"
         private const val REQ_POST_NOTIFICATIONS = 4101
 
         // NOTE: The native library (liblitep2p.so) is loaded by :litep2p-core's

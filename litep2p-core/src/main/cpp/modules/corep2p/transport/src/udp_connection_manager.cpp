@@ -403,9 +403,15 @@ public:
         auto& buf = m_event_loop_recv_buf;
         sockaddr_storage from_addr{};
         socklen_t from_len = sizeof(from_addr);
-        ssize_t n = recvfrom(m_sock, buf.data(), buf.size(), 0, reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+        // MSG_TRUNC: same oversize-detection as listenLoop().
+        ssize_t n = recvfrom(m_sock, buf.data(), buf.size(), MSG_TRUNC, reinterpret_cast<sockaddr*>(&from_addr), &from_len);
         
         if (n > 0) {
+            if (n > static_cast<ssize_t>(buf.size())) {
+                nativeLog("UDP_ST_ERROR: Dropping oversized datagram of " + std::to_string(n) +
+                          " bytes (receive buffer is only " + std::to_string(buf.size()) + " bytes)");
+                return;
+            }
             std::string sender_ip;
             uint16_t sender_port = 0;
             parse_network_id(sockaddr_to_network_id(reinterpret_cast<sockaddr*>(&from_addr)),
@@ -497,9 +503,17 @@ private:
 
             sockaddr_storage from_addr{};
             socklen_t from_len = sizeof(from_addr);
-            ssize_t n = recvfrom(sock_fd, buf.data(), buf.size(), 0, reinterpret_cast<sockaddr*>(&from_addr), &from_len);
+            // MSG_TRUNC makes recvfrom return the *full* datagram length even
+            // when it exceeds the buffer, so we can detect truncation instead
+            // of silently processing a partial (undecryptable) message.
+            ssize_t n = recvfrom(sock_fd, buf.data(), buf.size(), MSG_TRUNC, reinterpret_cast<sockaddr*>(&from_addr), &from_len);
             
             if (n > 0) {
+                if (n > static_cast<ssize_t>(buf.size())) {
+                    nativeLog("UDP Error: Dropping oversized datagram of " + std::to_string(n) +
+                              " bytes (receive buffer is only " + std::to_string(buf.size()) + " bytes)");
+                    continue;
+                }
                 std::string sender_ip;
                 uint16_t sender_port = 0;
                 parse_network_id(sockaddr_to_network_id(reinterpret_cast<sockaddr*>(&from_addr)),

@@ -79,6 +79,8 @@ litep2p_callbacks_t g_callbacks{};
 bool g_callbacks_set = false;
 litep2p_transfer_callbacks_t g_transfer_callbacks{};
 bool g_transfer_callbacks_set = false;
+litep2p_voice_callbacks_t g_voice_callbacks{};
+bool g_voice_callbacks_set = false;
 
 std::thread g_stop_completion_thread;
 
@@ -172,6 +174,52 @@ void apply_transfer_callbacks(SessionManager* engine) {
             if (!tc.on_completed) return;
             tc.on_completed(tc.user_data, transfer_id.c_str(), success ? 1 : 0,
                             error.empty() ? nullptr : error.c_str());
+        });
+}
+
+// Wire the stored voice-call callbacks onto the engine. Called from
+// litep2p_start() after engine creation and from litep2p_set_voice_call_callbacks()
+// when the engine already exists. Callbacks are invoked on engine threads;
+// the stored struct is copied under g_cb_mutex so re-registration is safe.
+void apply_voice_callbacks(SessionManager* engine) {
+    if (!engine) return;
+    litep2p_voice_callbacks_t vc{};
+    bool have = false;
+    {
+        std::lock_guard<std::mutex> lk(g_cb_mutex);
+        have = g_voice_callbacks_set;
+        vc = g_voice_callbacks;
+    }
+    if (!have) return;
+
+    engine->set_voice_call_callbacks(
+        // on_offered
+        [vc](const std::string& call_id, const std::string& peer_id,
+             const std::string& codec, uint16_t sample_rate,
+             uint8_t channels, uint8_t frame_ms) {
+            if (!vc.on_voice_call_offered) return;
+            litep2p_voice_offer_t offer{};
+            copy_to_buf(offer.call_id, sizeof(offer.call_id), call_id);
+            copy_to_buf(offer.peer_id, sizeof(offer.peer_id), peer_id);
+            copy_to_buf(offer.codec, sizeof(offer.codec), codec);
+            offer.sample_rate = sample_rate;
+            offer.channels = channels;
+            offer.frame_ms = frame_ms;
+            vc.on_voice_call_offered(vc.user_data, &offer);
+        },
+        // on_state
+        [vc](const std::string& call_id, const std::string& peer_id,
+             int state, const std::string& detail) {
+            if (!vc.on_voice_call_state) return;
+            vc.on_voice_call_state(vc.user_data, call_id.c_str(), peer_id.c_str(),
+                                   state, detail.empty() ? nullptr : detail.c_str());
+        },
+        // on_frame
+        [vc](const std::string& call_id, const std::string& peer_id,
+             const uint8_t* data, size_t len) {
+            if (!vc.on_voice_frame) return;
+            vc.on_voice_frame(vc.user_data, call_id.c_str(), peer_id.c_str(),
+                              data, static_cast<uint32_t>(len));
         });
 }
 
@@ -343,6 +391,9 @@ uint32_t litep2p_get_feature_flags(void) {
     uint32_t flags = 0u;
 #ifdef HAVE_FILE_TRANSFER
     flags |= LITEP2P_FEATURE_FILE_TRANSFER;
+#endif
+#ifdef HAVE_VOICE_CALL
+    flags |= LITEP2P_FEATURE_VOICE_CALL;
 #endif
 #if ENABLE_OVERLAY_MODULE
     flags |= LITEP2P_FEATURE_OVERLAY;
@@ -618,6 +669,7 @@ litep2p_result_t litep2p_start(void) {
     // before start. Re-applied on every start so callbacks survive engine
     // recreation across stop/start cycles.
     apply_transfer_callbacks(engine);
+    apply_voice_callbacks(engine);
 
     // Wire the overlay delivery callback the same way.
     apply_overlay_delivery_cb(engine);
@@ -1074,6 +1126,75 @@ litep2p_result_t litep2p_set_transfer_callbacks(const litep2p_transfer_callbacks
     // applied in litep2p_start().
     if (engine) apply_transfer_callbacks(engine);
     return LITEP2P_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Voice calls — realtime audio (§3.10a)                                     */
+/* ------------------------------------------------------------------------ */
+litep2p_result_t litep2p_set_voice_call_callbacks(const litep2p_voice_callbacks_t* callbacks) {
+    if (!callbacks || callbacks->struct_size < sizeof(litep2p_voice_callbacks_t)) {
+        return LITEP2P_ERR_INVALID_ARG;
+    }
+    SessionManager* engine = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_api_mutex);
+        {
+            std::lock_guard<std::mutex> lk(g_cb_mutex);
+            g_voice_callbacks = *callbacks;
+            g_voice_callbacks_set = true;
+        }
+        engine = g_engine.get();
+    }
+    if (engine) apply_voice_callbacks(engine);
+    return LITEP2P_OK;
+}
+
+litep2p_result_t litep2p_start_voice_call(const char* peer_id, const char* codec,
+                                          uint16_t sample_rate, uint8_t channels,
+                                          uint8_t frame_ms,
+                                          char* out_call_id, uint32_t buf_len) {
+    if (!peer_id || !peer_id[0] || !codec || !codec[0] || sample_rate == 0 ||
+        channels == 0 || channels > 2 || frame_ms == 0) {
+        return LITEP2P_ERR_INVALID_ARG;
+    }
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    const std::string call_id = g_engine->start_voice_call(
+        peer_id, codec, sample_rate, channels, frame_ms);
+    if (call_id.empty()) return LITEP2P_ERR_NOT_FOUND;  // peer not connected / busy
+    if (out_call_id && buf_len > 0) copy_to_buf(out_call_id, buf_len, call_id);
+    return LITEP2P_OK;
+}
+
+litep2p_result_t litep2p_accept_voice_call(const char* call_id) {
+    if (!call_id || !call_id[0]) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->accept_voice_call(call_id) ? LITEP2P_OK : LITEP2P_ERR_NOT_FOUND;
+}
+
+litep2p_result_t litep2p_decline_voice_call(const char* call_id) {
+    if (!call_id || !call_id[0]) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->decline_voice_call(call_id) ? LITEP2P_OK : LITEP2P_ERR_NOT_FOUND;
+}
+
+litep2p_result_t litep2p_end_voice_call(const char* call_id) {
+    if (!call_id || !call_id[0]) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->end_voice_call(call_id) ? LITEP2P_OK : LITEP2P_ERR_NOT_FOUND;
+}
+
+litep2p_result_t litep2p_send_voice_frame(const char* call_id, const uint8_t* data,
+                                          uint32_t len) {
+    if (!call_id || !call_id[0] || (!data && len > 0)) return LITEP2P_ERR_INVALID_ARG;
+    if (len > 16384) return LITEP2P_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (!g_engine) return LITEP2P_ERR_INVALID_STATE;
+    return g_engine->send_voice_frame(call_id, data, len) ? LITEP2P_OK
+                                                          : LITEP2P_ERR_NOT_FOUND;
 }
 
 litep2p_result_t litep2p_send_file(const char* peer_id, const char* file_path,

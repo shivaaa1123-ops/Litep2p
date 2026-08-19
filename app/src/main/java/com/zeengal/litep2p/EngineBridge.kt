@@ -1,9 +1,12 @@
 package com.zeengal.litep2p
 
+import com.zeengal.litep2p.core.FileTransferOffer
 import com.zeengal.litep2p.core.LiteP2P
 import com.zeengal.litep2p.core.LiteP2PListener
 import com.zeengal.litep2p.core.LogLevel
 import com.zeengal.litep2p.core.PeerInfo
+import com.zeengal.litep2p.core.VoiceCallOffer
+import com.zeengal.litep2p.core.VoiceCallState
 import com.zeengal.litep2p.hook.P2P
 
 /**
@@ -55,6 +58,35 @@ object EngineBridge {
 
         override fun onMessageAcked(messageId: String, sentTsMs: Long, recvTsMs: Long) {
             MessageTraceStore.onAckReceived(messageId, sentTsMs, recvTsMs)
+        }
+
+        override fun onFileTransferOffered(offer: FileTransferOffer) {
+            TransferStore.onOfferReceived(offer)
+        }
+
+        override fun onTransferProgress(transferId: String, progressPercent: Float, bytesPerSec: Float) {
+            TransferStore.onProgress(transferId, progressPercent, bytesPerSec)
+        }
+
+        override fun onTransferCompleted(transferId: String, success: Boolean, error: String?) {
+            TransferStore.onCompleted(transferId, success, error)
+        }
+
+        override fun onVoiceCallOffered(offer: VoiceCallOffer) {
+            VoiceCallStore.onOffer(offer)
+        }
+
+        override fun onVoiceCallStateChanged(
+            callId: String,
+            peerId: String,
+            state: VoiceCallState,
+            detail: String?
+        ) {
+            VoiceCallStore.onStateChanged(callId, peerId, state, detail)
+        }
+
+        override fun onVoiceFrameReceived(callId: String, peerId: String, data: ByteArray) {
+            VoiceCallEngine.play(data)
         }
     }
 

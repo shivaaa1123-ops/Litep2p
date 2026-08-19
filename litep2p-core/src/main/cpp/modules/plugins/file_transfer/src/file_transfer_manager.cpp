@@ -118,7 +118,8 @@ FileTransferManager::FileTransferManager(const TransferConfig& cfg)
             m_chunk_size(cfg.chunk_size_kb * 1024),
             m_current_rate_limit_kbps(cfg.initial_rate_limit_kbps),
             m_path_eval_interval_sec(cfg.path_eval_interval_sec),
-            m_congestion_check_interval_ms(cfg.congestion_check_interval_ms) {
+            m_congestion_check_interval_ms(cfg.congestion_check_interval_ms),
+            m_stall_timeout_ms(cfg.stall_timeout_ms) {
 
         init_crc32_table();
 
@@ -698,6 +699,35 @@ void FileTransferManager::send_worker_loop() {
             break;
         }
 
+        // ------------------------------------------------------------------
+        // Stall watchdog (both SEND and RECEIVE in-progress transfers):
+        // fail a transfer that has made no chunk/ack progress for longer than
+        // the stall timeout instead of retransmitting a doomed chunk forever.
+        // Keeps checkpoint + .part so the transfer can be resumed later.
+        // ------------------------------------------------------------------
+        if (m_stall_timeout_ms > 0) {
+            const auto watchdog_now = clock::now();
+            const auto stall = std::chrono::milliseconds(m_stall_timeout_ms);
+            std::vector<std::string> stalled;
+            {
+                std::lock_guard<std::mutex> lock(m_transfers_mutex);
+                for (auto& kv : m_transfers) {
+                    const auto& s = kv.second;
+                    if (s->state != TransferState::IN_PROGRESS) continue;
+                    // Require both a full stall window of inactivity AND that the
+                    // transfer has been alive long enough to rule out a slow start.
+                    if (watchdog_now - s->last_activity > stall &&
+                        watchdog_now - s->start_time > stall) {
+                        stalled.push_back(kv.first);
+                    }
+                }
+            }
+            for (const auto& id : stalled) {
+                fail_transfer(id, "transfer stalled: no chunk/ack progress for >= " +
+                                      std::to_string(m_stall_timeout_ms) + " ms");
+            }
+        }
+
         TransferOutboundMessageCallback outbound;
         {
             std::lock_guard<std::mutex> lk(m_send_mutex);
@@ -781,6 +811,47 @@ void FileTransferManager::send_worker_loop() {
             }
         }
     }
+}
+
+bool FileTransferManager::fail_transfer(const std::string& transfer_id,
+                                        const std::string& error) {
+    // Lock order here is transfers -> chunks -> stats. No caller passes in while
+    // already holding chunks, so this stays deadlock-free (see get_next_chunk_to_send
+    // and acknowledge_chunk which take these in the same one-way order).
+    TransferCompleteCallback complete_cb;
+    bool already_terminal = false;
+    {
+        std::lock_guard<std::mutex> lock(m_transfers_mutex);
+        auto it = m_transfers.find(transfer_id);
+        if (it == m_transfers.end()) return false;
+        auto& s = it->second;
+        if (s->state == TransferState::COMPLETED || s->state == TransferState::FAILED ||
+            s->state == TransferState::CANCELLED) {
+            already_terminal = true;
+        } else {
+            s->state = TransferState::FAILED;
+            s->last_error = error;
+            s->error_count++;
+            // Persist a checkpoint so the partial download can be resumed later
+            // rather than restarting from zero. (save_checkpoint requires the
+            // caller to already hold m_transfers_mutex, which we do.)
+            save_checkpoint(transfer_id);
+            // Stop any further send/retransmit work for this transfer.
+            {
+                std::lock_guard<std::mutex> chunks_lock(m_chunks_mutex);
+                m_pending_chunks.erase(transfer_id);
+                m_inflight_chunks.erase(transfer_id);
+            }
+            std::lock_guard<std::mutex> stats_lock(m_stats_mutex);
+            m_stats.failed_transfers++;
+        }
+        complete_cb = m_complete_callback;
+    }
+    if (!already_terminal && complete_cb) {
+        complete_cb(transfer_id, false, error);
+    }
+    LOG_WARN("FT: Transfer failed: " + transfer_id + " - " + error);
+    return !already_terminal;
 }
 
 bool FileTransferManager::cancel_transfer_local(const std::string& transfer_id) {

@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Microphone capture for voice calls (LiteCall). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <!--
         The engine must keep sockets alive while the app is backgrounded, which requires
@@ -52,7 +54,9 @@
             android:foregroundServiceType="dataSync"
             android:stopWithTask="false" />
 
-        <!-- Brings the engine back after a reboot or an app update. -->
+        <!--
+            Brings the engine back after a reboot or an app update.
+        -->
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
@@ -64,6 +68,21 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!--
+            Grants the system image viewer read access to received files (the
+            app's private storage) when the user taps "Open" on a completed
+            inbound transfer.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

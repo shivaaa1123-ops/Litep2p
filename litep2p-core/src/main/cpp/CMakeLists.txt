@@ -29,6 +29,7 @@ option(LITEP2P_ENABLE_NETWORK_TRAVERSAL "Enable NAT traversal and network traver
 option(LITEP2P_ENABLE_NOISE_PROTOCOL "Enable Noise protocol for encrypted communication" ON)
 option(LITEP2P_ENABLE_DISCOVERY "Enable peer discovery service" ON)
 option(LITEP2P_ENABLE_FILE_TRANSFER "Enable file transfer capabilities" ON)
+option(LITEP2P_ENABLE_VOICE_CALL "Enable realtime voice call capabilities" ON)
 option(LITEP2P_ENABLE_OPTIMIZATION "Enable battery and network optimization" ON)
 option(LITEP2P_ENABLE_ROUTING "Enable routing capabilities" ON)
 
@@ -66,6 +67,10 @@ endif()
 
 if(LITEP2P_ENABLE_FILE_TRANSFER)
     add_compile_definitions(HAVE_FILE_TRANSFER)
+endif()
+
+if(LITEP2P_ENABLE_VOICE_CALL)
+    add_compile_definitions(HAVE_VOICE_CALL)
 endif()
 
 if(LITEP2P_ENABLE_OPTIMIZATION)
@@ -131,6 +136,10 @@ endif()
 
 if(LITEP2P_ENABLE_FILE_TRANSFER)
     include_directories(${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/file_transfer/include)
+endif()
+
+if(LITEP2P_ENABLE_VOICE_CALL)
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/voice_call/include)
 endif()
 
 include_directories(
@@ -261,6 +270,12 @@ if(LITEP2P_ENABLE_FILE_TRANSFER)
     target_link_libraries(litep2p_file_transfer litep2p_corep2p)
 endif()
 
+if(LITEP2P_ENABLE_VOICE_CALL)
+    file(GLOB_RECURSE VOICE_CALL_SOURCES CONFIGURE_DEPENDS "modules/plugins/voice_call/src/*.cpp")
+    add_library(litep2p_voice_call STATIC ${VOICE_CALL_SOURCES})
+    target_link_libraries(litep2p_voice_call litep2p_corep2p)
+endif()
+
 # Add prebuilt libsodium for current ABI (required when Noise is enabled).
 set(LIBSODIUM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/libsodium")
 set(LIBSODIUM_LIB "")
@@ -345,6 +360,10 @@ endif()
 
 if(LITEP2P_ENABLE_FILE_TRANSFER)
     target_link_libraries(litep2p litep2p_file_transfer)
+endif()
+
+if(LITEP2P_ENABLE_VOICE_CALL)
+    target_link_libraries(litep2p litep2p_voice_call)
 endif()
 
 # Compiler options

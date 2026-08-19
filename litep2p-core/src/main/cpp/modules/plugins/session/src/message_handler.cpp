@@ -749,6 +749,16 @@ namespace detail {
                 }
                 break;
             }
+            case MessageType::VOICE_STREAM: {
+                // Voice frames are handled by VoiceCallManager (not forwarded to app callbacks).
+                auto* vc_mgr = m_sm->get_voice_call_manager();
+                if (vc_mgr) {
+                    vc_mgr->handle_incoming_message(peer_id, payload);
+                } else {
+                    LOG_WARN("MH: VOICE_STREAM received but voice call manager is null");
+                }
+                break;
+            }
             case MessageType::HANDSHAKE_NOISE:
 #if HAVE_NOISE_PROTOCOL
                 if (m_sm->m_use_noise_protocol) {
@@ -1279,6 +1289,7 @@ namespace detail {
             // High-volume / latency-sensitive frames must bypass batching.
             const bool is_batchable = (!is_control &&
                                       msg_type != MessageType::FILE_TRANSFER &&
+                                      msg_type != MessageType::VOICE_STREAM &&
                                       msg_type != MessageType::PROXY_CONTROL &&
                                       msg_type != MessageType::PROXY_STREAM_DATA);
 

@@ -23,7 +23,11 @@ constexpr bool ENABLE_SELECTIVE_ENCRYPTION = true;  // Only encrypt on cellular
 
 // Buffer Sizes
 constexpr size_t TCP_BUFFER_SIZE = 4096;
-constexpr size_t UDP_BUFFER_SIZE = 4096;
+// UDP receive scratch buffer. Must be able to hold a whole datagram (up to
+// 65507 bytes of UDP payload); anything smaller silently truncates large
+// messages via recvfrom(), which breaks decryption and drops the message.
+// Matches the config default: communication.udp.buffer_size (65535).
+constexpr size_t UDP_BUFFER_SIZE = 65535;
 constexpr size_t DISCOVERY_MSG_MAX = 1024;
 
 // Socket Behavior

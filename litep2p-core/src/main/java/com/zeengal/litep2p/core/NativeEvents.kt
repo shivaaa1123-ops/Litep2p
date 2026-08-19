@@ -82,6 +82,27 @@ object NativeEvents {
         LiteP2P.dispatchTransferCompleted(transferId, success, error)
     }
 
+    /** Voice-call offer arrived (call_id, peer_id, codec, sample_rate, channels, frame_ms). */
+    @JvmStatic
+    fun onVoiceCallOffered(callId: String, peerId: String, codec: String,
+                           sampleRate: Int, channels: Int, frameMs: Int) {
+        LiteP2P.dispatchVoiceCallOffered(
+            VoiceCallOffer(callId, peerId, codec, sampleRate, channels, frameMs)
+        )
+    }
+
+    /** Voice-call state change (call_id, peer_id, state wire value, detail). */
+    @JvmStatic
+    fun onVoiceCallStateChanged(callId: String, peerId: String, state: Int, detail: String?) {
+        LiteP2P.dispatchVoiceCallStateChanged(callId, peerId, VoiceCallState.fromWire(state), detail)
+    }
+
+    /** Incoming voice audio frame (call_id, peer_id, codec bytes). */
+    @JvmStatic
+    fun onVoiceFrameReceived(callId: String, peerId: String, data: ByteArray) {
+        LiteP2P.dispatchVoiceFrameReceived(callId, peerId, data)
+    }
+
     /* ------------------------------------------------------------------ */
     /* v0.4: reliable messaging / presence / directory / invites            */
     /* ------------------------------------------------------------------ */

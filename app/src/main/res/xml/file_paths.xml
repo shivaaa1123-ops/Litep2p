@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    FileProvider paths: received files land in filesDir/p2p_received, outgoing
+    staged copies in filesDir/p2p_outgoing. Both are private app storage, so the
+    system image viewer can only reach them through the FileProvider URI grants.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="p2p_received" path="p2p_received/" />
+    <files-path name="p2p_outgoing" path="p2p_outgoing/" />
+</paths>

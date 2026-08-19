@@ -43,11 +43,19 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
         private const val TAG = "PeersAdapter"
     }
 
+    /** Invoked when the user taps "File" on a ready peer (system picker). */
+    var onSendFile: ((PeerInfo) -> Unit)? = null
+
+    /** Invoked when the user taps "Call" on a ready peer (voice call). */
+    var onCall: ((PeerInfo) -> Unit)? = null
+
     class Holder(view: View) : RecyclerView.ViewHolder(view) {
         val dot: View = view.findViewById(R.id.peerStatusDot)
         val id: TextView = view.findViewById(R.id.peerIdText)
         val meta: TextView = view.findViewById(R.id.peerMetaText)
         val action: MaterialButton = view.findViewById(R.id.peerActionButton)
+        val file: MaterialButton = view.findViewById(R.id.peerFileButton)
+        val call: MaterialButton = view.findViewById(R.id.peerCallButton)
     }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder {
@@ -98,10 +106,21 @@ class PeersAdapter(private var items: List<PeerInfo> = emptyList()) :
             holder.action.text = "Send"
             holder.action.setIconResource(R.drawable.ic_send)
             holder.action.setOnClickListener { showSendDialog(context, p) }
+
+            // File-transfer action for ready peers.
+            holder.file.visibility = View.VISIBLE
+            holder.file.setOnClickListener { onSendFile?.invoke(p) }
+
+            // Voice-call action for ready peers (requires RECORD_AUDIO permission,
+            // which the host activity requests on first use).
+            holder.call.visibility = View.VISIBLE
+            holder.call.setOnClickListener { onCall?.invoke(p) }
         } else {
             holder.action.text = "Connect"
             holder.action.setIconResource(R.drawable.ic_play)
             holder.action.setOnClickListener { requestConnect(context, p) }
+            holder.file.visibility = View.GONE
+            holder.call.visibility = View.GONE
         }
 
         // Row tap mirrors the button.

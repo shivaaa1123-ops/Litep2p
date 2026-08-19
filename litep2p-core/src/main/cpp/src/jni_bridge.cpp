@@ -83,6 +83,10 @@ static jmethodID g_onOverlayDeliveryMethod = nullptr;
 static jmethodID g_onFileTransferOfferedMethod = nullptr;
 static jmethodID g_onTransferProgressMethod = nullptr;
 static jmethodID g_onTransferCompletedMethod = nullptr;
+// Voice call callbacks (offer/state/frame).
+static jmethodID g_onVoiceCallOfferedMethod = nullptr;
+static jmethodID g_onVoiceCallStateMethod = nullptr;
+static jmethodID g_onVoiceFrameMethod = nullptr;
 // v0.4 callbacks (reliable send / presence / ping / lookup / invite).
 static jmethodID g_onDeliveryStatusMethod = nullptr;
 static jmethodID g_onPresenceMethod = nullptr;
@@ -462,6 +466,116 @@ void cabi_on_transfer_completed(void* /*user_data*/, const char* transfer_id,
     env->DeleteLocalRef(jId);
 }
 
+void cabi_on_voice_call_offered(void* /*user_data*/, const litep2p_voice_offer_t* offer) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onVoiceCallOfferedMethod || !offer) return;
+
+    jstring jId = env->NewStringUTF(offer->call_id);
+    if (!jId) {
+        clear_any_exception(env);
+        return;
+    }
+    jstring jPeer = env->NewStringUTF(offer->peer_id);
+    if (!jPeer) {
+        env->DeleteLocalRef(jId);
+        clear_any_exception(env);
+        return;
+    }
+    jstring jCodec = env->NewStringUTF(offer->codec);
+    if (!jCodec) {
+        env->DeleteLocalRef(jId);
+        env->DeleteLocalRef(jPeer);
+        clear_any_exception(env);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onVoiceCallOfferedMethod,
+                              jId, jPeer, jCodec,
+                              static_cast<jint>(offer->sample_rate),
+                              static_cast<jint>(offer->channels),
+                              static_cast<jint>(offer->frame_ms));
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onVoiceCallOffered");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jId);
+    env->DeleteLocalRef(jPeer);
+    env->DeleteLocalRef(jCodec);
+}
+
+void cabi_on_voice_call_state(void* /*user_data*/, const char* call_id,
+                              const char* peer_id, int state, const char* detail) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onVoiceCallStateMethod || !call_id || !peer_id) return;
+
+    jstring jId = env->NewStringUTF(call_id);
+    if (!jId) {
+        clear_any_exception(env);
+        return;
+    }
+    jstring jPeer = env->NewStringUTF(peer_id);
+    if (!jPeer) {
+        env->DeleteLocalRef(jId);
+        clear_any_exception(env);
+        return;
+    }
+    jstring jDetail = detail ? env->NewStringUTF(detail) : nullptr;
+    if (detail && !jDetail) {
+        env->DeleteLocalRef(jId);
+        env->DeleteLocalRef(jPeer);
+        clear_any_exception(env);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onVoiceCallStateMethod,
+                              jId, jPeer, static_cast<jint>(state), jDetail);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onVoiceCallStateChanged");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    if (jDetail) env->DeleteLocalRef(jDetail);
+    env->DeleteLocalRef(jId);
+    env->DeleteLocalRef(jPeer);
+}
+
+void cabi_on_voice_frame(void* /*user_data*/, const char* call_id,
+                         const char* peer_id, const uint8_t* data, uint32_t len) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onVoiceFrameMethod || !call_id || !peer_id) return;
+
+    jstring jId = env->NewStringUTF(call_id);
+    if (!jId) {
+        clear_any_exception(env);
+        return;
+    }
+    jstring jPeer = env->NewStringUTF(peer_id);
+    if (!jPeer) {
+        env->DeleteLocalRef(jId);
+        clear_any_exception(env);
+        return;
+    }
+    jbyteArray jData = env->NewByteArray(static_cast<jsize>(len));
+    if (!jData) {
+        env->DeleteLocalRef(jId);
+        env->DeleteLocalRef(jPeer);
+        clear_any_exception(env);
+        return;
+    }
+    if (len > 0) {
+        env->SetByteArrayRegion(jData, 0, static_cast<jsize>(len),
+                                reinterpret_cast<const jbyte*>(data));
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onVoiceFrameMethod, jId, jPeer, jData);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onVoiceFrameReceived");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(jData);
+    env->DeleteLocalRef(jId);
+    env->DeleteLocalRef(jPeer);
+}
+
 void register_cabi_callbacks() {
     litep2p_callbacks_t cb{};
     cb.struct_size = sizeof(litep2p_callbacks_t);
@@ -498,6 +612,20 @@ void register_cabi_callbacks() {
     if (trc != LITEP2P_OK) {
         nativeLog("JNI_BRIDGE: litep2p_set_transfer_callbacks failed: " +
                   std::string(litep2p_result_string(trc)));
+    }
+
+    // Voice-call offer/state/frame callbacks.
+    litep2p_voice_callbacks_t vc{};
+    vc.struct_size = sizeof(litep2p_voice_callbacks_t);
+    vc.user_data = nullptr;
+    vc.on_voice_call_offered = cabi_on_voice_call_offered;
+    vc.on_voice_call_state = cabi_on_voice_call_state;
+    vc.on_voice_frame = cabi_on_voice_frame;
+
+    const litep2p_result_t vrc = litep2p_set_voice_call_callbacks(&vc);
+    if (vrc != LITEP2P_OK) {
+        nativeLog("JNI_BRIDGE: litep2p_set_voice_call_callbacks failed: " +
+                  std::string(litep2p_result_string(vrc)));
     }
 }
 
@@ -883,6 +1011,29 @@ bool jniBridgeInit(JNIEnv* env) {
         clear_any_exception(env);
     }
 
+    // Voice call callbacks (optional; missing methods only disable the call UI).
+    jmethodID newOnVoiceCallOfferedMethod =
+        env->GetStaticMethodID(newEventsClass, "onVoiceCallOffered",
+                               "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;III)V");
+    if (!newOnVoiceCallOfferedMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onVoiceCallOffered not found (voice call UI disabled)");
+        clear_any_exception(env);
+    }
+    jmethodID newOnVoiceCallStateMethod =
+        env->GetStaticMethodID(newEventsClass, "onVoiceCallStateChanged",
+                               "(Ljava/lang/String;Ljava/lang/String;ILjava/lang/String;)V");
+    if (!newOnVoiceCallStateMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onVoiceCallStateChanged not found (voice call UI disabled)");
+        clear_any_exception(env);
+    }
+    jmethodID newOnVoiceFrameMethod =
+        env->GetStaticMethodID(newEventsClass, "onVoiceFrameReceived",
+                               "(Ljava/lang/String;Ljava/lang/String;[B)V");
+    if (!newOnVoiceFrameMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onVoiceFrameReceived not found (voice call UI disabled)");
+        clear_any_exception(env);
+    }
+
     // v0.4 callbacks are optional conveniences; missing methods only disable
     // those features, never the engine.
     jmethodID newOnDeliveryStatusMethod =
@@ -963,6 +1114,9 @@ bool jniBridgeInit(JNIEnv* env) {
     g_onFileTransferOfferedMethod = newOnFileTransferOfferedMethod;
     g_onTransferProgressMethod = newOnTransferProgressMethod;
     g_onTransferCompletedMethod = newOnTransferCompletedMethod;
+    g_onVoiceCallOfferedMethod = newOnVoiceCallOfferedMethod;
+    g_onVoiceCallStateMethod = newOnVoiceCallStateMethod;
+    g_onVoiceFrameMethod = newOnVoiceFrameMethod;
     g_onDeliveryStatusMethod = newOnDeliveryStatusMethod;
     g_onPresenceMethod = newOnPresenceMethod;
     g_onPingResultMethod = newOnPingResultMethod;
@@ -997,6 +1151,9 @@ void jniBridgeCleanup(JNIEnv* env) {
     g_onFileTransferOfferedMethod = nullptr;
     g_onTransferProgressMethod = nullptr;
     g_onTransferCompletedMethod = nullptr;
+    g_onVoiceCallOfferedMethod = nullptr;
+    g_onVoiceCallStateMethod = nullptr;
+    g_onVoiceFrameMethod = nullptr;
     g_onDeliveryStatusMethod = nullptr;
     g_onPresenceMethod = nullptr;
     g_onPingResultMethod = nullptr;
@@ -1292,6 +1449,74 @@ Java_com_zeengal_litep2p_core_LiteP2PNative_cancelTransfer(
     const std::string transfer_id = jstring_to_utf8(env, transferId);
     if (transfer_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
     return (jint)litep2p_cancel_transfer(transfer_id.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// JNI entry points — voice calls (realtime audio).
+// ---------------------------------------------------------------------------
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_startVoiceCall(
+    JNIEnv* env, jobject /*thiz*/, jstring peerId, jstring codec,
+    jint sampleRate, jint channels, jint frameMs) {
+    const std::string peer_id = jstring_to_utf8(env, peerId);
+    const std::string codec_name = jstring_to_utf8(env, codec);
+    if (peer_id.empty() || codec_name.empty()) return env->NewStringUTF("");
+
+    char call_id[64] = {0};
+    const litep2p_result_t rc = litep2p_start_voice_call(
+        peer_id.c_str(), codec_name.c_str(),
+        static_cast<uint16_t>(sampleRate), static_cast<uint8_t>(channels),
+        static_cast<uint8_t>(frameMs), call_id, sizeof(call_id));
+    if (rc != LITEP2P_OK) {
+        nativeLog("JNI_BRIDGE: startVoiceCall failed: " +
+                  std::string(litep2p_result_string(rc)));
+        return env->NewStringUTF("");
+    }
+    return env->NewStringUTF(call_id);
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_acceptVoiceCall(
+    JNIEnv* env, jobject /*thiz*/, jstring callId) {
+    const std::string call_id = jstring_to_utf8(env, callId);
+    if (call_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_accept_voice_call(call_id.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_declineVoiceCall(
+    JNIEnv* env, jobject /*thiz*/, jstring callId) {
+    const std::string call_id = jstring_to_utf8(env, callId);
+    if (call_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_decline_voice_call(call_id.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_endVoiceCall(
+    JNIEnv* env, jobject /*thiz*/, jstring callId) {
+    const std::string call_id = jstring_to_utf8(env, callId);
+    if (call_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_end_voice_call(call_id.c_str());
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_sendVoiceFrame(
+    JNIEnv* env, jobject /*thiz*/, jstring callId, jbyteArray data) {
+    const std::string call_id = jstring_to_utf8(env, callId);
+    if (call_id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+
+    jsize len = data ? env->GetArrayLength(data) : 0;
+    if (len <= 0) return (jint)LITEP2P_ERR_INVALID_ARG;
+    std::vector<jbyte> buf(static_cast<size_t>(len));
+    env->GetByteArrayRegion(data, 0, len, buf.data());
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return (jint)LITEP2P_ERR_INVALID_ARG;
+    }
+    return (jint)litep2p_send_voice_frame(
+        call_id.c_str(), reinterpret_cast<const uint8_t*>(buf.data()),
+        static_cast<uint32_t>(len));
 }
 
 // ---------------------------------------------------------------------------

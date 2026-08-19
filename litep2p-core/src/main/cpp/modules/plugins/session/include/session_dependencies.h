@@ -7,6 +7,7 @@
 #include "session_cache.h"
 #include "message_batcher.h"
 #include "file_transfer_manager.h"
+#include "voice_call_manager.h"
 #include "event_manager.h"
 #include "peer_tier_manager.h"
 #include "broadcast_discovery_manager.h"
@@ -40,6 +41,7 @@ public:
     virtual std::unique_ptr<SessionCache> createSessionCache() = 0;
     virtual std::unique_ptr<MessageBatcher> createMessageBatcher(int batchDelayMs, int maxMessages) = 0;
     virtual std::unique_ptr<FileTransferManager> createFileTransferManager() = 0;
+    virtual std::unique_ptr<VoiceCallManager> createVoiceCallManager() = 0;
     virtual std::unique_ptr<EventManager> createEventManager() = 0;
     virtual std::unique_ptr<PeerTierManager> createPeerTierManager() = 0;
     virtual std::unique_ptr<BroadcastDiscoveryManager> createBroadcastDiscoveryManager() = 0;
@@ -82,6 +84,10 @@ public:
     
     std::unique_ptr<FileTransferManager> createFileTransferManager() override {
         return std::make_unique<FileTransferManager>(FileTransferManager::TransferConfig(100, 32));
+    }
+
+    std::unique_ptr<VoiceCallManager> createVoiceCallManager() override {
+        return std::make_unique<VoiceCallManager>();
     }
     
     std::unique_ptr<EventManager> createEventManager() override {

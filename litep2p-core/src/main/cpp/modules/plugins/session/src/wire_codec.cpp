@@ -23,6 +23,7 @@ namespace {
             case MessageType::APPLICATION_DATA:
             case MessageType::APPLICATION_ACK:
             case MessageType::FILE_TRANSFER:
+            case MessageType::VOICE_STREAM:
             case MessageType::PROXY_CONTROL:
             case MessageType::PROXY_STREAM_DATA:
             case MessageType::OVERLAY_FRAME:

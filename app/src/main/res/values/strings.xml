@@ -10,6 +10,10 @@
     <string name="logs_filter_errors">Errors</string>
     <string name="logs_empty_hint">Engine output will appear here.</string>
     <string name="messages_hint">Tap a message for trace details.</string>
+    <string name="transfers_hint">Offers, progress and received files.</string>
+    <string name="transfers_empty_hint">No file transfers yet.\n\nSend a photo from a connected peer card, or accept an incoming offer.</string>
+    <string name="action_clear_transfers">Clear transfers</string>
+    <string name="transfer_direction_icon">Transfer direction</string>
     <string-array name="comms_modes_array">
         <item>UDP</item>
         <item>TCP</item>

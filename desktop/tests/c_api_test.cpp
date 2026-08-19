@@ -551,9 +551,12 @@ static bool test_feature_flags() {
     TEST_ASSERT((flags & LITEP2P_FEATURE_TELEMETRY) != 0,
                 "telemetry feature flag should be set");
 
-    // The desktop build compiles file transfer, overlay, proxy and noise.
+    // The desktop build compiles file transfer, voice calls, overlay, proxy
+    // and noise.
     TEST_ASSERT((flags & LITEP2P_FEATURE_FILE_TRANSFER) != 0,
                 "file-transfer feature flag should be set");
+    TEST_ASSERT((flags & LITEP2P_FEATURE_VOICE_CALL) != 0,
+                "voice-call feature flag should be set");
     TEST_ASSERT((flags & LITEP2P_FEATURE_OVERLAY) != 0,
                 "overlay feature flag should be set");
     TEST_ASSERT((flags & LITEP2P_FEATURE_PROXY) != 0,
@@ -562,8 +565,9 @@ static bool test_feature_flags() {
                 "encryption feature flag should be set");
 
     // No reserved/unknown bits set.
-    TEST_ASSERT((flags & ~(LITEP2P_FEATURE_FILE_TRANSFER | LITEP2P_FEATURE_OVERLAY |
-                           LITEP2P_FEATURE_PROXY | LITEP2P_FEATURE_ENCRYPTION |
+    TEST_ASSERT((flags & ~(LITEP2P_FEATURE_FILE_TRANSFER | LITEP2P_FEATURE_VOICE_CALL |
+                           LITEP2P_FEATURE_OVERLAY | LITEP2P_FEATURE_PROXY |
+                           LITEP2P_FEATURE_ENCRYPTION |
                            LITEP2P_FEATURE_DISCOVERY | LITEP2P_FEATURE_TELEMETRY)) == 0,
                 "no unknown feature bits should be set");
 
