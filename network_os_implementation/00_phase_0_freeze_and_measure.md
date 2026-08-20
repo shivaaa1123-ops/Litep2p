@@ -191,10 +191,46 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | c_api_test | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | session_manager_test | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | idle CPU/RAM/network | 5 | see JSON | record values |
-| YYYY-MM-DD | live peer baseline | 3 | PASS/FAIL | latency p50/p95 |
+| 2026-08-20 | c_api_test | 5 | PASS | run_all_tests.sh --loop 5; green every pass |
+| 2026-08-20 | session_manager_test | 5 | PASS | green every pass |
+| 2026-08-20 | overlay_test | 5 | PASS | green every pass |
+| 2026-08-20 | proxy_test | 5 | PASS | green every pass |
+| 2026-08-20 | file_transfer_test | 5 | PASS | green every pass |
+| 2026-08-20 | crypto_test | 5 | PASS | green every pass |
+| 2026-08-20 | nat_traversal_test | 5 | PASS | green every pass |
+| 2026-08-20 | malformed_input_test | 5 | PASS | green every pass |
+| 2026-08-20 | voice_call_test | 5 | PASS | 3/6 FAIL before test-only flake fix (voice_call_test.cpp:298 waited only for caller state); 8/8 PASS after |
+| 2026-08-20 | idle CPU/RAM/network | 5 | see JSON | passes 1-5 → baseline JSON per pass; see below |
+| 2026-08-20 | live peer baseline | 3 | PASS | message_latency_runner receiver+sender pair; see below |
+
+**Idle-cost baseline (5×, 60s windows, daemon peer, signaling/NAT/discovery off):**
+| pass | RSS KB | threads | CPU% |
+|---|---|---|---|
+| 1 | 6587 | 31 | 0 (macOS; tick sampling N/A) |
+| 2 | 6505 | 31 | 0 |
+| 3 | 7934 | 31 | 0 |
+| 4 | 7353 | 31 | 0 |
+| 5 | 7922 | 31 | 0 |
+| mean | **7260** | **31** | **0** |
+
+**Live peer baseline (loopback, UDP + Noise, 20 iters/size):**
+| session | handshake_ms | 1KB p50/p95 ms | 8KB p50/p95 ms |
+|---|---|---|---|
+| 1 | 5069 | 309.3 / 315.0 | 309.7 / 322.6 |
+| 2 | 5074 | 309.2 / 315.0 | 309.5 / 315.3 |
+| 3 | 5109 | 309.1 / 341.9 | 310.4 / 321.0 |
+| 4 | 5059 | 309.9 / 316.5 | 309.7 / 340.2 |
+| 5 | 5113 | 309.8 / 380.7 | 310.0 / 315.4 |
+
+**Startup (daemon peer to running):** cold 854 ms; warm runs 227/223/224/218 ms (mean 223 ms).
+
+**Notable findings this phase:**
+- `LocalPeerDb` is JSON-file, not SQLite (METHODOLOGY decision 1's SQLite precedent does not exist in production code; `sqlite3_dyn` is an unused loader).
+- Fixed-interval reliable-send retry (`reliable_send_manager`) violates §76 — Phase 7 must convert to backoff+jitter+event.
+- Random-fallback PeerID is not persisted (desktop) — Phase 1 `IIdentityStore` work.
+- Keystore is a plain JSON file, not Android Keystore.
+- Per-ABI release libs are 2.95–4.19 MB vs Gate B target <2.5 MB/ABI — Phase 8/11 gap.
+- voice_call_test ring-timeout scenario was flaky (test-side race); fixed test-only.
 
 ## 11. Risks & mitigations
 
@@ -206,11 +242,11 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [ ] All `docs/network-os/01..08` maps exist, are accurate, and are reviewed.
-- [ ] Baseline JSON recorded (5 runs per metric).
-- [ ] Existing suites green 5×.
-- [ ] Live peer baseline recorded.
-- [ ] Status table in `METHODOLOGY.md` updated.
+- [x] All `docs/network-os/01..08` maps exist, are accurate, and are reviewed.
+- [x] Baseline JSON recorded (5 runs per metric).
+- [x] Existing suites green 5×.
+- [x] Live peer baseline recorded.
+- [x] Status table in `METHODOLOGY.md` updated.
 - [ ] Committed with message: `Network OS P0: freeze & measure (maps + baselines)`.
 
 

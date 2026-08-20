@@ -282,10 +282,13 @@ static bool test_ring_timeout() {
     TEST_ASSERT(!call_id.empty(), "start_call failed");
 
     // Nobody answers; the callee's watchdog auto-declines after the timeout.
+    // Wait for BOTH sides to settle before asserting (the two watchdogs can
+    // fire a few ms apart; asserting b_state right after a_state was observed
+    // caused an intermittent flake).
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline) {
         std::lock_guard<std::mutex> lk(pair.m);
-        if (pair.a_state == "ENDED") break;
+        if (pair.a_state == "ENDED" && pair.b_state == "ENDED") break;
     }
     {
         std::lock_guard<std::mutex> lk(pair.m);

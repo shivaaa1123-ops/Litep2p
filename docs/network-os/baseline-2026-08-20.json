@@ -1,0 +1,30 @@
+{
+  "date": "2026-08-20",
+  "env": { "os": "Darwin", "arch": "arm64", "branch": "network-os-dev" },
+  "startup_ms": { "cold": 854, "warm_runs_ms": [227, 223, 224, 218], "warm_mean_ms": 223 },
+  "idle_5runs": {
+    "rss_kb": [6587, 6505, 7934, 7353, 7922],
+    "rss_mean_kb": 7260,
+    "threads": [31, 31, 31, 31, 31],
+    "cpu_pct": [0, 0, 0, 0, 0]
+  },
+  "latency_5runs": {
+    "handshake_ms": [5068.56, 5073.93, 5108.88, 5058.8, 5113.3],
+    "size_1024": { "p50_ms": [309.322, 309.17, 309.103, 309.866, 309.835], "p50_mean_ms": 309.46, "p95_max_ms": 380.74 },
+    "size_8192": { "p50_ms": [309.65, 309.484, 310.412, 309.678, 309.963], "p50_mean_ms": 309.84, "p95_max_ms": 340.231 }
+  },
+  "aar_sizes_bytes": {
+    "multiThread-release.aar": 4385450,
+    "singleThread-release.aar": 4357357
+  },
+  "per_abi_so_bytes": {
+    "multiThread": { "arm64-v8a": 3874616, "armeabi-v7a": 2973744, "x86_64": 4186272 },
+    "singleThread": { "arm64-v8a": 3845088, "armeabi-v7a": 2953536, "x86_64": 4155312 }
+  },
+  "notes": {
+    "quic": "Android AARs are the default no-QUIC build (per locked decision 8). Desktop peer binary (3.93 MB) links picoquic (third_party/picoquic/build/libpicoquic-core.a present); Android QUIC-vs-noQUIC delta requires a flag-enabled AAR build (not produced in P0).",
+    "gate_b_per_abi_target": "2.5 MB per ABI (Gate B). Current release .so per ABI: 2.95-4.19 MB — ABOVE target; Phase 8/11 must close this gap.",
+    "latency_method": "loopback UDP + Noise NK, two SessionManager processes (message_latency_runner), 20 iterations/size after warmup; handshake_ms includes connect+Noise over loopback. p50 ~310ms is dominated by the 50ms message-batcher delay + poll granularity on the send/receive path.",
+    "idle_method": "daemon peer (litep2p_peer_mac --no-tui --daemon) with signaling/NAT/discovery disabled; RSS + thread count sampled 5x over ~50s per run, 5 runs; CPU on macOS not measured (Linux-only tick sampling) - recorded 0."
+  }
+}

@@ -481,6 +481,11 @@ add_executable(message_size_runner tests/message_size_runner.cpp)
 target_include_directories(message_size_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(message_size_runner PRIVATE litep2p_engine)
 
+# Phase 0 measurement harness (idle-cost + latency baseline; not production code)
+add_executable(message_latency_runner tests/message_latency_runner.cpp)
+target_include_directories(message_latency_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(message_latency_runner PRIVATE litep2p_engine)
+
 if(LITEP2P_ENABLE_REAL_QUIC)
     add_executable(quic_test tests/quic_test.cpp)
     target_include_directories(quic_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
