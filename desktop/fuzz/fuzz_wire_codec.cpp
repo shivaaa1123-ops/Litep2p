@@ -12,6 +12,7 @@
 
 #include "wire_codec.h"
 #include "message_types.h"
+#include "networkos/anti_entropy/anti_entropy_frames.h"
 #include "networkos/object/envelope.h"
 #include "networkos/handoff/handoff_frames.h"
 
@@ -57,6 +58,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         (void)networkos::handoff::decode_data(std::string(sv), df);
         networkos::handoff::StoredAckFrame sa;
         (void)networkos::handoff::decode_stored_ack(std::string(sv), sa);
+    }
+
+    // Phase 6: feed the raw bytes into every anti-entropy frame decoder. Must
+    // never crash/hang on arbitrary input (bounded: entry caps checked before
+    // allocation, string lengths validated, trailing bytes rejected).
+    {
+        networkos::anti_entropy::InventoryFrame inv;
+        (void)networkos::anti_entropy::decode_inventory(std::string(sv), inv);
+        networkos::anti_entropy::ObjectWantFrame want;
+        (void)networkos::anti_entropy::decode_object_want(std::string(sv), want);
     }
 
     return 0;

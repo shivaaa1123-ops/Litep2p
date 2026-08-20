@@ -108,6 +108,9 @@ per delivered object (§44).
 - `modules/networkos/anti_entropy/` + tests `desktop/tests/anti_entropy_test`.
 - Inventory format spec + Bloom filter design note for the future.
 - `docs/network-os/12-anti-entropy.md`.
+- Codec fuzz coverage: `desktop/tools/anti_entropy_fuzz_smoke.cpp` (standalone
+  substitute, runnable on Apple clang) + INVENTORY/OBJECT_WANT decoders fed in
+  `desktop/fuzz/fuzz_wire_codec.cpp` (libFuzzer target).
 
 ## 9. Verification Plan (repeated cycles — required)
 
@@ -148,6 +151,7 @@ Run in this order; record every run in §10.
 | 2026-08-21 | Phase 5 regression | 5 | PASS | delivery_test (72 checks) + p5 milestone green after P6 |
 | 2026-08-21 | existing suites | 5 | PASS | 16 suites × 5 = 0 failures (incl. anti_entropy_test + delivery_test) |
 | 2026-08-21 | native build | 1 | PASS | `externalNativeBuildMultiThreadDebug` green; desktop full build 0 errors; C ABI 56 identical |
+| 2026-08-21 | anti-entropy codec fuzz | 1 | PASS | `anti_entropy_fuzz_smoke` 9.3M iters / 60s, no crash (raw garbage + bit-flips + truncation); also covered in `fuzz_wire_codec.cpp` (libFuzzer target) |
 
 ## 11. Risks & mitigations
 
@@ -160,7 +164,9 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [x] INVENTORY/OBJECT_WANT frames implemented in the codec, fuzzed.
+- [x] INVENTORY/OBJECT_WANT frames implemented in the codec, fuzzed
+      (`fuzz_wire_codec.cpp` libFuzzer target + `tools/anti_entropy_fuzz_smoke.cpp`
+      standalone substitute: 9.3M iters / 60s, no crash).
 - [x] Reconciliation session flow (authenticate → capabilities → inventory →
       deliver → receipts → repair stub → close) implemented.
 - [x] Prioritized ordering implemented; bounded per-session work.

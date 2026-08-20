@@ -566,6 +566,13 @@ add_executable(envelope_fuzz_smoke tools/envelope_fuzz_smoke.cpp)
 target_include_directories(envelope_fuzz_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(envelope_fuzz_smoke PRIVATE litep2p_engine)
 
+# Network OS Phase 6 fuzz substitute: runs the anti-entropy frame codecs
+# (INVENTORY / OBJECT_WANT) against randomized/bit-flipped/truncated input for
+# --seconds (see fuzz_wire_codec.cpp for the libFuzzer coverage).
+add_executable(anti_entropy_fuzz_smoke tools/anti_entropy_fuzz_smoke.cpp)
+target_include_directories(anti_entropy_fuzz_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(anti_entropy_fuzz_smoke PRIVATE litep2p_engine)
+
 # Network OS Phase 3 performance probe (put/get throughput, open latency,
 # size overhead, commit latency).
 add_executable(store_bench tools/store_bench.cpp)
