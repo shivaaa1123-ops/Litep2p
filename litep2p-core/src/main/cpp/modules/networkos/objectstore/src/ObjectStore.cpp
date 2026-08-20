@@ -4,6 +4,7 @@
 
 #include "sqlite3_dyn.h"
 
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -140,6 +141,7 @@ bool ObjectStore::open(const Options& options) {
         "  origin_header_blob BLOB,"
         "  origin_signature BLOB,"
         "  forwarding_header_blob BLOB,"
+        "  envelope_blob BLOB,"
         "  state INTEGER NOT NULL DEFAULT 0,"
         "  lease_expires_at_ms INTEGER,"
         "  replica_hint INTEGER);",
@@ -160,6 +162,25 @@ bool ObjectStore::open(const Options& options) {
         "  object_id TEXT PRIMARY KEY,"
         "  terminal_state INTEGER NOT NULL,"
         "  created_at_ms INTEGER NOT NULL);",
+        // Phase 4 (schema v2): signed replica leases (master doc §11).
+        // - sender rows: carrier_id = a carrier holding OUR object
+        // - carrier rows: carrier_id = our own promise to hold the object
+        "CREATE TABLE IF NOT EXISTS leases("
+        "  object_id TEXT NOT NULL,"
+        "  carrier_id TEXT NOT NULL,"
+        "  accepted_until_ms INTEGER NOT NULL,"
+        "  storage_class INTEGER NOT NULL,"
+        "  lease_signature BLOB,"
+        "  carrier_pk_hex TEXT,"
+        "  PRIMARY KEY(object_id, carrier_id));",
+        "CREATE INDEX IF NOT EXISTS idx_leases_until ON leases(accepted_until_ms);",
+        // EVICTED_EARLY record (§27): carrier evicted a copy while its lease
+        // was still live; Phase 7 repair reads this to re-replicate.
+        "CREATE TABLE IF NOT EXISTS evicted_early("
+        "  object_id TEXT NOT NULL,"
+        "  carrier_id TEXT NOT NULL,"
+        "  evicted_at_ms INTEGER NOT NULL,"
+        "  lease_was_until_ms INTEGER NOT NULL);",
     };
     for (const char* sql : kSchema) {
         if (!m_impl->exec(sql)) { m_impl->teardown(); return false; }
@@ -171,7 +192,32 @@ bool ObjectStore::open(const Options& options) {
         int current = 0;
         if (st.ok() && st.step() == SQLITE_ROW) current = st.col_int(0);
         if (current > kSchemaVersion) { m_impl->teardown(); return false; }  // future DB
-        if (current == 0) m_impl->exec("INSERT INTO schema_version(version) VALUES (1);");
+        if (current == 0) {
+            m_impl->exec("INSERT INTO schema_version(version) VALUES (2);");
+        } else if (current < kSchemaVersion) {
+            // Migration v1 -> v2: Phase 4 tables (leases, evicted_early —
+            // already created by the idempotent CREATEs above) plus the
+            // envelope_blob column on objects.
+            bool has_envelope_col = false;
+            {
+                Impl::Stmt info(m_impl->sqlite, m_impl->db,
+                                "PRAGMA table_info(objects);");
+                if (info.ok()) {
+                    while (info.step() == SQLITE_ROW) {
+                        if (info.col_text(1) == "envelope_blob") has_envelope_col = true;
+                    }
+                }
+            }
+            if (!has_envelope_col &&
+                !m_impl->exec("ALTER TABLE objects ADD COLUMN envelope_blob BLOB;")) {
+                m_impl->teardown();
+                return false;
+            }
+            if (!m_impl->exec("UPDATE schema_version SET version=2;")) {
+                m_impl->teardown();
+                return false;
+            }
+        }
     }
 
     m_open = true;
@@ -249,6 +295,24 @@ bool usage_sub_locked(ObjectStore::Impl& impl, const std::string& ns,
     return st.step() == SQLITE_DONE;
 }
 
+// Phase 4: upsert a signed lease row (must run inside the object's insert
+// transaction on the carrier path; standalone on the sender path).
+bool insertLeaseLocked(ObjectStore::Impl& impl, const std::string& object_id_hex,
+                       const ObjectStore::LeaseInfo& lease) {
+    ObjectStore::Impl::Stmt st(impl.sqlite, impl.db,
+        "INSERT OR REPLACE INTO leases(object_id, carrier_id, accepted_until_ms,"
+        " storage_class, lease_signature, carrier_pk_hex)"
+        " VALUES(?1,?2,?3,?4,?5,?6);");
+    if (!st.ok()) return false;
+    st.bind_text(1, object_id_hex);
+    st.bind_text(2, lease.carrier_id);
+    st.bind_int64(3, lease.accepted_until_ms);
+    st.bind_int64(4, lease.storage_class);
+    st.bind_text(5, lease.signature);
+    st.bind_text(6, lease.carrier_id_hex);
+    return st.step() == SQLITE_DONE;
+}
+
 } // namespace
 
 Result ObjectStore::put(const ObjectMeta& meta, std::string_view payload) {
@@ -258,6 +322,24 @@ Result ObjectStore::put(const ObjectMeta& meta, std::string_view payload) {
 
 Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payload,
                                    Outcome& out) {
+    return putInternal(meta, payload, nullptr, out);
+}
+
+Result ObjectStore::putWithLease(const ObjectMeta& meta, std::string_view payload,
+                                 const LeaseInfo& lease, Outcome& out) {
+    if (lease.carrier_id.empty()) {
+        out = Outcome::RejectedPolicy;
+        return Result::kInvalidArg;
+    }
+    if (!lease.object_id_hex.empty() && lease.object_id_hex != meta.id.toHex()) {
+        out = Outcome::RejectedPolicy;
+        return Result::kInvalidArg;
+    }
+    return putInternal(meta, payload, &lease, out);
+}
+
+Result ObjectStore::putInternal(const ObjectMeta& meta, std::string_view payload,
+                                const LeaseInfo* lease, Outcome& out) {
     std::lock_guard<std::mutex> lock(m_impl->mu);
     if (!m_open) return Result::kInvalidState;
     if (meta.id.empty()) { out = Outcome::RejectedPolicy; return Result::kInvalidArg; }
@@ -275,6 +357,32 @@ Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payl
         if (st.ok()) {
             st.bind_text(1, id);
             if (st.step() == SQLITE_ROW) {
+                // Idempotent duplicate. The carrier path still records the
+                // (possibly refreshed) lease so a post-commit re-send is
+                // answered with a fresh STORED_ACK — never a second copy.
+                if (lease) {
+                    if (!m_impl->exec("BEGIN IMMEDIATE;")) {
+                        out = Outcome::Busy;
+                        return Result::kBusy;
+                    }
+                    if (!insertLeaseLocked(*m_impl, id, *lease)) {
+                        m_impl->exec("ROLLBACK;");
+                        out = Outcome::Unsupported;
+                        return Result::kIo;
+                    }
+                    Impl::Stmt up(m_impl->sqlite, m_impl->db,
+                        "UPDATE objects SET lease_expires_at_ms=?1 WHERE object_id=?2;");
+                    if (up.ok()) {
+                        up.bind_int64(1, lease->accepted_until_ms);
+                        up.bind_text(2, id);
+                        up.step();
+                    }
+                    if (!m_impl->exec("COMMIT;")) {
+                        m_impl->exec("ROLLBACK;");
+                        out = Outcome::RetryAfter;
+                        return Result::kIo;
+                    }
+                }
                 out = Outcome::Accepted;   // idempotent duplicate
                 return Result::kOk;
             }
@@ -323,8 +431,8 @@ Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payl
         "INSERT INTO objects(object_id, namespace_id, origin, destination, object_type,"
         " created_at_ms, ttl_ms, expires_at_ms, priority, payload_size, payload_hash,"
         " payload_blob, origin_header_blob, origin_signature, forwarding_header_blob,"
-        " state, lease_expires_at_ms, replica_hint)"
-        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18);");
+        " envelope_blob, state, lease_expires_at_ms, replica_hint)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19);");
     if (!ins.ok()) {
         m_impl->exec("ROLLBACK;");
         out = Outcome::Unsupported;
@@ -345,9 +453,12 @@ Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payl
     ins.bind_text(13, meta.origin_header_blob);
     ins.bind_text(14, meta.origin_signature);
     ins.bind_text(15, meta.forwarding_header_blob);
-    ins.bind_int(16, static_cast<int>(meta.status));
-    ins.bind_int64(17, meta.lease_expires_at_ms);
-    ins.bind_int64(18, meta.replica_hint);
+    ins.bind_text(16, meta.envelope_blob);
+    ins.bind_int(17, static_cast<int>(meta.status));
+    // The carrier-side path records the lease's expiry as the object's lease
+    // expiry (accepted_until); the sender path uses its own meta hint.
+    ins.bind_int64(18, lease ? lease->accepted_until_ms : meta.lease_expires_at_ms);
+    ins.bind_int64(19, meta.replica_hint);
     if (ins.step() != SQLITE_DONE) {
         m_impl->exec("ROLLBACK;");
         out = Outcome::Unsupported;
@@ -368,6 +479,16 @@ Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payl
 
     {  // Increment the usage counter (same transaction — cannot drift).
         if (!usage_add_locked(*m_impl, meta.namespace_id, meta.origin, added_bytes)) {
+            m_impl->exec("ROLLBACK;");
+            out = Outcome::Unsupported;
+            return Result::kIo;
+        }
+    }
+
+    // Carrier-side: the signed lease is committed in the SAME transaction as
+    // the object (invariant 2: never ACK before this COMMIT succeeds).
+    if (lease) {
+        if (!insertLeaseLocked(*m_impl, id, *lease)) {
             m_impl->exec("ROLLBACK;");
             out = Outcome::Unsupported;
             return Result::kIo;
@@ -405,6 +526,123 @@ Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payl
     return Result::kOk;
 }
 
+Result ObjectStore::recordLease(const ObjectId& id, const LeaseInfo& lease) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    const std::string id_hex = id.toHex();
+    if (!m_impl->exec("BEGIN IMMEDIATE;")) return Result::kBusy;
+    if (!insertLeaseLocked(*m_impl, id_hex, lease)) {
+        m_impl->exec("ROLLBACK;");
+        return Result::kIo;
+    }
+    Impl::Stmt up(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET lease_expires_at_ms=?1 WHERE object_id=?2;");
+    if (up.ok()) {
+        up.bind_int64(1, lease.accepted_until_ms);
+        up.bind_text(2, id_hex);
+        up.step();
+    }
+    if (!m_impl->exec("COMMIT;")) {
+        m_impl->exec("ROLLBACK;");
+        return Result::kIo;
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::getLeases(const ObjectId& id, std::vector<LeaseInfo>& out) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    out.clear();
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT carrier_id, accepted_until_ms, storage_class, lease_signature,"
+        " carrier_pk_hex FROM leases WHERE object_id=?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, id.toHex());
+    while (st.step() == SQLITE_ROW) {
+        LeaseInfo l;
+        l.object_id_hex = id.toHex();
+        l.carrier_id = st.col_text(0);
+        l.accepted_until_ms = st.col_int64(1);
+        l.storage_class = st.col_int64(2);
+        l.signature = st.col_text(3);
+        l.carrier_id_hex = st.col_text(4);
+        out.push_back(std::move(l));
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::updateObjectState(const ObjectId& id, ObjectStatus status) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET state=?1 WHERE object_id=?2;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, static_cast<int>(status));
+    st.bind_text(2, id.toHex());
+    if (st.step() != SQLITE_DONE) return Result::kIo;
+    // Terminal states also refresh the dedup record (compact, §65).
+    if (status == ObjectStatus::kDurabilityReached) {
+        Impl::Stmt d(m_impl->sqlite, m_impl->db,
+            "UPDATE dedup SET terminal_state=5 WHERE object_id=?1;");
+        if (d.ok()) {
+            d.bind_text(1, id.toHex());
+            d.step();
+        }
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::forEachExpiringLease(
+    int64_t before_ms, const std::function<Result(const LeaseInfo&)>& fn) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT object_id, carrier_id, accepted_until_ms, storage_class,"
+        " lease_signature, carrier_pk_hex FROM leases"
+        " WHERE accepted_until_ms <= ?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int64(1, before_ms);
+    while (st.step() == SQLITE_ROW) {
+        LeaseInfo l;
+        l.object_id_hex = st.col_text(0);
+        l.carrier_id = st.col_text(1);
+        l.accepted_until_ms = st.col_int64(2);
+        l.storage_class = st.col_int64(3);
+        l.signature = st.col_text(4);
+        l.carrier_id_hex = st.col_text(5);
+        const Result rc = fn(l);
+        if (rc != Result::kOk) return rc;
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::markEvictedEarly(const ObjectId& id, const std::string& carrier_id,
+                                     int64_t lease_was_until_ms) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "INSERT INTO evicted_early(object_id, carrier_id, evicted_at_ms,"
+        " lease_was_until_ms) VALUES(?1,?2,?3,?4);");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, id.toHex());
+    st.bind_text(2, carrier_id);
+    st.bind_int64(3,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    st.bind_int64(4, lease_was_until_ms);
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+uint64_t ObjectStore::evictedEarlyCount() const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return 0;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db, "SELECT COUNT(*) FROM evicted_early;");
+    if (st.ok() && st.step() == SQLITE_ROW) {
+        return static_cast<uint64_t>(st.col_int64(0));
+    }
+    return 0;
+}
+
 Result ObjectStore::getMeta(const ObjectId& id, ObjectMeta& meta_out) const {
     std::lock_guard<std::mutex> lock(m_impl->mu);
     if (!m_open) return Result::kInvalidState;
@@ -412,7 +650,7 @@ Result ObjectStore::getMeta(const ObjectId& id, ObjectMeta& meta_out) const {
         "SELECT namespace_id, origin, destination, object_type, created_at_ms,"
         " ttl_ms, expires_at_ms, priority, payload_size, payload_hash,"
         " origin_header_blob, origin_signature, forwarding_header_blob,"
-        " state, lease_expires_at_ms, replica_hint FROM objects"
+        " envelope_blob, state, lease_expires_at_ms, replica_hint FROM objects"
         " WHERE object_id=?1;");
     if (!st.ok()) return Result::kIo;
     st.bind_text(1, id.toHex());
@@ -430,9 +668,10 @@ Result ObjectStore::getMeta(const ObjectId& id, ObjectMeta& meta_out) const {
     meta_out.origin_header_blob = st.col_text(10);
     meta_out.origin_signature = st.col_text(11);
     meta_out.forwarding_header_blob = st.col_text(12);
-    meta_out.status = static_cast<ObjectStatus>(st.col_int(13));
-    meta_out.lease_expires_at_ms = st.col_int64(14);
-    meta_out.replica_hint = st.col_int64(15);
+    meta_out.envelope_blob = st.col_text(13);
+    meta_out.status = static_cast<ObjectStatus>(st.col_int(14));
+    meta_out.lease_expires_at_ms = st.col_int64(15);
+    meta_out.replica_hint = st.col_int64(16);
     return Result::kOk;
 }
 
@@ -444,7 +683,7 @@ Result ObjectStore::get(const ObjectId& id, ObjectMeta& meta_out,
         "SELECT namespace_id, origin, destination, object_type, created_at_ms,"
         " ttl_ms, expires_at_ms, priority, payload_size, payload_hash,"
         " origin_header_blob, origin_signature, forwarding_header_blob,"
-        " state, lease_expires_at_ms, replica_hint, payload_blob FROM objects"
+        " envelope_blob, state, lease_expires_at_ms, replica_hint, payload_blob FROM objects"
         " WHERE object_id=?1;");
     if (!st.ok()) return Result::kIo;
     st.bind_text(1, id.toHex());
@@ -462,10 +701,11 @@ Result ObjectStore::get(const ObjectId& id, ObjectMeta& meta_out,
     meta_out.origin_header_blob = st.col_text(10);
     meta_out.origin_signature = st.col_text(11);
     meta_out.forwarding_header_blob = st.col_text(12);
-    meta_out.status = static_cast<ObjectStatus>(st.col_int(13));
-    meta_out.lease_expires_at_ms = st.col_int64(14);
-    meta_out.replica_hint = st.col_int64(15);
-    payload_out = st.col_text(16);
+    meta_out.envelope_blob = st.col_text(13);
+    meta_out.status = static_cast<ObjectStatus>(st.col_int(14));
+    meta_out.lease_expires_at_ms = st.col_int64(15);
+    meta_out.replica_hint = st.col_int64(16);
+    payload_out = st.col_text(17);
     return Result::kOk;
 }
 
@@ -623,7 +863,7 @@ Result ObjectStore::evictForQuota(const std::string& namespace_id,
     while (released < need_bytes) {
         // §27 score: expired first, then lowest priority, then oldest expiry.
         Impl::Stmt v(m_impl->sqlite, m_impl->db,
-            "SELECT object_id, payload_size FROM objects"
+            "SELECT object_id, payload_size, lease_expires_at_ms FROM objects"
             " WHERE namespace_id=?1 AND origin=?2"
             " ORDER BY (expires_at_ms <= strftime('%s','now')*1000) DESC,"
             " priority ASC, expires_at_ms ASC LIMIT 1;");
@@ -633,6 +873,26 @@ Result ObjectStore::evictForQuota(const std::string& namespace_id,
         if (v.step() != SQLITE_ROW) break;
         const std::string victim = v.col_text(0);
         const int64_t victim_size = v.col_int64(1);
+        const int64_t lease_until = v.col_int64(2);
+        // EVICTED_EARLY (§27): evicting a copy whose lease is still live must
+        // be recorded so Phase 7 repair can re-replicate before accepted_until.
+        if (lease_until > 0 &&
+            lease_until >= std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count()) {
+            Impl::Stmt ev(m_impl->sqlite, m_impl->db,
+                "INSERT INTO evicted_early(object_id, carrier_id, evicted_at_ms,"
+                " lease_was_until_ms) VALUES(?1,?2,?3,?4);");
+            if (ev.ok()) {
+                ev.bind_text(1, victim);
+                ev.bind_text(2, origin);   // carrier_id is the local peer id
+                ev.bind_int64(3, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count());
+                ev.bind_int64(4, lease_until);
+                ev.step();
+            }
+        }
         Impl::Stmt del(m_impl->sqlite, m_impl->db,
                        "DELETE FROM objects WHERE object_id=?1;");
         if (!del.ok()) { m_impl->exec("ROLLBACK;"); return Result::kIo; }

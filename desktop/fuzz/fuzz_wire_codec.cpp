@@ -13,6 +13,7 @@
 #include "wire_codec.h"
 #include "message_types.h"
 #include "networkos/object/envelope.h"
+#include "networkos/handoff/handoff_frames.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -41,6 +42,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     if (networkos::obj::deserialize(std::string(sv), obj)) {
         // If it parsed, round-trip it back through the encoder.
         (void)networkos::obj::serialize(obj);
+    }
+
+    // Phase 4: feed the raw bytes into every handoff frame decoder. Must
+    // never crash/hang on arbitrary input (lengths validated pre-allocation).
+    {
+        networkos::handoff::OfferFrame of;
+        (void)networkos::handoff::decode_offer(std::string(sv), of);
+        networkos::handoff::AcceptFrame af;
+        (void)networkos::handoff::decode_accept(std::string(sv), af);
+        networkos::handoff::RejectFrame rf;
+        (void)networkos::handoff::decode_reject(std::string(sv), rf);
+        networkos::handoff::DataFrame df;
+        (void)networkos::handoff::decode_data(std::string(sv), df);
+        networkos::handoff::StoredAckFrame sa;
+        (void)networkos::handoff::decode_stored_ack(std::string(sv), sa);
     }
 
     return 0;

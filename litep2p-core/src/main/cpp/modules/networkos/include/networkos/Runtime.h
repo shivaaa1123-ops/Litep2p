@@ -18,6 +18,8 @@ namespace networkos {
 class SessionFacade;   // declared in networkos/session/SessionFacade.h
 class ObjectStore;     // declared in networkos/objectstore/ObjectStore.h
 
+namespace handoff { class HandoffManager; }  // declared in networkos/handoff/HandoffManager.h
+
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
 // ---------------------------------------------------------------------------
@@ -168,6 +170,11 @@ public:
     // Phase 3: durable object store owned by the runtime (SQLite/WAL).
     // Default: none (runtimes without files_dir / without SQLite).
     virtual ObjectStore* objectStore() { return nullptr; }
+
+    // Phase 4: two-phase durable handoff manager owned by the runtime
+    // (signed replica leases). Valid only while running and only when the
+    // object store is present. Default: none.
+    virtual handoff::HandoffManager* handoff() { return nullptr; }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).

@@ -28,6 +28,9 @@ enum class ObjectStatus : uint8_t {
     kStored,           // committed
     kRejected,         // policy/quota/validation rejection
     kExpired,
+    // Phase 4: two-phase durable handoff states (master doc §22/§93 inv. 4).
+    kRemoteAccepted = 4,    // a carrier accepted and is storing/transferring
+    kDurabilityReached = 5, // >=1 validated signed lease persisted (target met)
 };
 
 struct ObjectMeta {
@@ -46,6 +49,11 @@ struct ObjectMeta {
     std::string origin_header_blob;        // serialized origin header (envelope)
     std::string origin_signature;          // Ed25519 signature
     std::string forwarding_header_blob;    // serialized forwarding header
+    // Phase 4: the full serialized, origin-signed obj::NetworkObject envelope
+    // (origin + forwarding headers + payload + signature + recipient keys).
+    // Persisted so the sender can re-transfer OBJECT_DATA after a crash, and
+    // the carrier can forward on delivery (Phase 5).
+    std::string envelope_blob;
     int64_t lease_expires_at_ms{0};
     int64_t replica_hint{0};
 };

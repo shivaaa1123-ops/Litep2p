@@ -121,6 +121,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/session/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/object/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/objectstore/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/handoff/include
 )
 
 if(ENABLE_PROXY_MODULE)
@@ -342,6 +343,8 @@ set(NETWORKOS_SOURCES
     "modules/networkos/object/src/envelope.cpp"
     "modules/networkos/object/src/e2e.cpp"
     "modules/networkos/objectstore/src/ObjectStore.cpp"
+    "modules/networkos/handoff/src/handoff_frames.cpp"
+    "modules/networkos/handoff/src/HandoffManager.cpp"
 )
 add_library(litep2p_networkos STATIC ${NETWORKOS_SOURCES})
 target_link_libraries(litep2p_networkos litep2p_corep2p litep2p_session)

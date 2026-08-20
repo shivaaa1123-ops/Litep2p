@@ -27,7 +27,7 @@ namespace networkos {
 
 class ObjectStore : public IObjectStore {
 public:
-    static constexpr int kSchemaVersion = 1;
+    static constexpr int kSchemaVersion = 2;
 
     struct Options {
         std::string path;                          // sqlite file path
@@ -89,6 +89,48 @@ public:
     bool contains(const ObjectId& id) const;
     bool isDuplicate(const ObjectId& id) const;
 
+    // ---- Phase 4: confirmed remote storage + replica leases ----------------
+    // A signed storage lease (master doc §11). The signature is the carrier's
+    // Ed25519 signature over canonical_lease_bytes (see handoff module).
+    struct LeaseInfo {
+        std::string object_id_hex;
+        std::string carrier_id;
+        int64_t accepted_until_ms{0};
+        int64_t storage_class{0};
+        std::string signature;      // carrier Ed25519 (64 bytes raw)
+        std::string carrier_id_hex; // optional carrier public key hex (audit)
+    };
+
+    // Carrier-side atomic accept: object + dedup + usage + lease row committed
+    // in ONE transaction. Returns kOk only after COMMIT — never ACK before this
+    // returns (invariant 2). Idempotent: a duplicate object refreshes the lease
+    // row without a second copy (§65/§29).
+    Result putWithLease(const ObjectMeta& meta, std::string_view payload,
+                        const LeaseInfo& lease, Outcome& out);
+
+    // Sender-side: record a validated remote lease for an object we hold and
+    // bump the object's lease_expires_at_ms. Idempotent upsert.
+    Result recordLease(const ObjectId& id, const LeaseInfo& lease);
+
+    // All leases for an object (sender: carriers holding our object; carrier:
+    // our own promises). Empty vector when none.
+    Result getLeases(const ObjectId& id, std::vector<LeaseInfo>& out) const;
+
+    // Object status transition (handoff state machine; replay after crash
+    // converges — §93 invariant 4).
+    Result updateObjectState(const ObjectId& id, ObjectStatus status);
+
+    // Lease-expiry sweep: yields every lease whose accepted_until_ms is at or
+    // before `before_ms` (event-triggered; the Phase 7 planner hooks this).
+    Result forEachExpiringLease(
+        int64_t before_ms, const std::function<Result(const LeaseInfo&)>& fn) const;
+
+    // Record that a carrier-eviction happened while a lease was still live
+    // (EVICTED_EARLY, §27) so Phase 7 repair can re-replicate.
+    Result markEvictedEarly(const ObjectId& id, const std::string& carrier_id,
+                            int64_t lease_was_until_ms);
+    uint64_t evictedEarlyCount() const;
+
     // Remove all objects expired at or before now_ms. Returns count removed.
     Result purgeExpired(int64_t now_ms, uint64_t* removed = nullptr);
 
@@ -111,6 +153,12 @@ public:
     struct Impl;
 
 private:
+    // Shared put implementation. `lease` != nullptr selects the carrier-side
+    // atomic path (object + dedup + usage + lease in ONE transaction). The
+    // mutex is taken inside.
+    Result putInternal(const ObjectMeta& meta, std::string_view payload,
+                       const LeaseInfo* lease, Outcome& out);
+
     std::unique_ptr<Impl> m_impl;
     Options m_options;
     bool m_open{false};

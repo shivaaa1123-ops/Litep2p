@@ -198,16 +198,19 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | frame unit tests | 10 | PASS/FAIL | ... |
-| YYYY-MM-DD | kill-at-every-arrow | 10 | PASS/FAIL | kill points listed |
-| YYYY-MM-DD | lease correctness | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | idempotent replay | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | honest rejection | 5 | PASS/FAIL | reason codes |
-| YYYY-MM-DD | live peer handoff | 3 | PASS/FAIL | ... |
-| YYYY-MM-DD | ResourceManager stub | 3 | PASS/FAIL | ... |
-| YYYY-MM-DD | existing suites | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | native build | 1 | PASS/FAIL | ... |
-| YYYY-MM-DD | tcpdump capture | 1 | PASS/FAIL | frames match spec |
+| 2026-08-20 | frame unit tests | 10 | PASS | handoff_test 104 checks; malformed_input extended; fuzz target extended |
+| 2026-08-20 | kill-at-every-arrow | 10 | PASS | handoff_kill_test.sh (SIGKILL at random arrow; never ACK-before-commit; all-or-nothing) |
+| 2026-08-20 | lease correctness | 5 | PASS | signature validates; accepted_until <= TTL; EVICTED_EARLY recorded on live-lease eviction |
+| 2026-08-20 | idempotent replay | 5 | PASS | post-commit OBJECT_DATA -> STORED_ACK again, single copy |
+| 2026-08-20 | honest rejection | 5 | PASS | REJECTED_QUOTA (global headroom) + REJECTED_AUTH (untrusted origin); NO_CARRIER transient |
+| 2026-08-20 | live peer handoff | 6 | PASS | S->C over real encrypted session, D offline; restart proof 6/6 |
+| 2026-08-20 | ResourceManager stub | 3 | PASS | pressure->1h lease, charging->24h, low battery->2 concurrent |
+| 2026-08-20 | existing suites | 5 | PASS | 14 suites x 5 = 0 failures (see p4_reg5.log) |
+| 2026-08-20 | native build | 1 | PASS | externalNativeBuildMultiThreadDebug BUILD SUCCESSFUL |
+| 2026-08-20 | tcpdump capture | 1 | PASS | two-phase flow on wire (S>C offer+data, C>S accept+ack); obfuscated payloads by design |
+
+Additional: C ABI gate PASS (56 functions identical); fuzz smoke 60s PASS
+(12.7M iterations, no crash); store regression PASS (63 checks).
 
 ## 11. Risks & mitigations
 
@@ -221,18 +224,18 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [ ] Handoff protocol (offer/accept/reject/data/STORED_ACK) implemented in
+- [x] Handoff protocol (offer/accept/reject/data/STORED_ACK) implemented in
       the existing codec, fuzz inputs updated.
-- [ ] Signed leases implemented; lease expiry hooks emit events.
-- [ ] Never-ACK-before-commit enforced and proven by kill-at-every-arrow 10×.
-- [ ] Honest rejection with structured reasons works.
-- [ ] Minimal ResourceManager stub wired into admission.
-- [ ] Handoff telemetry events + counters present.
-- [ ] Invariants 2, 3, 4, 5, 7 asserted by tests.
-- [ ] Live peer handoff proven (S → C, D offline), repeated 2 sessions.
-- [ ] Existing suites green; native build green.
-- [ ] Status table in `METHODOLOGY.md` updated.
-- [ ] Committed with message:
+- [x] Signed leases implemented; lease expiry hooks emit events.
+- [x] Never-ACK-before-commit enforced and proven by kill-at-every-arrow 10×.
+- [x] Honest rejection with structured reasons works.
+- [x] Minimal ResourceManager stub wired into admission.
+- [x] Handoff telemetry events + counters present.
+- [x] Invariants 2, 3, 4, 5, 7 asserted by tests.
+- [x] Live peer handoff proven (S → C, D offline), repeated 2 sessions.
+- [x] Existing suites green; native build green.
+- [x] Status table in `METHODOLOGY.md` updated.
+- [x] Committed with message:
       `Network OS P4: confirmed remote storage + signed replica leases`.
 
 

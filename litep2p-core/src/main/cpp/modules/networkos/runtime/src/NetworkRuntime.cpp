@@ -17,6 +17,7 @@
 #include "networkos/IScheduler.h"
 #include "networkos/ITransport.h"
 #include "networkos/objectstore/ObjectStore.h"
+#include "networkos/handoff/HandoffManager.h"
 #include "networkos/session/SessionFacade.h"
 
 #include "config_manager.h"
@@ -97,6 +98,9 @@ public:
                         if (p.connected) {
                             emit_(RuntimeEventType::kPeerState, "peer_ready", p.id, "");
                             if (m_session_facade) m_session_facade->onPeerState(p.id, "READY");
+                            // Phase 4: a new READY peer is a carrier
+                            // opportunity — re-offer queued objects.
+                            if (m_handoff) m_handoff->retryPending(now_ms());
                         } else {
                             emit_(RuntimeEventType::kPeerState, "peer_disconnected", p.id, "");
                             if (m_session_facade) m_session_facade->onPeerState(p.id, "DISCONNECTED");
@@ -130,6 +134,47 @@ public:
             }
         }
 
+        // Phase 4: the two-phase durable handoff manager. Wired over the live
+        // session (typed frames, encrypted channel) + the object store.
+        if (m_object_store) {
+            handoff::HandoffManager::Config hcfg;
+            hcfg.local_peer_id = m_peer_id;
+            hcfg.carrier_enabled = true;
+            m_handoff = std::make_unique<handoff::HandoffManager>(
+                m_object_store.get(), hcfg);
+            m_handoff->setSendFn(
+                [this](const std::string& peer_id, MessageType type,
+                       const std::string& payload) -> bool {
+                    return m_session && m_session->send_handoff_frame(
+                                            peer_id, type, payload);
+                });
+            m_handoff->setConnectedPeersFn(
+                [this]() -> std::vector<std::string> {
+                    if (!m_session) return {};
+                    return m_session->getConnectedPeerIds();
+                });
+            m_handoff->setSigningKeysFns(
+                [this]() -> std::pair<std::vector<uint8_t>,
+                                      std::vector<uint8_t>> {
+                    if (!m_session) return {};
+                    return m_session->get_local_signing_keys();
+                },
+                [this](const std::string& peer_id) -> std::vector<uint8_t> {
+                    if (!m_session) return {};
+                    return m_session->get_peer_signing_key(peer_id);
+                });
+            m_handoff->setEventFn(
+                [this](const std::string& kind, const std::string& payload) {
+                    emit_(RuntimeEventType::kDelivery, kind, "", payload);
+                });
+            // Incoming frames -> handoff state machine.
+            m_session->set_handoff_frame_handler(
+                [this](const std::string& peer_id, MessageType type,
+                       const std::string& payload) {
+                    if (m_handoff) m_handoff->onFrame(peer_id, type, payload);
+                });
+        }
+
         // 4. Durable state restore (peer DB bootstrap happens inside
         //    SessionManager::start; nothing extra to do in Phase 1).
         // 5. Notify scheduler.
@@ -158,9 +203,11 @@ public:
         m_state = RuntimeState::kStopping;
         emit_(RuntimeEventType::kLifecycle, "stopping", "", "");
         if (m_session) {
+            m_session->set_handoff_frame_handler(nullptr);
             m_session->stop();
             m_session.reset();
         }
+        m_handoff.reset();
         m_session_facade.reset();
         m_object_store.reset();
         m_state = RuntimeState::kStopped;
@@ -212,6 +259,10 @@ public:
     // running (and only when files_dir was configured). Returns nullptr when
     // stopped or when SQLite is unavailable.
     ObjectStore* objectStore() override { return m_object_store.get(); }
+
+    // Phase 4: the two-phase durable handoff manager. Valid while running and
+    // only when the object store is present.
+    handoff::HandoffManager* handoff() override { return m_handoff.get(); }
 
     Result sendMessage(const std::string& peer_id, const std::string& payload) override {
         if (!m_session) return Result::kInvalidState;
@@ -266,6 +317,7 @@ private:
     std::shared_ptr<SessionManager> m_session;
     std::unique_ptr<SessionFacade> m_session_facade;
     std::unique_ptr<ObjectStore> m_object_store;
+    std::unique_ptr<handoff::HandoffManager> m_handoff;
 
     mutable std::mutex m_life_mu;
     mutable std::mutex m_cb_mu;

@@ -281,6 +281,8 @@ set(NETWORKOS_SOURCES
     ../litep2p-core/src/main/cpp/modules/networkos/object/src/envelope.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/object/src/e2e.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/objectstore/src/ObjectStore.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/handoff/src/handoff_frames.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/handoff/src/HandoffManager.cpp
 )
 
 set(ENGINE_SOURCES
@@ -335,6 +337,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/networkos/session/include
     ../litep2p-core/src/main/cpp/modules/networkos/object/include
     ../litep2p-core/src/main/cpp/modules/networkos/objectstore/include
+    ../litep2p-core/src/main/cpp/modules/networkos/handoff/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -526,6 +529,10 @@ add_executable(object_store_test tests/object_store_test.cpp)
 target_include_directories(object_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(object_store_test PRIVATE litep2p_engine)
 
+add_executable(handoff_test tests/handoff_test.cpp)
+target_include_directories(handoff_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(handoff_test PRIVATE litep2p_engine)
+
 # Network OS Phase 3 crash-consistency probe (driven by object_store_kill_test.sh).
 add_executable(object_store_kill_probe tools/object_store_kill_probe.cpp)
 target_include_directories(object_store_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -542,6 +549,16 @@ target_link_libraries(envelope_fuzz_smoke PRIVATE litep2p_engine)
 add_executable(store_bench tools/store_bench.cpp)
 target_include_directories(store_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(store_bench PRIVATE litep2p_engine)
+
+# Phase 4 SIGKILL harness probe (carrier-side handoff with durability markers).
+add_executable(handoff_kill_probe tools/handoff_kill_probe.cpp)
+target_include_directories(handoff_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(handoff_kill_probe PRIVATE litep2p_engine)
+
+# Phase 4 live two-peer handoff tool (real session over loopback).
+add_executable(handoff_live tools/handoff_live.cpp)
+target_include_directories(handoff_live PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(handoff_live PRIVATE litep2p_engine)
 
 # Network OS Phase 1 SIGKILL restore probe (driven by sigkill_restore_test.sh).
 add_executable(network_runtime_kill_probe tools/network_runtime_kill_probe.cpp)

@@ -17,6 +17,7 @@
 #include "discovery.h"
 #include "config_manager.h"
 #include "noise_nk.h"
+#include "networkos/handoff/handoff_frames.h"
 
 #include <cstdint>
 #include <iostream>
@@ -226,11 +227,49 @@ bool test_noise_handshake() {
 
 } // namespace
 
+bool test_handoff_frames() {
+    std::cout << "Testing Phase 4 handoff frame decoder robustness..." << std::endl;
+    bool any_threw = false;
+    // Malformed corpus: truncated, oversized-length, garbage, valid-prefix
+    // + junk. Every decoder must reject without throwing.
+    const std::vector<std::string> corpus = {
+        "",
+        "A",
+        "aabbcc",                                    // valid id, nothing else
+        std::string(600, 'a') + "\x00\x00\x00\x01x", // id at bound, trailing
+        std::string(601, 'a'),                       // id over bound
+        std::string("aabbcc") + "\xff\xff\xff\xff",  // 4 GiB length field
+        std::string(64, '\xff'),
+        std::string(1024, '\x00'),
+    };
+    for (const auto& raw : corpus) {
+        try {
+            networkos::handoff::OfferFrame of;
+            (void)networkos::handoff::decode_offer(raw, of);
+            networkos::handoff::AcceptFrame af;
+            (void)networkos::handoff::decode_accept(raw, af);
+            networkos::handoff::RejectFrame rf;
+            (void)networkos::handoff::decode_reject(raw, rf);
+            networkos::handoff::DataFrame df;
+            (void)networkos::handoff::decode_data(raw, df);
+            networkos::handoff::StoredAckFrame sa;
+            (void)networkos::handoff::decode_stored_ack(raw, sa);
+        } catch (...) {
+            any_threw = true;
+            std::cerr << "  handoff frame decode threw for input size=" << raw.size() << std::endl;
+        }
+    }
+    TEST_ASSERT(!any_threw, "handoff frame decoders must never throw");
+    std::cout << "Handoff frame decoder robustness Passed!" << std::endl;
+    return !any_threw;
+}
+
 int main() {
     bool ok = true;
     ok &= test_wire_codec();
     ok &= test_discovery_parser();
     ok &= test_noise_handshake();
+    ok &= test_handoff_frames();
     std::cout << (tests_failed == 0 ? "\nALL MALFORMED-INPUT TESTS PASSED\n"
                                     : "\nSOME TESTS FAILED\n");
     return tests_failed == 0 ? 0 : 1;
