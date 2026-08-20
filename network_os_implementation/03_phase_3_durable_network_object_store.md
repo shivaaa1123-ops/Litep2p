@@ -227,6 +227,8 @@ Run in this order; record every run in §10.
 | 2026-08-20 | existing suites | 5 | PASS | `run_all_tests.sh 5` = 13 suites × 5 = 0 failures (added object_envelope_test, object_store_test) |
 | 2026-08-20 | native build | 1 | PASS | `:litep2p-core:externalNativeBuildMultiThreadDebug` SUCCESSFUL (1m44s); C ABI check 56 functions identical |
 | 2026-08-20 | fuzz | 1 | PASS | libFuzzer runtime absent on Apple clang 12 (documented); TU compiles clean; `envelope_fuzz_smoke --seconds 60`: 9,833,167 iterations (≈2.0M parsed), no crash; fuzz_wire_codec extended with envelope input |
+| 2026-08-20 | RE-VALIDATION audit | 1 | PASS | Full code audit of every Step 3.1–3.12 vs implementation; live two-node smoke 6/6 rc=0; performance measured. Found + fixed: (1) `open()` self-deadlock on failure paths (called `close()` while holding the non-recursive mutex — triggered by corrupt/future-schema DBs); (2) O(N²) quota + dedup scans on every insert (global `SUM(payload_size)` over `objects` + `COUNT(*) FROM dedup`) — replaced with an incremental `usage` table + amortized dedup prune. Added tests: corruption-open rejection, forward-migration rejection, usage-accounting consistency (store suite 43 → 63 checks) |
+| 2026-08-20 | store perf (store_bench) | 2 | PASS | before: 10k/512B put 248 obj/s (O(N²)); after: 10k/512B put 3,734 obj/s, get 42,017 obj/s, cold open 28 ms, size 194%; 100k/64B put 4,263 obj/s, get 38,565 obj/s, cold open 176 ms, size 792% (tiny-payload row overhead) |
 
 ## 11. Risks & mitigations
 
@@ -248,6 +250,11 @@ Run in this order; record every run in §10.
       (`ObjectStore` on `sqlite3_dyn`, WAL, `synchronous=NORMAL`, crash-safe
       open, forward-migration guard).
 - [x] All §9 verification items green at required repetitions (§10 log).
+- [x] Re-validation passed: full code audit of Steps 3.1–3.12; two defects found
+      in audit and fixed with regression tests (open()-self-deadlock on corrupt/
+      future-schema DBs; O(N²) quota/dedup scans — now O(1)-ish via incremental
+      `usage` table + amortized prune). Store suite 63 checks; live two-node
+      smoke 6/6; performance: 10k put 3,734 obj/s / get 42k obj/s / open 28 ms.
 - [x] Invariants 2, 6, 8, 9, 10, 16 asserted by tests (never ACK before
       commit — SIGKILL harness; dedup-before-work; quota-in-transaction;
       bounded memory; namespace isolation; signed-origin + tamper detect).

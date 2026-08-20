@@ -5,9 +5,12 @@
 // crash-consistency semantics (transactional rollback), schema versioning.
 
 #include "networkos/objectstore/ObjectStore.h"
+#include "sqlite3_dyn.h"
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -219,6 +222,129 @@ int main() {
         store.close();
     }
     std::cout << "memory bounds / batch ok\n";
+
+    // --- 8. Crash-safe open (§25): corrupt DB must FAIL to open -------------
+    {
+        const std::string path = db_path("corrupt");
+        {
+            networkos::ObjectStore store;
+            networkos::ObjectStore::Options opt;
+            opt.path = path;
+            TEST_ASSERT(store.open(opt), "store opens (setup)");
+            auto m = make_meta("c1", "chat", "peer-a", NOW, 3600000);
+            networkos::ObjectStore::Outcome oc;
+            store.putWithOutcome(m, "corrupt-me", oc);
+            store.commit();
+            store.close();  // close checkpoints WAL into the main file
+        }
+        // Corrupt a page-STRUCTURE byte (offset 100 = page 2's page-type byte).
+        // quick_check validates page structure (not content bytes), so this is
+        // reliably detected as non-"ok" — unlike a content-byte flip.
+        {
+            std::error_code ec;
+            std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+            TEST_ASSERT(f.is_open(), "corrupt db file opened for writing");
+            f.seekg(0, std::ios::end);
+            const std::streampos sz = f.tellg();
+            TEST_ASSERT(sz > 512, "db file has real size");
+            f.seekp(100, std::ios::beg);   // page 2 header: first byte = page type
+            char flip = 0;
+            f.read(&flip, 1);
+            flip ^= 0x5A;                  // turn a valid page type into garbage
+            f.seekp(100, std::ios::beg);
+            f.write(&flip, 1);
+            f.close();
+        }
+        networkos::ObjectStore store;
+        networkos::ObjectStore::Options opt;
+        opt.path = path;
+        TEST_ASSERT(!store.open(opt), "corrupt DB refused on open (quick_check)");
+        TEST_ASSERT(!store.is_open(), "store not open after corrupt open");
+    }
+    std::cout << "corruption-open rejection ok\n";
+
+    // --- 9. Forward migration: a future schema version must be rejected -----
+    {
+        const std::string path = db_path("futureschema");
+        {
+            networkos::ObjectStore store;
+            networkos::ObjectStore::Options opt;
+            opt.path = path;
+            TEST_ASSERT(store.open(opt), "store opens (setup)");
+            store.close();
+        }
+        // Bump the schema version past the current one.
+        {
+            SqliteDyn sql;  // engine's dynamic loader
+            TEST_ASSERT(sql.load(), "sqlite loads");
+            sqlite3* db = nullptr;
+            if (sql.open_v2(path.c_str(), &db, 0x02 | 0x04, nullptr) == SQLITE_OK && db) {
+                sql.exec(db, "UPDATE schema_version SET version=99;");
+                sql.close_v2(db);
+            }
+            sql.unload();
+        }
+        networkos::ObjectStore store;
+        networkos::ObjectStore::Options opt;
+        opt.path = path;
+        TEST_ASSERT(!store.open(opt), "future schema rejected (forward-migration guard)");
+        TEST_ASSERT(!store.is_open(), "store not open after future-schema reject");
+    }
+    std::cout << "forward-migration rejection ok\n";
+
+    // --- 10. Usage accounting stays exact through put/remove/evict/purge -----
+    {
+        // Eviction scores expiry with the DB wall clock, so use a REAL clock
+        // base here (a frozen 2023 NOW would make every object look expired).
+        const int64_t RNOW = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+        networkos::ObjectStore store;
+        networkos::ObjectStore::Options opt;
+        opt.path = db_path("usage");
+        opt.default_namespace_quota_bytes = 100000;
+        opt.default_origin_quota_bytes = 100000;
+        TEST_ASSERT(store.open(opt), "store opens");
+        networkos::ObjectStore::Outcome oc;
+
+        auto m1 = make_meta("u1", "chat", "peer-a", RNOW, 3600000);
+        m1.priority = 1;
+        auto m2 = make_meta("u2", "chat", "peer-a", RNOW, 3600000);
+        m2.priority = 3;
+        auto m3 = make_meta("u3", "chat", "peer-a", RNOW, 3600000);
+        m3.priority = 0;
+        store.putWithOutcome(m1, std::string(100, 'a'), oc);
+        store.putWithOutcome(m2, std::string(200, 'b'), oc);
+        store.putWithOutcome(m3, std::string(50, 'c'), oc);
+        networkos::QuotaInfo q;
+        store.quota("chat", "peer-a", q);
+        TEST_ASSERT(q.used_bytes == 350, "usage counts all three objects");
+
+        // remove one -> usage drops exactly its bytes.
+        TEST_ASSERT(store.remove(m2.id) == networkos::Result::kOk, "remove ok");
+        store.quota("chat", "peer-a", q);
+        TEST_ASSERT(q.used_bytes == 150, "usage drops on remove");
+
+        // evict (need 30B): lowest priority (m3, 50B) goes first; freed 50 >= 30.
+        uint64_t freed = 0;
+        TEST_ASSERT(store.evictForQuota("chat", "peer-a", 30, &freed) == networkos::Result::kOk,
+                    "evict ok");
+        TEST_ASSERT(freed == 50, "evicted exactly m3");
+        store.quota("chat", "peer-a", q);
+        TEST_ASSERT(q.used_bytes == 100, "usage drops on evict");
+
+        // purge the expired one -> usage drops exactly its bytes.
+        auto m4 = make_meta("u4", "chat", "peer-a", RNOW, 100);  // 100ms TTL
+        store.putWithOutcome(m4, std::string(40, 'd'), oc);
+        uint64_t removed = 0;
+        TEST_ASSERT(store.purgeExpired(RNOW + 5000, &removed) == networkos::Result::kOk, "purge ok");
+        TEST_ASSERT(removed == 1, "expired purged");
+        store.quota("chat", "peer-a", q);
+        TEST_ASSERT(q.used_bytes == 100, "usage drops on purge");
+        TEST_ASSERT(store.totalBytes() == 100, "totalBytes agrees with usage");
+        store.close();
+    }
+    std::cout << "usage accounting consistency ok\n";
 
     std::cout << (g_failures == 0 ? "PASS" : "FAIL") << ": " << g_checks
               << " checks, " << g_failures << " failure(s)\n";

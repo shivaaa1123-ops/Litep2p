@@ -537,6 +537,12 @@ add_executable(envelope_fuzz_smoke tools/envelope_fuzz_smoke.cpp)
 target_include_directories(envelope_fuzz_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(envelope_fuzz_smoke PRIVATE litep2p_engine)
 
+# Network OS Phase 3 performance probe (put/get throughput, open latency,
+# size overhead, commit latency).
+add_executable(store_bench tools/store_bench.cpp)
+target_include_directories(store_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(store_bench PRIVATE litep2p_engine)
+
 # Network OS Phase 1 SIGKILL restore probe (driven by sigkill_restore_test.sh).
 add_executable(network_runtime_kill_probe tools/network_runtime_kill_probe.cpp)
 target_include_directories(network_runtime_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

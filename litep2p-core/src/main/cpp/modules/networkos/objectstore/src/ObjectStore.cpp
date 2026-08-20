@@ -36,9 +36,24 @@ struct ObjectStore::Impl {
     sqlite3* db{nullptr};
     Options opts;
     mutable std::mutex mu;
+    // Amortized dedup-prune counter: the "COUNT(*) FROM dedup" gate is a full
+    // table scan, so running it on every put makes inserts O(N) again. We only
+    // re-check (and possibly prune) every 256 puts — bounded amortized cost.
+    uint64_t puts_since_dedup_prune{0};
 
     bool exec(const char* sql) {
         return db && sqlite.exec(db, sql) == SQLITE_OK;
+    }
+
+    // Lock-free teardown (caller holds mu). Used by close() and by open()'s
+    // failure paths — open() must never call close() while holding mu (the
+    // mutex is non-recursive; doing so self-deadlocks).
+    void teardown() {
+        if (db) {
+            sqlite.close_v2(db);
+            db = nullptr;
+        }
+        sqlite.unload();
     }
 
     struct Stmt {
@@ -89,10 +104,16 @@ bool ObjectStore::open(const Options& options) {
     m_impl->exec("PRAGMA busy_timeout=5000;");
     m_impl->exec("PRAGMA foreign_keys=ON;");
 
-    {  // Corruption detection on open (Step 3.5/§25).
+    {  // Corruption detection on open (Step 3.5/§25): require quick_check to
+        // return exactly the "ok" row. A corrupt DB returns one or more error
+        // rows instead — those must FAIL the open.
         Impl::Stmt st(m_impl->sqlite, m_impl->db, "PRAGMA quick_check;");
-        if (!st.ok() || st.step() != SQLITE_ROW) {
-            close();
+        bool healthy = false;
+        if (st.ok() && st.step() == SQLITE_ROW) {
+            healthy = st.col_text(0) == "ok";
+        }
+        if (!healthy) {
+            m_impl->teardown();
             return false;
         }
     }
@@ -122,6 +143,16 @@ bool ObjectStore::open(const Options& options) {
         "  state INTEGER NOT NULL DEFAULT 0,"
         "  lease_expires_at_ms INTEGER,"
         "  replica_hint INTEGER);",
+        // Incremental usage counter (one row per namespace+origin). Quota
+        // checks read this instead of SUM() over objects — otherwise every
+        // insert is O(all objects) and the store degrades to O(N^2) (measured
+        // ~250 obj/s at 10k objects). Updated in the same transaction as the
+        // object rows, so it can never drift.
+        "CREATE TABLE IF NOT EXISTS usage("
+        "  ns TEXT NOT NULL,"
+        "  origin TEXT NOT NULL,"
+        "  bytes INTEGER NOT NULL DEFAULT 0,"
+        "  PRIMARY KEY(ns, origin));",
         "CREATE INDEX IF NOT EXISTS idx_objects_expires ON objects(expires_at_ms);",
         "CREATE INDEX IF NOT EXISTS idx_objects_dest ON objects(destination);",
         "CREATE INDEX IF NOT EXISTS idx_objects_ns ON objects(namespace_id);",
@@ -131,7 +162,7 @@ bool ObjectStore::open(const Options& options) {
         "  created_at_ms INTEGER NOT NULL);",
     };
     for (const char* sql : kSchema) {
-        if (!m_impl->exec(sql)) { close(); return false; }
+        if (!m_impl->exec(sql)) { m_impl->teardown(); return false; }
     }
 
     {  // Schema versioning + forward migration (Step 6).
@@ -139,7 +170,7 @@ bool ObjectStore::open(const Options& options) {
                       "SELECT version FROM schema_version LIMIT 1;");
         int current = 0;
         if (st.ok() && st.step() == SQLITE_ROW) current = st.col_int(0);
-        if (current > kSchemaVersion) { close(); return false; }  // future DB
+        if (current > kSchemaVersion) { m_impl->teardown(); return false; }  // future DB
         if (current == 0) m_impl->exec("INSERT INTO schema_version(version) VALUES (1);");
     }
 
@@ -149,11 +180,7 @@ bool ObjectStore::open(const Options& options) {
 
 void ObjectStore::close() {
     std::lock_guard<std::mutex> lock(m_impl->mu);
-    if (m_impl->db) {
-        m_impl->sqlite.close_v2(m_impl->db);
-        m_impl->db = nullptr;
-    }
-    m_impl->sqlite.unload();
+    m_impl->teardown();
     m_open = false;
 }
 
@@ -168,9 +195,18 @@ int64_t namespace_quota_locked(ObjectStore::Impl& impl, const std::string& ns) {
     return static_cast<int64_t>(impl.opts.default_namespace_quota_bytes);
 }
 
+// Usage reads go through the incremental `usage` table (PK lookups / tiny
+// scans) — never SUM over `objects`. See the schema comment.
+int64_t global_used_locked(ObjectStore::Impl& impl) {
+    ObjectStore::Impl::Stmt st(impl.sqlite, impl.db,
+        "SELECT COALESCE(SUM(bytes),0) FROM usage;");
+    if (st.ok() && st.step() == SQLITE_ROW) return st.col_int64(0);
+    return 0;
+}
+
 int64_t namespace_used_locked(ObjectStore::Impl& impl, const std::string& ns) {
     ObjectStore::Impl::Stmt st(impl.sqlite, impl.db,
-        "SELECT COALESCE(SUM(payload_size),0) FROM objects WHERE namespace_id=?1;");
+        "SELECT COALESCE(SUM(bytes),0) FROM usage WHERE ns=?1;");
     if (!st.ok()) return 0;
     st.bind_text(1, ns);
     if (st.step() == SQLITE_ROW) return st.col_int64(0);
@@ -180,13 +216,37 @@ int64_t namespace_used_locked(ObjectStore::Impl& impl, const std::string& ns) {
 int64_t origin_used_locked(ObjectStore::Impl& impl, const std::string& ns,
                            const std::string& origin) {
     ObjectStore::Impl::Stmt st(impl.sqlite, impl.db,
-        "SELECT COALESCE(SUM(payload_size),0) FROM objects "
-        "WHERE namespace_id=?1 AND origin=?2;");
+        "SELECT bytes FROM usage WHERE ns=?1 AND origin=?2;");
     if (!st.ok()) return 0;
     st.bind_text(1, ns);
     st.bind_text(2, origin);
     if (st.step() == SQLITE_ROW) return st.col_int64(0);
     return 0;
+}
+
+// In-transaction usage accounting helpers (must run inside the same
+// transaction as the object row change so they can never drift).
+bool usage_add_locked(ObjectStore::Impl& impl, const std::string& ns,
+                      const std::string& origin, int64_t bytes) {
+    ObjectStore::Impl::Stmt st(impl.sqlite, impl.db,
+        "INSERT INTO usage(ns, origin, bytes) VALUES(?1,?2,?3)"
+        " ON CONFLICT(ns, origin) DO UPDATE SET bytes = bytes + excluded.bytes;");
+    if (!st.ok()) return false;
+    st.bind_text(1, ns);
+    st.bind_text(2, origin);
+    st.bind_int64(3, bytes);
+    return st.step() == SQLITE_DONE;
+}
+
+bool usage_sub_locked(ObjectStore::Impl& impl, const std::string& ns,
+                      const std::string& origin, int64_t bytes) {
+    ObjectStore::Impl::Stmt st(impl.sqlite, impl.db,
+        "UPDATE usage SET bytes = MAX(0, bytes - ?1) WHERE ns=?2 AND origin=?3;");
+    if (!st.ok()) return false;
+    st.bind_int64(1, bytes);
+    st.bind_text(2, ns);
+    st.bind_text(3, origin);
+    return st.step() == SQLITE_DONE;
 }
 
 } // namespace
@@ -235,12 +295,10 @@ Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payl
     const int64_t origin_used = origin_used_locked(*m_impl, meta.namespace_id, meta.origin);
 
     // Hierarchical quotas (§26/§53): global cap (minus system reserve), then
-    // namespace cap, then origin cap — all inside the insert transaction.
+    // namespace cap, then origin cap — all inside the insert transaction,
+    // all O(1)-ish reads off the incremental usage table.
     {
-        Impl::Stmt st(m_impl->sqlite, m_impl->db,
-                      "SELECT COALESCE(SUM(payload_size),0) FROM objects;");
-        int64_t global_used = 0;
-        if (st.ok() && st.step() == SQLITE_ROW) global_used = st.col_int64(0);
+        const int64_t global_used = global_used_locked(*m_impl);
         const int64_t usable = static_cast<int64_t>(m_impl->opts.global_quota_bytes) -
                                static_cast<int64_t>(m_impl->opts.system_reserve_bytes);
         if (usable > 0 && global_used + added_bytes > usable) {
@@ -308,6 +366,14 @@ Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payl
         }
     }
 
+    {  // Increment the usage counter (same transaction — cannot drift).
+        if (!usage_add_locked(*m_impl, meta.namespace_id, meta.origin, added_bytes)) {
+            m_impl->exec("ROLLBACK;");
+            out = Outcome::Unsupported;
+            return Result::kIo;
+        }
+    }
+
     if (!m_impl->exec("COMMIT;")) {
         m_impl->exec("ROLLBACK;");
         out = Outcome::RetryAfter;
@@ -315,7 +381,11 @@ Result ObjectStore::putWithOutcome(const ObjectMeta& meta, std::string_view payl
     }
 
     // Bounded dedup table: prune expired records when over capacity.
-    if (m_impl->opts.max_dedup_entries > 0) {
+    // Amortized — the COUNT gate is a full-table scan, so it only runs every
+    // 256 puts (O(1) amortized instead of O(N) per put).
+    ++m_impl->puts_since_dedup_prune;
+    if (m_impl->opts.max_dedup_entries > 0 &&
+        m_impl->puts_since_dedup_prune % 256 == 0) {
         Impl::Stmt cnt(m_impl->sqlite, m_impl->db, "SELECT COUNT(*) FROM dedup;");
         int64_t n = 0;
         if (cnt.ok() && cnt.step() == SQLITE_ROW) n = cnt.col_int64(0);
@@ -404,12 +474,36 @@ Result ObjectStore::remove(const ObjectId& id) {
     if (!m_open) return Result::kInvalidState;
     const std::string id_hex = id.toHex();
     if (!m_impl->exec("BEGIN IMMEDIATE;")) return Result::kBusy;
+
+    // Read the row's accounting before deleting it (usage decrement needs it).
+    std::string ns, origin;
+    int64_t size = 0;
+    bool found = false;
+    {
+        Impl::Stmt sel(m_impl->sqlite, m_impl->db,
+            "SELECT namespace_id, origin, payload_size FROM objects WHERE object_id=?1;");
+        if (sel.ok()) {
+            sel.bind_text(1, id_hex);
+            if (sel.step() == SQLITE_ROW) {
+                ns = sel.col_text(0);
+                origin = sel.col_text(1);
+                size = sel.col_int64(2);
+                found = true;
+            }
+        }
+    }
     {
         Impl::Stmt del(m_impl->sqlite, m_impl->db,
                        "DELETE FROM objects WHERE object_id=?1;");
         if (!del.ok()) { m_impl->exec("ROLLBACK;"); return Result::kIo; }
         del.bind_text(1, id_hex);
         del.step();
+    }
+    if (found) {
+        if (!usage_sub_locked(*m_impl, ns, origin, size)) {
+            m_impl->exec("ROLLBACK;");
+            return Result::kIo;
+        }
     }
     {  // Terminal dedup record survives the payload (compact; §65).
         Impl::Stmt up(m_impl->sqlite, m_impl->db,
@@ -451,20 +545,34 @@ Result ObjectStore::forEachExpired(int64_t now_ms,
 Result ObjectStore::purgeExpired(int64_t now_ms, uint64_t* removed) {
     std::lock_guard<std::mutex> lock(m_impl->mu);
     if (!m_open) return Result::kInvalidState;
+    if (!m_impl->exec("BEGIN IMMEDIATE;")) return Result::kBusy;
     int64_t n = 0;
-    {
-        Impl::Stmt cnt(m_impl->sqlite, m_impl->db,
-                       "SELECT COUNT(*) FROM objects WHERE expires_at_ms <= ?1;");
-        if (cnt.ok()) {
-            cnt.bind_int64(1, now_ms);
-            if (cnt.step() == SQLITE_ROW) n = cnt.col_int64(0);
+    for (;;) {
+        // Read one expired object at a time and delete it, decrementing the
+        // usage counter in the same transaction.
+        Impl::Stmt sel(m_impl->sqlite, m_impl->db,
+            "SELECT object_id, namespace_id, origin, payload_size FROM objects"
+            " WHERE expires_at_ms <= ?1 LIMIT 1;");
+        if (!sel.ok()) { m_impl->exec("ROLLBACK;"); return Result::kIo; }
+        sel.bind_int64(1, now_ms);
+        if (sel.step() != SQLITE_ROW) break;
+        const std::string id_hex = sel.col_text(0);
+        const std::string ns = sel.col_text(1);
+        const std::string origin = sel.col_text(2);
+        const int64_t size = sel.col_int64(3);
+
+        Impl::Stmt del(m_impl->sqlite, m_impl->db,
+                       "DELETE FROM objects WHERE object_id=?1;");
+        if (!del.ok()) { m_impl->exec("ROLLBACK;"); return Result::kIo; }
+        del.bind_text(1, id_hex);
+        if (del.step() != SQLITE_DONE) { m_impl->exec("ROLLBACK;"); return Result::kIo; }
+        if (!usage_sub_locked(*m_impl, ns, origin, size)) {
+            m_impl->exec("ROLLBACK;");
+            return Result::kIo;
         }
+        ++n;
     }
-    Impl::Stmt del(m_impl->sqlite, m_impl->db,
-                   "DELETE FROM objects WHERE expires_at_ms <= ?1;");
-    if (!del.ok()) return Result::kIo;
-    del.bind_int64(1, now_ms);
-    if (del.step() != SQLITE_DONE) return Result::kIo;
+    if (!m_impl->exec("COMMIT;")) { m_impl->exec("ROLLBACK;"); return Result::kIo; }
     if (removed) *removed = static_cast<uint64_t>(n);
     return Result::kOk;
 }
@@ -529,7 +637,11 @@ Result ObjectStore::evictForQuota(const std::string& namespace_id,
                        "DELETE FROM objects WHERE object_id=?1;");
         if (!del.ok()) { m_impl->exec("ROLLBACK;"); return Result::kIo; }
         del.bind_text(1, victim);
-        del.step();
+        if (del.step() != SQLITE_DONE) { m_impl->exec("ROLLBACK;"); return Result::kIo; }
+        if (!usage_sub_locked(*m_impl, namespace_id, origin, victim_size)) {
+            m_impl->exec("ROLLBACK;");
+            return Result::kIo;
+        }
         released += static_cast<uint64_t>(victim_size > 0 ? victim_size : 0);
     }
     if (!m_impl->exec("COMMIT;")) { m_impl->exec("ROLLBACK;"); return Result::kIo; }
