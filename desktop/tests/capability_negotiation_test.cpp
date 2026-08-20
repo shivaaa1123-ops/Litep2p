@@ -14,9 +14,12 @@
 #include "networkos/session/SessionFacade.h"
 
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -39,6 +42,22 @@ std::string tmp_dir(const std::string& tag) {
     std::filesystem::remove_all(base, ec);
     std::filesystem::create_directories(base, ec);
     return base;
+}
+
+// Writes a hermetic config.json (signaling/discovery/NAT off) so test
+// runtimes never register with a LAN signaling server or see foreign peers.
+void write_hermetic_config(const std::string& dir) {
+    std::ofstream f(dir + "/config.json", std::ios::trunc);
+    f << "{\n"
+      << "  \"communication\": {\"default_protocol\": \"UDP\",\n"
+      << "    \"udp\": {\"enabled\": true, \"port\": 30001, \"buffer_size\": 65535}},\n"
+      << "  \"peer_management\": {\"max_message_size\": 10485760},\n"
+      << "  \"discovery\": {\"enabled\": false},\n"
+      << "  \"security\": {\"noise_nk_protocol\": {\"enabled\": true, \"mandatory\": true}},\n"
+      << "  \"nat_traversal\": {\"enabled\": false, \"mode\": \"off\", \"stun_enabled\": false},\n"
+      << "  \"signaling\": {\"enabled\": false}\n"
+      << "}\n";
+    f.flush();
 }
 
 } // namespace
@@ -159,6 +178,7 @@ static void test_privacy_no_identifiers() {
 // 5. Session bounds + telemetry (SessionFacade)
 // ---------------------------------------------------------------------------
 static void test_session_bounds() {
+    // Pending-handshake cap.
     networkos::SessionFacade::Bounds tight;
     tight.max_pending_handshakes = 1;
     networkos::SessionFacade facade_tight(nullptr, tight);
@@ -166,13 +186,47 @@ static void test_session_bounds() {
     TEST_ASSERT(facade_tight.connect("peer-b", "127.0.0.1:1") == networkos::Result::kBusy,
                 "pending-handshake cap returns BUSY");
 
-    facade_tight.onHandshakeSucceeded("peer-a");
-    auto tel = facade_tight.telemetry();
-    TEST_ASSERT(tel.handshake_success_total == 1, "handshake success counted");
-    TEST_ASSERT(tel.pending_handshakes == 1, "pending gauge reflects CONNECTING");
-    TEST_ASSERT(!facade_tight.telemetryJson().empty(), "telemetry JSON present");
+    // Active-session cap.
+    networkos::SessionFacade::Bounds active_tight;
+    active_tight.max_active_sessions = 1;
+    active_tight.max_pending_handshakes = 8;
+    networkos::SessionFacade facade_active(nullptr, active_tight);
+    facade_active.onPeerState("peer-a", "READY");
+    TEST_ASSERT(facade_active.connect("peer-b", "127.0.0.1:1") == networkos::Result::kBusy,
+                "active-session cap returns BUSY");
 
-    std::cout << "session bounds + telemetry ok\n";
+    // Handshake timeout: a peer stuck in CONNECTING beyond the timeout is
+    // failed by the next event-driven check (no timer).
+    networkos::SessionFacade::Bounds timeouts;
+    timeouts.handshake_timeout_ms = 1;   // 1 ms
+    networkos::SessionFacade facade_to(nullptr, timeouts);
+    (void)facade_to.connect("peer-a", "127.0.0.1:1");  // marks CONNECTING, started=now
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    facade_to.onPeerState("peer-a", "HANDSHAKING");    // triggers checkTimeoutsLocked_
+    auto tel_to = facade_to.telemetry();
+    TEST_ASSERT(tel_to.handshake_failed_total == 1, "slow handshake timed out");
+    TEST_ASSERT(tel_to.connect_failed_total == 1, "timeout counted as connect failure");
+    TEST_ASSERT(tel_to.pending_handshakes == 0, "timed-out peer no longer pending");
+
+    // Handshake latency + session duration telemetry.
+    networkos::SessionFacade facade_metrics(nullptr, networkos::SessionFacade::Bounds{});
+    facade_metrics.onHandshakeStarted("peer-a");
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    facade_metrics.onHandshakeSucceeded("peer-a");
+    auto tm = facade_metrics.telemetry();
+    TEST_ASSERT(tm.handshake_latency_count == 1 && tm.avgHandshakeLatencyMs() >= 1,
+                "handshake latency measured");
+    facade_metrics.onPeerState("peer-a", "READY");
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    facade_metrics.onPeerState("peer-a", "DISCONNECTED");
+    auto td = facade_metrics.telemetry();
+    TEST_ASSERT(td.session_duration_count == 1 && td.avgSessionDurationMs() >= 1,
+                "session duration measured");
+    TEST_ASSERT(td.avgHandshakeLatencyMs() >= 1, "latency avg present in JSON");
+    TEST_ASSERT(facade_metrics.telemetryJson().find("handshake_latency_avg_ms") != std::string::npos,
+                "latency avg in telemetry JSON");
+
+    std::cout << "session bounds + timeouts + telemetry ok\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +234,7 @@ static void test_session_bounds() {
 // ---------------------------------------------------------------------------
 static void test_stable_peerid_across_address_change() {
     const std::string dir = tmp_dir("addr");
+    write_hermetic_config(dir);
     std::string first_id;
     // Three "network change" cycles: each is a fresh runtime on a different
     // listen port (port change == endpoint change). The LOCAL identity must

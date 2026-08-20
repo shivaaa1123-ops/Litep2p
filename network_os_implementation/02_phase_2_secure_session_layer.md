@@ -149,13 +149,24 @@ Run in this order; record every run in §10.
 | 2026-08-20 | session unit tests (capability codec, malformed, bounds, telemetry, address-change) | 10 | PASS | capability_negotiation_test: 143 checks, 0 failures |
 | 2026-08-20 | stable PeerID / address change | 3 | PASS | 3 network-change cycles (fresh runtime, changed port) — PeerID identical |
 | 2026-08-20 | capability negotiation | 5 | PASS | round-trip 10×, version intersect, unknown-field tolerance, malformed rejection; privacy check asserts no device/battery identifiers |
-| 2026-08-20 | bounded sessions | 5 | PASS | pending-handshake cap returns BUSY; active-session gauge present |
+| 2026-08-20 | bounded sessions | 5 | PASS | pending-handshake cap + active-session cap return BUSY; handshake timeout enforced (event-driven) |
 | 2026-08-20 | reconnect | 5 | PASS | setReconnectMode passthrough; existing PeerReconnectPolicy backoff+jitter+event verified unchanged (P0 §06) |
 | 2026-08-20 | multiplexing contract | 5 | PASS | StreamId priority ladder documented + conformance via scheduler priority ordering |
 | 2026-08-20 | live peers | 6 | PASS | phase1_smoke.sh: 2 sessions × 3 runs (receiver+sender pair, UDP+Noise) |
+| 2026-08-20 | live network-switch reconnect | 2 | PASS | phase2_networkswitch_test.sh: connect+exchange → receiver restarts on new port → sender reconnects (legs rc=0/0, stable SELF_ID) |
 | 2026-08-20 | existing suites | 5 | PASS | 55/55 PASS (11 suites incl. network_runtime_test + capability_negotiation_test) |
 | 2026-08-20 | native build | 1 | PASS | externalNativeBuildMultiThreadDebug green (capability + session sources on Android) |
 | 2026-08-20 | C ABI | 1 | EMPTY | 56 functions unchanged |
+
+**Audit (2026-08-20) — gaps found & fixed after re-check against the phase file:**
+1. `max_active_sessions` was declared but NOT enforced → now enforced in `SessionFacade::connect` (returns BUSY at cap); test added.
+2. `handshake_timeout_ms` was declared but NOT enforced → now enforced lazily via `checkTimeoutsLocked_()` on every state/connect event (no timer, idle cost unchanged); test added.
+3. Step 5.8 telemetry lacked **handshake latency** and **session duration** → now measured (avg in `telemetryJson()`); tests added.
+4. Step 6 bounded capability cache: `m_peers` now capped at `kMaxPeerCapabilities=2048` with eviction.
+5. Verification item 7 (network switch → reconnect with stable PeerID) was not covered live → `phase2_networkswitch_test.sh` (two processes) added; the in-process dual-engine connect was found not to work (singleton/event-loop limitation) so the live leg uses the repo's two-process pattern.
+6. Tests made hermetic: runtimes now get a config.json with signaling/discovery/NAT off (previously the live test registered with a real LAN signaling server).
+7. Fixed a timeout-ordering bug: `onPeerState` now applies the new state before checking timeouts so a late transition cannot resurrect a timed-out peer.
+8. capability_negotiation_test now **148 checks, 0 failures**.
 
 ## 11. Risks & mitigations
 

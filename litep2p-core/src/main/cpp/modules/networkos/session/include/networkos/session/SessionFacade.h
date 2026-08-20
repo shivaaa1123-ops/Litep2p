@@ -38,8 +38,20 @@ public:
         uint64_t handshake_success_total{0};
         uint64_t handshake_failed_total{0};
         uint64_t reconnect_total{0};
+        uint64_t session_duration_total_ms{0};   // sum for avg
+        uint64_t session_duration_count{0};
+        uint64_t handshake_latency_total_ms{0};  // sum for avg
+        uint64_t handshake_latency_count{0};
         size_t pending_handshakes{0};
         size_t active_sessions{0};
+
+        // Running averages (computed on demand from totals).
+        uint64_t avgHandshakeLatencyMs() const {
+            return handshake_latency_count ? handshake_latency_total_ms / handshake_latency_count : 0;
+        }
+        uint64_t avgSessionDurationMs() const {
+            return session_duration_count ? session_duration_total_ms / session_duration_count : 0;
+        }
     };
 
     explicit SessionFacade(std::shared_ptr<SessionManager> session, const Bounds& bounds);
@@ -95,11 +107,16 @@ private:
         CapabilityDocument::Negotiated negotiated;
         bool has_capability{false};
         int64_t handshake_started_ms{0};
+        int64_t session_started_ms{0};
         std::string state;
     };
     mutable std::mutex m_mu;
     std::unordered_map<std::string, PeerSessionInfo> m_peers;
     SessionTelemetry m_telemetry;
+    // Bounded capability cache (§75): at most this many peer capability docs.
+    static constexpr size_t kMaxPeerCapabilities = 2048;
+    void evictOldestCapabilityLocked_();
+    void checkTimeoutsLocked_();
 };
 
 std::unique_ptr<SessionFacade> createSessionFacade(std::shared_ptr<SessionManager> session);
