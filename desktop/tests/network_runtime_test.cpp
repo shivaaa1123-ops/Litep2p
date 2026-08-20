@@ -16,6 +16,7 @@
 #include "networkos/IObjectStore.h"
 #include "networkos/ITransport.h"
 #include "networkos/objectstore/ObjectStore.h"
+#include "networkos/handoff/HandoffManager.h"
 
 #include <atomic>
 #include <chrono>
@@ -216,7 +217,7 @@ static void test_object_store_wired() {
     auto* store = rt->objectStore();
     TEST_ASSERT(store != nullptr, "runtime owns an object store (SQLite loaded)");
     TEST_ASSERT(store->schemaVersion() == networkos::ObjectStore::kSchemaVersion,
-                "store schema version 1");
+                "store schema version 2");
 
     if (store) {
         networkos::ObjectMeta m;
@@ -255,12 +256,55 @@ static void test_object_store_wired() {
     std::cout << "runtime object store wiring ok\n";
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4: the runtime owns the two-phase handoff manager AND feeds platform
+// signals into its ResourceManager (storage pressure shortens offered
+// leases, charging lengthens). Verify the wiring is genuinely live.
+// ---------------------------------------------------------------------------
+static void test_handoff_wired() {
+    const std::string dir = tmp_dir("handoff_wired");
+    auto rt = networkos::createRuntime();
+    networkos::RuntimeConfig cfg;
+    cfg.files_dir = dir;
+    cfg.listen_port = 35002;
+    cfg.enable_discovery = false;
+    cfg.comms_mode = "UDP";
+    TEST_ASSERT(rt->start(cfg) == networkos::Result::kOk, "runtime start");
+    auto* ho = rt->handoff();
+    TEST_ASSERT(ho != nullptr, "runtime owns a handoff manager (Phase 4)");
+
+    if (ho) {
+        // Default lease hint 6h.
+        TEST_ASSERT(ho->resourceManager().snapshot().storage_lease_duration_hint_ms ==
+                        6LL * 3600 * 1000,
+                    "default lease hint 6h");
+        // Storage pressure (live signal) -> 1h.
+        TEST_ASSERT(rt->onPlatformSignal("storage", "low") == networkos::Result::kOk,
+                    "storage signal accepted");
+        TEST_ASSERT(ho->resourceManager().snapshot().storage_lease_duration_hint_ms ==
+                        1LL * 3600 * 1000,
+                    "pressure shortens lease via runtime wiring");
+        // Charging -> 24h (after pressure is cleared; pressure wins by design).
+        TEST_ASSERT(rt->onPlatformSignal("storage", "ok") == networkos::Result::kOk,
+                    "storage ok signal accepted");
+        TEST_ASSERT(rt->onPlatformSignal("charging", "1") == networkos::Result::kOk,
+                    "charging signal accepted");
+        TEST_ASSERT(ho->resourceManager().snapshot().storage_lease_duration_hint_ms ==
+                        24LL * 3600 * 1000,
+                    "charging lengthens lease via runtime wiring");
+    }
+
+    TEST_ASSERT(rt->stop() == networkos::Result::kOk, "runtime stop");
+    std::cout << "runtime handoff wiring ok\n";
+}
+
 int main() {
     test_identity_stable_across_restarts();
     test_runtime_restart_loop();
     test_scheduler_skeleton();
     test_platform_adapter();
     test_object_store_wired();
+    test_handoff_wired();
 
     std::cout << (g_failures == 0 ? "PASS" : "FAIL") << ": " << g_checks
               << " checks, " << g_failures << " failure(s)\n";

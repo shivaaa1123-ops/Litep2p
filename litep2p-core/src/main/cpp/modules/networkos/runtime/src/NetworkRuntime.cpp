@@ -281,10 +281,19 @@ public:
         else if (signal == "wakeup_window") s = PlatformSignal::kWakeupWindow;
         else return Result::kInvalidArg;
         if (m_platform) m_platform->pushSignal(s, value);
+        // Phase 4: forward the signal to the handoff ResourceManager so the
+        // carrier admission policy reacts to storage pressure / charging /
+        // battery / metering (Step 4.2/4.7).
+        if (m_handoff) {
+            m_handoff->resourceManager().onSignal(s, value);
+        }
         // Any connectivity/foreground/charging signal is a scheduler event.
         if (s == PlatformSignal::kConnectivity || s == PlatformSignal::kForeground ||
             s == PlatformSignal::kCharging) {
             if (m_scheduler) m_scheduler->process(now_ms());
+            // Step 4.6: envoy-triggered lease-expiry sweep (emits
+            // LEASE_EXPIRING so the Phase 7 planner can renew/replicate).
+            if (m_handoff) m_handoff->sweepLeases(now_ms());
         }
         emit_(RuntimeEventType::kPlatform, signal, "", value);
         return Result::kOk;

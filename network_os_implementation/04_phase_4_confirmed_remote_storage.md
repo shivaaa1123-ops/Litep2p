@@ -66,28 +66,46 @@ Add typed frames per §82 to `wire_codec.cpp` (+ fuzz target input):
 - `OBJECT_ACCEPT` / `OBJECT_REJECT` — accept with offered lease terms, or
   reject with a reason code (`REJECTED_AUTH | REJECTED_POLICY |
   REJECTED_QUOTA | BUSY | RETRY_AFTER`).
-- `OBJECT_DATA` — payload transfer (chunked if payload large; streaming
-  buffers, bounded memory).
+- `OBJECT_DATA` — payload transfer. The full signed `obj::NetworkObject`
+  envelope is transferred in a SINGLE bounded frame (envelope capped at 16 MB
+  in the codec; the wire codec caps total messages at 10 MB). Chunked /
+  streaming transfer for large payloads is deferred to Phase 10 (Large Object
+  Layer).
 - `STORED_ACK` — signed/validated storage acknowledgement containing
   `object_id`, `accepted_until`, `storage_class`, `recipient_id`, signature
   (this is the lease).
 
-All lengths validated before allocation (§29); unknown optional fields
-ignored safely; replay detection via dedup index before expensive work.
+All lengths validated before allocation (§29); decoders are STRICT —
+unknown/trailing fields are rejected (point-to-point frames within one
+protocol version; forward-tolerance is deliberately not applied); replay
+detection via dedup index before expensive work.
 
 ### Step 4.2 — Carrier admission policy
 Before accepting an object, a carrier evaluates (§26, §52, §81):
-- namespace authorization + quota headroom;
-- origin trust class (unknown/known/trusted/blocked) → quota and lease
-  length tiers;
-- current storage pressure → shorter lease or `BUSY`/`RETRY_AFTER`;
-- configured carrier willingness (app/user policy: Wi-Fi only, charging
-  only, max bytes, contacts/groups only, trusted network only).
+- carrier enabled (explicit opt-in via `carrier_enabled`/no-handler drop);
+- origin authorization — `trusted_origins` allowlist (empty = allow all);
+  unknown origins fail `REJECTED_AUTH` at DATA commit when no registered
+  trust anchor exists (`require_origin_signature`);
+- quota headroom — global usable capacity (Options minus system reserve) and
+  namespace quota, checked BEFORE any bytes move (`REJECTED_QUOTA`);
+- resource signals — storage pressure shortens the offered lease,
+  charging/battery/grid shape max concurrent handoffs (`ResourceManager`
+  stub, Step 4.7); a busy carrier returns `BUSY`/`RETRY_AFTER`;
+- cannot sign leases (no local origin-signing keypair) -> `REJECTED_POLICY`.
+
+Origin trust *tiers* (unknown/known/trusted/blocked → quota & lease tiers)
+and per-policy carrier willingness (Wi-Fi only, charging only, max bytes,
+contacts/groups) are Phase 8 extensions; the Step 4.2 skeleton above is what
+this phase implements.
 Admission is explicit: never silently drop after pretending to accept (§28).
 
 ### Step 4.3 — Lease model (§11)
-- On `OBJECT_ACCEPT`, the carrier stores the object and returns a signed
-  `STORED_ACK` lease: `object_id, accepted_until, storage_class, carrier_id`.
+- On `OBJECT_ACCEPT`, the carrier promises lease terms (`accepted_until`,
+  `storage_class`) and the sender transitions to REMOTE_ACCEPTED. The carrier
+  does NOT store the object at ACCEPT — it stores durably only when
+  `OBJECT_DATA` arrives and passes verification (never-ACK-before-commit;
+  the signed `STORED_ACK` lease is returned at that point):
+  `object_id, accepted_until, storage_class, carrier_id` + carrier signature.
 - `accepted_until = now + lease_duration` (carrier chooses duration within
   policy, e.g., 6h default; shorter under pressure; never beyond object TTL).
 - The sender records the lease and its `lease_expires_at_ms` in the object
@@ -208,6 +226,32 @@ Run in this order; record every run in §10.
 | 2026-08-20 | existing suites | 5 | PASS | 14 suites x 5 = 0 failures (see p4_reg5.log) |
 | 2026-08-20 | native build | 1 | PASS | externalNativeBuildMultiThreadDebug BUILD SUCCESSFUL |
 | 2026-08-20 | tcpdump capture | 1 | PASS | two-phase flow on wire (S>C offer+data, C>S accept+ack); obfuscated payloads by design |
+
+### Alignment audit (2026-08-20)
+
+Rechecked every doc statement against the code after Phase 4 shipped. Findings
+and resolutions:
+
+| Doc statement | Code status | Resolution |
+|---|---|---|
+| ResourceManager consumes PlatformAdapter signals (Step 4.2/4.7) | NOT wired: `onPlatformSignal` never fed the handoff ResourceManager | **FIXED** — runtime forwards signals; regression added (network_runtime_test 941 checks) |
+| Lease-expiry sweep emits LEASE_EXPIRING (Step 4.6) | `sweepLeases` defined but never invoked | **FIXED** — runtime triggers it on connectivity/foreground events |
+| "OBJECT_DATA chunked if payload large; streaming buffers" | single bounded frame (16 MB codec cap; 10 MB wire cap) | doc corrected: chunking deferred to Phase 10 |
+| "unknown optional fields ignored safely" | decoders STRICT (trailing rejected) | doc/comment corrected to state strictness |
+| "On OBJECT_ACCEPT the carrier stores the object" | stores only on DATA commit (never-ACK-before-commit) | doc clarified |
+| Carriage admission: origin trust tiers + willingness profiles | implemented subset: `carrier_enabled` + `trusted_origins` + resource admission | doc scoped to implemented skeleton; tiers/willingness noted as Phase 8 |
+| tcpdump data-vs-offer size heuristic | flaky (first/last S>C) | **FIXED** — max-vs-min comparison |
+
+All other documented features were verified present and correct in code:
+frames in codec (0x34–0x38), signed leases (accepted_until ≤ TTL, pressure/
+charging hints), never-ACK-before-commit, idempotent replay, honest
+rejection, schema v2 (leases/evicted_early/envelope_blob/states/migration),
+runtime ownership, retryPending on peer_ready, telemetry events+counters,
+fuzz/malformed inputs updated.
+
+Post-fix re-verification: 14 suites × 5 = 0 failures; handoff_test 104 × 10;
+kill harness 10/10; live handoff 6/6 + restart proof; tcpdump 0 failures;
+C ABI 56 identical; Android native build green; fuzz smoke 12.3M iters no crash.
 
 Additional: C ABI gate PASS (56 functions identical); fuzz smoke 60s PASS
 (12.7M iterations, no crash); store regression PASS (63 checks).

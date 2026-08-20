@@ -11,8 +11,11 @@ carrier Ed25519 signature) instead of an indefinite promise (§11).
 
 All frames ride the **existing encrypted session channel** (Noise NK when
 enabled), are never batched, and use bounded length-prefixed binary encoding
-(all lengths validated **before** allocation, §29). Frame payload codecs live
-in `modules/networkos/handoff/` (`handoff_frames.h/.cpp`).
+(all lengths validated **before** allocation, §29). Decoders are **strict**:
+unknown/trailing fields are rejected — the frames are point-to-point within
+one protocol version, so strictness is chosen over forward-tolerance. Frame
+payload codecs live in `modules/networkos/handoff/`
+(`handoff_frames.h/.cpp`).
 
 | Frame | Type | Direction | Payload |
 |---|---|---|---|
@@ -88,7 +91,10 @@ with an object store). The runtime wires:
 - lease signing via the engine's origin-signing keypair
   (`get_local_signing_keys`), verification via `get_peer_signing_key`;
 - `retryPending()` on every `peer_ready` event (transient NO_CARRIER retry);
-- `LEASE_EXPIRING` events for Phase 7 (`sweepLeases`, event-triggered).
+- platform signals → `ResourceManager::onSignal` (storage pressure shortens
+  leases, charging/battery shape concurrency) and an event-triggered
+  `sweepLeases()` that emits `LEASE_EXPIRING` on connectivity/foreground
+  events (Phase 7 planner hooks this).
 
 ## 7. Verification record (Phase 4 doc §9–§10)
 

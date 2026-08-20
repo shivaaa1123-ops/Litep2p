@@ -101,13 +101,16 @@ CS=$(echo "$FOUND" | grep -c '^C>S')
 fails=0
 if [ "$SC" -lt 2 ]; then echo "FAIL: expected >=2 sender frames, saw $SC" >> "$LOG"; fails=$((fails + 1)); fi
 if [ "$CS" -lt 2 ]; then echo "FAIL: expected >=2 carrier frames, saw $CS" >> "$LOG"; fails=$((fails + 1)); fi
-# The data frame must be larger than the offer frame (envelope travels in it).
-OFFER_SIZE=$(echo "$FOUND" | grep '^S>C' | head -1 | awk '{print $2}')
-DATA_SIZE=$(echo "$FOUND" | grep '^S>C' | tail -1 | awk '{print $2}')
-if [ -n "$OFFER_SIZE" ] && [ -n "$DATA_SIZE" ] && [ "$DATA_SIZE" -gt "$OFFER_SIZE" ]; then
-    echo "ok: data frame ($DATA_SIZE B) larger than offer ($OFFER_SIZE B) — envelope transfer" >> "$LOG"
+# The data frame carries the envelope, so it must be the LARGEST S>C frame
+# and clearly larger than the smallest (the offer). Compare max vs min to be
+# robust against later control/keepalive frames in the capture window.
+SC_SIZES=$(echo "$FOUND" | grep '^S>C' | awk '{print $2}' | sort -n)
+MIN_SC=$(echo "$SC_SIZES" | head -1)
+MAX_SC=$(echo "$SC_SIZES" | tail -1)
+if [ -n "$MAX_SC" ] && [ -n "$MIN_SC" ] && [ "${MAX_SC:-0}" -gt "${MIN_SC:-0}" ]; then
+    echo "ok: data frame (max S>C ${MAX_SC}B) larger than offer (min S>C ${MIN_SC}B) — envelope transfer" >> "$LOG"
 else
-    echo "FAIL: data frame not larger than offer (offer=$OFFER_SIZE data=$DATA_SIZE)" >> "$LOG"
+    echo "FAIL: no clear envelope-bearing data frame (min S>C=${MIN_SC:-none} max S>C=${MAX_SC:-none})" >> "$LOG"
     fails=$((fails + 1))
 fi
 echo "phase4 tcpdump: failures=$fails" | tee -a "$LOG"

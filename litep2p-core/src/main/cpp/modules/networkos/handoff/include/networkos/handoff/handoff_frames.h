@@ -7,7 +7,9 @@
 // OBJECT_ACCEPT / OBJECT_REJECT / OBJECT_DATA / STORED_ACK = MessageType
 // 0x34..0x38) over the encrypted session channel. All binary encoding is
 // bounded and length-prefixed; every length is validated BEFORE allocation
-// (§29). Unknown optional trailing fields are tolerated by decoders.
+// (§29). Decoders are STRICT: unknown/trailing fields are rejected (not
+// silently ignored) — the frames are point-to-point within the same protocol
+// version, so strictness is a security win over forward-tolerance.
 //
 // Lease signing: the carrier Ed25519-signs canonical_lease_bytes() with its
 // origin-signing key (the same key the overlay binds peer origins to), and
