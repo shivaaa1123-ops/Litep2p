@@ -116,6 +116,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/corep2p/monitoring/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/session/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/overlay/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/include
 )
 
 if(ENABLE_PROXY_MODULE)
@@ -323,6 +324,18 @@ if(LITEP2P_ENABLE_NOISE_PROTOCOL)
     target_link_libraries(litep2p_crypto PUBLIC sodium)
 endif()
 
+# Network OS module (Phase 1 skeleton: runtime facade, identity, scheduler,
+# platform adapters). Android uses the AndroidPlatformAdapter stub; desktop
+# uses NullPlatformAdapter (registered in the desktop CMakeLists).
+set(NETWORKOS_SOURCES
+    "modules/networkos/runtime/src/NetworkRuntime.cpp"
+    "modules/networkos/identity/src/FileIdentityStore.cpp"
+    "modules/networkos/scheduler/src/Scheduler.cpp"
+    "modules/networkos/platform/android/AndroidPlatformAdapter.cpp"
+)
+add_library(litep2p_networkos STATIC ${NETWORKOS_SOURCES})
+target_link_libraries(litep2p_networkos litep2p_corep2p litep2p_session)
+
 # Main shared library
 add_library(litep2p SHARED
     src/jni_bridge.cpp
@@ -337,6 +350,7 @@ target_link_libraries(litep2p
     litep2p_reactor
     litep2p_transport
     litep2p_session
+    litep2p_networkos
     $<$<BOOL:${LITEP2P_ENABLE_NOISE_PROTOCOL}>:sodium>
     log
     dl

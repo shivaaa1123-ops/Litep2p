@@ -1,0 +1,28 @@
+name: C ABI compatibility gate
+
+on:
+  push:
+    branches: [ main, network-os-dev ]
+  pull_request:
+
+jobs:
+  c-abi-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify C ABI snapshot is unchanged
+        shell: bash
+        run: |
+          chmod +x desktop/tools/check_c_abi.sh
+          # --update must produce no diff on the snapshot file.
+          desktop/tools/check_c_abi.sh --update
+          if ! git diff --exit-code tools/abi/litep2p_abi_snapshot.txt; then
+            echo "ERROR: C ABI drift detected. If intentional, bump the major"
+            echo "version and update jni_bridge.cpp, litep2p_c_api.cpp, the Kotlin"
+            echo "wrapper, and docs/api-spec.md together, then commit the snapshot."
+            exit 1
+          fi
+          echo "C ABI OK: no drift."

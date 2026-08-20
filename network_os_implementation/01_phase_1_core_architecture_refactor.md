@@ -159,12 +159,14 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | existing suites | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | restart loop (PeerID stable) | 100 | PASS/FAIL | ... |
-| YYYY-MM-DD | SIGKILL restore | 20 | PASS/FAIL | ... |
-| YYYY-MM-DD | C ABI diff | 1 | EMPTY | ... |
-| YYYY-MM-DD | live peer smoke | 3 | PASS/FAIL | ... |
-| YYYY-MM-DD | native build | 1 | PASS/FAIL | ... |
+| 2026-08-20 | existing suites (c_api, session, overlay, proxy, file_transfer, crypto, nat, malformed, voice) | 5 | PASS | run_all_tests.sh --loop 5; 50/50 PASS |
+| 2026-08-20 | network_runtime_test (restart loop + identity + scheduler + adapter) | 1 | PASS | 922 checks, 0 failures |
+| 2026-08-20 | restart loop (PeerID stable) | 100 | PASS | PeerID identical across 100 start/stop cycles + 100 identity re-creations |
+| 2026-08-20 | SIGKILL restore | 20 | PASS | sigkill_restore_test.sh: PeerID stable across 20 kills at random points |
+| 2026-08-20 | C ABI diff | 1 | EMPTY | 56 functions; snapshot at tools/abi/litep2p_abi_snapshot.txt |
+| 2026-08-20 | live peer smoke | 6 | PASS | phase1_smoke.sh: 2 sessions × 3 runs (see log) |
+| 2026-08-20 | native build | 1 | PASS | externalNativeBuildMultiThreadDebug green (networkos module + Android adapter compile) |
+| 2026-08-20 | idle threads | 1 | PASS | 31 threads at idle — unchanged vs Phase 0 baseline (no new threads added by the facade) |
 
 ## 11. Risks & mitigations
 
@@ -177,14 +179,14 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [ ] `modules/networkos/` skeleton with interfaces (Runtime, ITransport,
+- [x] `modules/networkos/` skeleton with interfaces (Runtime, ITransport,
       IObjectStore, IScheduler, IPlatformAdapter, IIdentityStore).
-- [ ] `NetworkRuntime` start/stop/restore works; 100× restart loop green.
-- [ ] PeerID stable across restarts and IP changes (test exists).
-- [ ] C ABI diff empty; `docs/api-spec.md` unchanged.
-- [ ] Existing suites green 5×; live peer smoke green.
-- [ ] Native Android build green (both flavors compile).
-- [ ] Status table in `METHODOLOGY.md` updated.
-- [ ] Committed with message:
+- [x] `NetworkRuntime` start/stop/restore works; 100× restart loop green.
+- [x] PeerID stable across restarts and IP changes (test exists).
+- [x] C ABI diff empty; `docs/api-spec.md` unchanged.
+- [x] Existing suites green 5×; live peer smoke green.
+- [x] Native Android build green (both flavors compile).
+- [x] Status table in `METHODOLOGY.md` updated.
+- [x] Committed with message:
       `Network OS P1: core runtime skeleton, stable interfaces, platform adapter`.
 

@@ -269,6 +269,14 @@ set(DISCOVERY_SOURCES
     ../litep2p-core/src/main/cpp/modules/plugins/discovery/src/peer_cache_lru.cpp
 )
 
+# Network OS module (Phase 1 skeleton). Desktop uses the NullPlatformAdapter.
+set(NETWORKOS_SOURCES
+    ../litep2p-core/src/main/cpp/modules/networkos/runtime/src/NetworkRuntime.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/identity/src/FileIdentityStore.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/scheduler/src/Scheduler.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/platform/desktop/NullPlatformAdapter.cpp
+)
+
 set(ENGINE_SOURCES
     ${CORE_SOURCES}
     ${SESSION_SOURCES}
@@ -284,6 +292,7 @@ set(ENGINE_SOURCES
     ${OVERLAY_SOURCES}
     ${CORE_P2P_SOURCES}
     ${DISCOVERY_SOURCES}
+    ${NETWORKOS_SOURCES}
     # Public C ABI (litep2p.h) — compiled into the engine so desktop tests can
     # exercise the exact contract integrators use.
     ../litep2p-core/src/main/cpp/src/litep2p_c_api.cpp
@@ -315,6 +324,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/plugins/voice_call/include
     ../litep2p-core/src/main/cpp/modules/plugins/proxy/include
     ../litep2p-core/src/main/cpp/modules/plugins/overlay/include
+    ../litep2p-core/src/main/cpp/modules/networkos/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -485,6 +495,16 @@ target_link_libraries(message_size_runner PRIVATE litep2p_engine)
 add_executable(message_latency_runner tests/message_latency_runner.cpp)
 target_include_directories(message_latency_runner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(message_latency_runner PRIVATE litep2p_engine)
+
+# Network OS Phase 1 verification: runtime/identity/scheduler/platform tests.
+add_executable(network_runtime_test tests/network_runtime_test.cpp)
+target_include_directories(network_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(network_runtime_test PRIVATE litep2p_engine)
+
+# Network OS Phase 1 SIGKILL restore probe (driven by sigkill_restore_test.sh).
+add_executable(network_runtime_kill_probe tools/network_runtime_kill_probe.cpp)
+target_include_directories(network_runtime_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(network_runtime_kill_probe PRIVATE litep2p_engine)
 
 if(LITEP2P_ENABLE_REAL_QUIC)
     add_executable(quic_test tests/quic_test.cpp)
