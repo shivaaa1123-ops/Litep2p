@@ -24,6 +24,16 @@ enum class MessageType : uint8_t {
     // serialized obj::NetworkObject inside the existing session framing).
     NETWORK_OBJECT       = 0x33,
 
+    // Network OS Phase 4: confirmed remote storage (two-phase durable
+    // handoff, master doc §82 typed frames). Point-to-point session frames
+    // between the sender and a carrier (the relay/mailbox roles from P2);
+    // they ride the encrypted session channel and are never batched.
+    OBJECT_OFFER         = 0x34,   // offer: object_id, size, payload_hash, lease ask
+    OBJECT_ACCEPT        = 0x35,   // accept: offered lease terms (carrier->sender)
+    OBJECT_REJECT        = 0x36,   // reject: structured reason + retry_after
+    OBJECT_DATA          = 0x37,   // payload: serialized NetworkObject envelope
+    STORED_ACK           = 0x38,   // signed storage lease (carrier->sender)
+
     // High-volume frames (not batched) for file transfer.
     FILE_TRANSFER        = 0x20,
 

@@ -28,6 +28,11 @@ namespace {
             case MessageType::PROXY_STREAM_DATA:
             case MessageType::OVERLAY_FRAME:
             case MessageType::NETWORK_OBJECT:
+            case MessageType::OBJECT_OFFER:
+            case MessageType::OBJECT_ACCEPT:
+            case MessageType::OBJECT_REJECT:
+            case MessageType::OBJECT_DATA:
+            case MessageType::STORED_ACK:
                 return true;
         }
         return false;

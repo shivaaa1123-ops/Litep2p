@@ -1140,6 +1140,18 @@ namespace detail {
                 LOG_WARN("MH: OVERLAY_FRAME received but overlay module not compiled");
 #endif
                 break;
+
+            // Network OS Phase 4: two-phase durable handoff frames. Point-to-
+            // point session frames (sender <-> carrier); routed to the optional
+            // handoff handler. No handler = dropped (safe by default).
+            case MessageType::OBJECT_OFFER:
+            case MessageType::OBJECT_ACCEPT:
+            case MessageType::OBJECT_REJECT:
+            case MessageType::OBJECT_DATA:
+            case MessageType::STORED_ACK:
+                m_sm->invoke_handoff_frame_handler(peer_id, type, payload);
+                break;
+
             default:
                 LOG_WARN("SM: Unknown message type received from " + peer_id + ", type=" + std::to_string(static_cast<int>(type)));
                 break;
@@ -1299,7 +1311,14 @@ namespace detail {
                                       msg_type != MessageType::FILE_TRANSFER &&
                                       msg_type != MessageType::VOICE_STREAM &&
                                       msg_type != MessageType::PROXY_CONTROL &&
-                                      msg_type != MessageType::PROXY_STREAM_DATA);
+                                      msg_type != MessageType::PROXY_STREAM_DATA &&
+                                      // Handoff frames are a request/response
+                                      // protocol — never batch them.
+                                      msg_type != MessageType::OBJECT_OFFER &&
+                                      msg_type != MessageType::OBJECT_ACCEPT &&
+                                      msg_type != MessageType::OBJECT_REJECT &&
+                                      msg_type != MessageType::OBJECT_DATA &&
+                                      msg_type != MessageType::STORED_ACK);
 
             const bool already_encrypted = (msg_type == MessageType::ENCRYPTED_DATA);
 #if HAVE_NOISE_PROTOCOL

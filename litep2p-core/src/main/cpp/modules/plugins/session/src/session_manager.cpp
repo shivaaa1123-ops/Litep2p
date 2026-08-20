@@ -233,6 +233,30 @@ void SessionManager::overlay_register_peer_signing_key(const std::string& peer_i
 #endif
 }
 
+std::pair<std::vector<uint8_t>, std::vector<uint8_t>> SessionManager::get_local_signing_keys() {
+#if HAVE_NOISE_PROTOCOL
+    if (m_impl->m_noise_key_store) {
+        if (!m_impl->m_noise_key_store->has_local_signing_keys()) {
+            m_impl->m_noise_key_store->generate_and_store_local_signing_keys();
+        }
+        return {m_impl->m_noise_key_store->get_local_signing_public_key(),
+                m_impl->m_noise_key_store->get_local_signing_private_key()};
+    }
+#endif
+    return {};
+}
+
+std::vector<uint8_t> SessionManager::get_peer_signing_key(const std::string& peer_id) const {
+#if HAVE_NOISE_PROTOCOL
+    if (m_impl->m_noise_key_store) {
+        return m_impl->m_noise_key_store->get_peer_signing_key(peer_id);
+    }
+#else
+    (void)peer_id;
+#endif
+    return {};
+}
+
 std::string SessionManager::overlay_stats_json() const {
     return m_impl->m_overlay_router ? m_impl->m_overlay_router->stats_json() : std::string("{}");
 }
@@ -362,6 +386,19 @@ bool SessionManager::invite_peer(const std::string& peer_id) {
 
 void SessionManager::set_capability_hooks(CapabilityProvider provider, CapabilityConsumer consumer) {
     m_impl->set_capability_hooks(std::move(provider), std::move(consumer));
+}
+
+void SessionManager::set_handoff_frame_handler(HandoffFrameHandler handler) {
+    m_impl->set_handoff_frame_handler(std::move(handler));
+}
+
+bool SessionManager::send_handoff_frame(const std::string& peer_id, MessageType type,
+                                        const std::string& payload) {
+    return m_impl->send_handoff_frame(peer_id, type, payload);
+}
+
+std::vector<std::string> SessionManager::getConnectedPeerIds() const {
+    return m_impl->get_connected_peer_ids();
 }
 
 // ============================================================================
@@ -6293,6 +6330,51 @@ void SessionManager::Impl::check_ping_timeouts_() {
     if (!cb) return;
     for (const auto& pid : expired) {
         cb(pid, -1);  // UNREACHABLE
+    }
+}
+
+// ==================== Phase 4: durable handoff hooks ====================
+void SessionManager::Impl::set_handoff_frame_handler(
+    std::function<void(const std::string&, MessageType, const std::string&)> handler) {
+    std::lock_guard<std::mutex> lock(m_handoff_frame_handler_mutex);
+    m_handoff_frame_handler = std::move(handler);
+}
+
+bool SessionManager::Impl::send_handoff_frame(const std::string& peer_id, MessageType type,
+                                              const std::string& payload) {
+    if (m_shutting_down.load(std::memory_order_acquire)) return false;
+    const std::string wire_message = wire::encode_message(type, payload);
+    sendMessageToPeer(peer_id, wire_message);
+    return true;
+}
+
+std::vector<std::string> SessionManager::Impl::get_connected_peer_ids() const {
+    std::vector<std::string> out;
+    std::lock_guard<std::mutex> lock(m_peers_mutex);
+    out.reserve(m_peers.size());
+    for (const auto& kv : m_peers) {
+        if (kv.second.connected) out.push_back(kv.first);
+    }
+    return out;
+}
+
+void SessionManager::Impl::invoke_handoff_frame_handler(const std::string& peer_id,
+                                                        MessageType type,
+                                                        const std::string& payload) {
+    std::function<void(const std::string&, MessageType, const std::string&)> handler;
+    {
+        std::lock_guard<std::mutex> lock(m_handoff_frame_handler_mutex);
+        handler = m_handoff_frame_handler;
+    }
+    if (!handler) {
+        LOG_WARN("SM: handoff frame type=" + std::to_string(static_cast<int>(type)) +
+                 " from " + peer_id + " dropped (no handler registered)");
+        return;
+    }
+    try {
+        handler(peer_id, type, payload);
+    } catch (...) {
+        LOG_WARN("SM: handoff frame handler threw for peer " + peer_id);
     }
 }
 

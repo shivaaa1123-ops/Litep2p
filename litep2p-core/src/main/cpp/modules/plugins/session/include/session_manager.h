@@ -116,6 +116,15 @@ public:
     void overlay_register_peer_signing_key(const std::string& peer_id,
                                            const std::vector<uint8_t>& public_key);
 
+    // Network OS Phase 4: the local Ed25519 origin-signing keypair used to sign
+    // replica leases (STORED_ACK). Ensures the pair exists (generated and
+    // persisted on first call). Returns {public_key, secret_key}.
+    std::pair<std::vector<uint8_t>, std::vector<uint8_t>> get_local_signing_keys();
+
+    // The registered Ed25519 signing public key of a peer (empty when the peer
+    // is unknown) — used to verify the peer's STORED_ACK lease signature.
+    std::vector<uint8_t> get_peer_signing_key(const std::string& peer_id) const;
+
     // Overlay counters as single-line JSON (telemetry/diagnostics).
     std::string overlay_stats_json() const;
 #endif
@@ -266,6 +275,26 @@ public:
     using CapabilityConsumer =
         std::function<void(const std::string& peer_id, const std::string& cap_b64)>;
     void set_capability_hooks(CapabilityProvider provider, CapabilityConsumer consumer);
+
+    // ==================== Durable handoff hooks (Network OS Phase 4) ====================
+    // Registers the consumer for handoff frames (OBJECT_OFFER/ACCEPT/REJECT/
+    // DATA/STORED_ACK). The handler is invoked on engine threads with
+    // (peer_id, MessageType, payload); it must not block or send back into
+    // this same thread. No handler = handoff frames are dropped (carrier role
+    // off by default).
+    using HandoffFrameHandler =
+        std::function<void(const std::string& peer_id, MessageType type,
+                           const std::string& payload)>;
+    void set_handoff_frame_handler(HandoffFrameHandler handler);
+
+    // Send a typed handoff frame to a peer over the encrypted session channel
+    // (non-batchable, non-control path — mirrors FILE_TRANSFER routing).
+    bool send_handoff_frame(const std::string& peer_id, MessageType type,
+                            const std::string& payload);
+
+    // Snapshot of currently READY peers (used by Phase 4 peer selection and
+    // by diagnostics). Read-only; cheap.
+    std::vector<std::string> getConnectedPeerIds() const;
 
 // private:
     class Impl;

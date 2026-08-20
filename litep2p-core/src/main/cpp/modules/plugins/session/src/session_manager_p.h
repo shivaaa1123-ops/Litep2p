@@ -181,6 +181,26 @@ public:
     // when absent or when no consumer is registered.
     void handle_capability_field(const std::string& peer_id, const std::string& payload);
 
+    // ==================== Phase 4: durable handoff hooks ====================
+    // Registers the consumer invoked on engine threads for every handoff frame
+    // (OBJECT_OFFER/ACCEPT/REJECT/DATA/STORED_ACK) received from a peer. No
+    // handler registered = frames dropped (carrier role off).
+    void set_handoff_frame_handler(
+        std::function<void(const std::string&, MessageType, const std::string&)> handler);
+
+    // Encodes and sends a typed handoff frame over the encrypted session
+    // channel. Returns false when the peer is unknown/shutting down.
+    bool send_handoff_frame(const std::string& peer_id, MessageType type,
+                            const std::string& payload);
+
+    // Collects peer ids currently in READY state (bounded by m_peers size).
+    std::vector<std::string> get_connected_peer_ids() const;
+
+    // Dispatches an incoming handoff frame to the registered handler (invoked
+    // by MessageHandler). Safe no-op when no handler is registered.
+    void invoke_handoff_frame_handler(const std::string& peer_id, MessageType type,
+                                      const std::string& payload);
+
 private:
     friend class SessionManager;
     friend class detail::MessageHandler;
@@ -420,6 +440,14 @@ private:
     // registered for the counterpart.
     std::unique_ptr<overlay::OverlayRouter> m_overlay_router;
 #endif
+
+    // Network OS Phase 4: two-phase durable handoff (OBJECT_OFFER/ACCEPT/
+    // REJECT/DATA/STORED_ACK). The optional handler receives every handoff
+    // frame from a connected peer (peer_id, MessageType, payload) on an
+    // engine thread; it must not block. No handler = frames are logged and
+    // dropped (safe-by-default: no carrier role).
+    std::function<void(const std::string&, MessageType, const std::string&)> m_handoff_frame_handler;
+    mutable std::mutex m_handoff_frame_handler_mutex;
 
     // Remote control configuration (safe-by-default: disabled unless config enables it)
     bool m_remote_control_enabled{false};
