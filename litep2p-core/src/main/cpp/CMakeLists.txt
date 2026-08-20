@@ -119,6 +119,8 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/capability/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/session/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/object/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/objectstore/include
 )
 
 if(ENABLE_PROXY_MODULE)
@@ -336,9 +338,17 @@ set(NETWORKOS_SOURCES
     "modules/networkos/platform/android/AndroidPlatformAdapter.cpp"
     "modules/networkos/capability/src/capability.cpp"
     "modules/networkos/session/src/SessionFacade.cpp"
+    "modules/networkos/object/src/object_id.cpp"
+    "modules/networkos/object/src/envelope.cpp"
+    "modules/networkos/object/src/e2e.cpp"
+    "modules/networkos/objectstore/src/ObjectStore.cpp"
 )
 add_library(litep2p_networkos STATIC ${NETWORKOS_SOURCES})
 target_link_libraries(litep2p_networkos litep2p_corep2p litep2p_session)
+# Network OS object module (envelope + E2E) uses libsodium primitives.
+if(LITEP2P_ENABLE_NOISE_PROTOCOL)
+    target_link_libraries(litep2p_networkos sodium)
+endif()
 
 # Main shared library
 add_library(litep2p SHARED

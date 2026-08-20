@@ -42,6 +42,7 @@ SqliteDyn::SqliteDyn()
       p_column_text(nullptr),
       p_column_int(nullptr),
       p_column_int64(nullptr),
+      p_column_bytes(nullptr),
       p_errmsg(nullptr) {}
 
 SqliteDyn::~SqliteDyn() {
@@ -94,6 +95,7 @@ bool SqliteDyn::load() {
     ok &= resolve_symbol_(reinterpret_cast<void**>(&p_column_text), "sqlite3_column_text");
     ok &= resolve_symbol_(reinterpret_cast<void**>(&p_column_int), "sqlite3_column_int");
     ok &= resolve_symbol_(reinterpret_cast<void**>(&p_column_int64), "sqlite3_column_int64");
+    ok &= resolve_symbol_(reinterpret_cast<void**>(&p_column_bytes), "sqlite3_column_bytes");
     ok &= resolve_symbol_(reinterpret_cast<void**>(&p_errmsg), "sqlite3_errmsg");
 
     if (!ok) {
@@ -125,6 +127,7 @@ void SqliteDyn::unload() {
     p_column_text = nullptr;
     p_column_int = nullptr;
     p_column_int64 = nullptr;
+    p_column_bytes = nullptr;
     p_errmsg = nullptr;
 }
 
@@ -206,6 +209,11 @@ int SqliteDyn::column_int(sqlite3_stmt* stmt, int col) {
 int64_t SqliteDyn::column_int64(sqlite3_stmt* stmt, int col) {
     if (!p_column_int64) return 0;
     return p_column_int64(stmt, col);
+}
+
+int SqliteDyn::column_bytes(sqlite3_stmt* stmt, int col) {
+    if (!p_column_bytes) return 0;
+    return p_column_bytes(stmt, col);
 }
 
 const char* SqliteDyn::errmsg(sqlite3* db) {

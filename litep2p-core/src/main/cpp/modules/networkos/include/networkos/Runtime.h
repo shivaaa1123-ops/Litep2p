@@ -15,7 +15,8 @@
 
 namespace networkos {
 
-class SessionFacade;  // declared in networkos/session/SessionFacade.h
+class SessionFacade;   // declared in networkos/session/SessionFacade.h
+class ObjectStore;     // declared in networkos/objectstore/ObjectStore.h
 
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
@@ -163,6 +164,10 @@ public:
     // Phase 2: session facade owned by the runtime (bounds, capabilities,
     // telemetry). Default: none (runtimes without a session layer return null).
     virtual SessionFacade* sessionFacade() { return nullptr; }
+
+    // Phase 3: durable object store owned by the runtime (SQLite/WAL).
+    // Default: none (runtimes without files_dir / without SQLite).
+    virtual ObjectStore* objectStore() { return nullptr; }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).

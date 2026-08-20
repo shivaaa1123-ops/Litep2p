@@ -27,6 +27,7 @@ namespace {
             case MessageType::PROXY_CONTROL:
             case MessageType::PROXY_STREAM_DATA:
             case MessageType::OVERLAY_FRAME:
+            case MessageType::NETWORK_OBJECT:
                 return true;
         }
         return false;

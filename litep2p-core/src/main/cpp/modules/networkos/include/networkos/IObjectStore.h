@@ -16,12 +16,12 @@
 #include <vector>
 
 #include "Runtime.h"
+#include "networkos/object/object_id.h"
 
 namespace networkos {
 
-// Object identity (Phase 3 defines the full ObjectID = NetworkID + OriginPeerID
-// + 128-bit nonce; today we only need an opaque key type).
-using ObjectId = std::string;
+// Object identity = NetworkID + OriginPeerID + 128-bit nonce (Phase 3).
+// See networkos/object/object_id.h.
 
 enum class ObjectStatus : uint8_t {
     kQueuedLocal = 0,  // durably persisted locally
@@ -35,11 +35,19 @@ struct ObjectMeta {
     std::string namespace_id;
     std::string origin;
     std::optional<std::string> destination;
+    std::string object_type;           // e.g. "message", "receipt" (P3)
     int64_t created_at_ms{0};
     int64_t ttl_ms{0};
     uint32_t priority{0};
     uint64_t payload_size{0};
     ObjectStatus status{ObjectStatus::kQueuedLocal};
+    // Phase 3 store columns (envelope data + lease/replica hints).
+    std::string payload_hash;              // 32-byte raw hash
+    std::string origin_header_blob;        // serialized origin header (envelope)
+    std::string origin_signature;          // Ed25519 signature
+    std::string forwarding_header_blob;    // serialized forwarding header
+    int64_t lease_expires_at_ms{0};
+    int64_t replica_hint{0};
 };
 
 // Quota snapshot for a namespace or origin (Phase 3 semantics).

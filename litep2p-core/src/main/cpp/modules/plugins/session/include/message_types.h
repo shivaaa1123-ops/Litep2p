@@ -20,6 +20,10 @@ enum class MessageType : uint8_t {
     // relay advertisements, mailbox traffic).
     OVERLAY_FRAME        = 0x32,
 
+    // Network OS Phase 3: generic network-object envelope framing (carries a
+    // serialized obj::NetworkObject inside the existing session framing).
+    NETWORK_OBJECT       = 0x33,
+
     // High-volume frames (not batched) for file transfer.
     FILE_TRANSFER        = 0x20,
 

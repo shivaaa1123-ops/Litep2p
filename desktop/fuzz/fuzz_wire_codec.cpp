@@ -1,7 +1,8 @@
-// Fuzz target for the wire codec (message framing) parser.
+// Fuzz target for the wire codec (message framing) parser + Phase 3 envelope.
 //
-// Feed arbitrary bytes into wire::decode_message (both overloads) and ensure
-// it returns gracefully without crashing, UB, or unbounded allocation.
+// Feed arbitrary bytes into wire::decode_message (both overloads) and the
+// network-object envelope deserializer; ensure they return gracefully without
+// crashing, UB, or unbounded allocation.
 //
 // Build (desktop, clang):
 //   cmake -S desktop -B desktop/build-fuzz -DLITEP2P_FUZZING=ON \
@@ -11,6 +12,7 @@
 
 #include "wire_codec.h"
 #include "message_types.h"
+#include "networkos/object/envelope.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +33,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     // Round-trip: if the input framed successfully, re-encode a zero-length
     // payload and decode it (cheap invariant check inside the fuzzer).
     (void)wire::encode_message(type, payload);
+
+    // Phase 3: feed the raw bytes into the network-object envelope parser.
+    // Must never crash/hang on arbitrary input (all lengths validated before
+    // allocation; oversized input rejected by the bounded decoder).
+    networkos::obj::NetworkObject obj;
+    if (networkos::obj::deserialize(std::string(sv), obj)) {
+        // If it parsed, round-trip it back through the encoder.
+        (void)networkos::obj::serialize(obj);
+    }
 
     return 0;
 }

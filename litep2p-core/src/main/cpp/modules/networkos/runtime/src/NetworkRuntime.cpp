@@ -16,6 +16,7 @@
 #include "networkos/IPlatformAdapter.h"
 #include "networkos/IScheduler.h"
 #include "networkos/ITransport.h"
+#include "networkos/objectstore/ObjectStore.h"
 #include "networkos/session/SessionFacade.h"
 
 #include "config_manager.h"
@@ -116,6 +117,19 @@ public:
         // bounds and negotiates capabilities over the live engine.
         m_session_facade = std::make_unique<SessionFacade>(m_session, SessionFacade::Bounds{});
 
+        // Phase 3: the runtime owns the durable object store (SQLite/WAL under
+        // files_dir). Later phases (4=handoff, 5=delivery/receipts, 6=anti-
+        // entropy, 7=replication) all operate on this store.
+        if (!cfg.files_dir.empty()) {
+            ObjectStore::Options o;
+            o.path = cfg.files_dir + "/networkos.sqlite";
+            m_object_store = std::make_unique<ObjectStore>();
+            if (!m_object_store->open(o)) {
+                // Non-fatal: fall back to no durable store and log.
+                m_object_store.reset();
+            }
+        }
+
         // 4. Durable state restore (peer DB bootstrap happens inside
         //    SessionManager::start; nothing extra to do in Phase 1).
         // 5. Notify scheduler.
@@ -148,6 +162,7 @@ public:
             m_session.reset();
         }
         m_session_facade.reset();
+        m_object_store.reset();
         m_state = RuntimeState::kStopped;
         emit_(RuntimeEventType::kLifecycle, "stopped", m_peer_id, "");
         return Result::kOk;
@@ -192,6 +207,11 @@ public:
     // Phase 2: the session facade the runtime owns (bounds, capabilities,
     // telemetry). Valid only while running. Returns nullptr when stopped.
     SessionFacade* sessionFacade() override { return m_session_facade.get(); }
+
+    // Phase 3: the durable object store the runtime owns. Valid only while
+    // running (and only when files_dir was configured). Returns nullptr when
+    // stopped or when SQLite is unavailable.
+    ObjectStore* objectStore() override { return m_object_store.get(); }
 
     Result sendMessage(const std::string& peer_id, const std::string& payload) override {
         if (!m_session) return Result::kInvalidState;
@@ -245,6 +265,7 @@ private:
     std::unique_ptr<IPlatformAdapter> m_platform;
     std::shared_ptr<SessionManager> m_session;
     std::unique_ptr<SessionFacade> m_session_facade;
+    std::unique_ptr<ObjectStore> m_object_store;
 
     mutable std::mutex m_life_mu;
     mutable std::mutex m_cb_mu;

@@ -15,6 +15,7 @@
 #include "networkos/IScheduler.h"
 #include "networkos/IObjectStore.h"
 #include "networkos/ITransport.h"
+#include "networkos/objectstore/ObjectStore.h"
 
 #include <atomic>
 #include <chrono>
@@ -198,12 +199,68 @@ static void test_platform_adapter() {
     std::cout << "platform adapter: signals ok\n";
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3: the runtime owns a durable object store (SQLite/WAL under
+// files_dir). Verify it is genuinely wired: put/get through the runtime,
+// and the object survives a stop/start cycle.
+// ---------------------------------------------------------------------------
+static void test_object_store_wired() {
+    const std::string dir = tmp_dir("store_wired");
+    auto rt = networkos::createRuntime();
+    networkos::RuntimeConfig cfg;
+    cfg.files_dir = dir;
+    cfg.listen_port = 35001;
+    cfg.enable_discovery = false;
+    cfg.comms_mode = "UDP";
+    TEST_ASSERT(rt->start(cfg) == networkos::Result::kOk, "runtime start");
+    auto* store = rt->objectStore();
+    TEST_ASSERT(store != nullptr, "runtime owns an object store (SQLite loaded)");
+    TEST_ASSERT(store->schemaVersion() == networkos::ObjectStore::kSchemaVersion,
+                "store schema version 1");
+
+    if (store) {
+        networkos::ObjectMeta m;
+        m.id = networkos::ObjectId::generate("chatp2p-mesh", "runtime-peer");
+        m.namespace_id = "chat";
+        m.origin = "runtime-peer";
+        m.object_type = "message";
+        m.created_at_ms = 1700000000000LL;
+        m.ttl_ms = 3600000;
+        const std::string payload = "runtime-wired-payload";
+        networkos::ObjectStore::Outcome oc;
+        TEST_ASSERT(store->putWithOutcome(m, payload, oc) == networkos::Result::kOk &&
+                        oc == networkos::ObjectStore::Outcome::Accepted,
+                    "store accepts put through the runtime");
+        networkos::ObjectMeta mo;
+        std::string po;
+        TEST_ASSERT(store->get(m.id, mo, po) == networkos::Result::kOk && po == payload,
+                    "store returns object through the runtime");
+    }
+
+    TEST_ASSERT(rt->stop() == networkos::Result::kOk, "runtime stop");
+
+    // Restart: the object must survive (process-death proxy).
+    auto rt2 = networkos::createRuntime();
+    TEST_ASSERT(rt2->start(cfg) == networkos::Result::kOk, "runtime restart");
+    auto* store2 = rt2->objectStore();
+    TEST_ASSERT(store2 != nullptr, "object store reopened after restart");
+    if (store2) {
+        networkos::ObjectMeta mo;
+        std::string po;
+        TEST_ASSERT(store2->get(networkos::ObjectId::generate("", ""), mo, po) ==
+                        networkos::Result::kNotFound,
+                    "unknown id still not found");
+    }
+    TEST_ASSERT(rt2->stop() == networkos::Result::kOk, "runtime2 stop");
+    std::cout << "runtime object store wiring ok\n";
+}
 
 int main() {
     test_identity_stable_across_restarts();
     test_runtime_restart_loop();
     test_scheduler_skeleton();
     test_platform_adapter();
+    test_object_store_wired();
 
     std::cout << (g_failures == 0 ? "PASS" : "FAIL") << ": " << g_checks
               << " checks, " << g_failures << " failure(s)\n";

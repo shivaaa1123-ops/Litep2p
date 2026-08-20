@@ -224,9 +224,9 @@ Update after each phase is approved and committed:
 
 - [x] Phase 0 — Freeze & Measure (`00_phase_0_freeze_and_measure.md`) — **COMPLETE** (commit `be2b084`; maps `docs/network-os/01..09` + `baseline-2026-08-20.json`; 5× suites green; live-peer + idle baselines recorded in §10)
 - [x] Phase 1 — Core Runtime Refactor (`01_phase_1_core_architecture_refactor.md`) — **COMPLETE** (commit `55d6adc`; `modules/networkos/` skeleton + `NetworkRuntime` lifecycle + `FileIdentityStore` + scheduler + platform adapters; 100× restart + 20× SIGKILL + C ABI diff empty + 5× suites green + native build green)
-- [ ] Phase 2 — Secure Session Layer (`02_phase_2_secure_session_layer.md`)
 - [x] Phase 2 — Secure Session Layer (`02_phase_2_secure_session_layer.md`) — **COMPLETE** (commits `9ef55fa` + audit fixes `2438a4e`; capability negotiation on CONTROL_CONNECT, SessionFacade bounds/timeouts/telemetry, multiplexing contract, stable-PeerID tests; 148-check suite + 5× suites green + live peers + network-switch test + native build)
 - [ ] Phase 3 — Durable Network Object Store (`03_phase_3_durable_network_object_store.md`)
+- [x] Phase 3 — Durable Network Object Store (`03_phase_3_durable_network_object_store.md`) — **COMPLETE** (commit `0fa8245`; `object/` ObjectID + signed immutable/mutable envelope + E2E key model, `objectstore/` SQLite/WAL store (transactions, hierarchical quotas, TTL, dedup-before-work, score eviction, crash-safe open, forward-migration guard), runtime owns store at `files_dir/networkos.sqlite`; envelope 131 checks × 10, store 43 checks × 10, SIGKILL harness 10/10, 13 suites × 5 = 0 failures, native build green, C ABI 56 functions identical, fuzz 60s no crash)
 - [ ] Phase 4 — Confirmed Remote Storage (`04_phase_4_confirmed_remote_storage.md`)
 - [ ] Phase 5 — Direct Delivery + Receipts (`05_phase_5_direct_delivery_and_receipts.md`)
 - [ ] Phase 6 — Anti-Entropy (`06_phase_6_anti_entropy.md`)

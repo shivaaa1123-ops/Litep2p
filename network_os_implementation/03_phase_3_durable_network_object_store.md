@@ -93,7 +93,8 @@ Reuse existing engine signing. Verify the signature before any expensive work
 - Content key wrapped for each recipient/origin using their public keys;
   wrappers stored in the envelope's recipient-wrapped section.
 - Storage/relay peers see ciphertext + envelope metadata only.
-- Document the scheme in `docs/network-os/09-e2e-key-model.md`.
+- Document the scheme in `docs/network-os/11-e2e-key-model.md` (P0 mapped
+  `09-` to `delivery-path-map.md`).
 
 ### Step 3.5 — SQLite object store
 New module `modules/networkos/objectstore/` implementing `IObjectStore` from
@@ -177,8 +178,11 @@ whole-object RAM buffering.
 
 ## 8. Deliverables
 - `modules/networkos/object/` and `modules/networkos/objectstore/` modules.
-- `desktop/tests/object_store_test` + `desktop/tests/object_envelope_test`.
-- `docs/network-os/09-e2e-key-model.md`.
+- `desktop/tests/object_store_test` + `desktop/tests/object_envelope_test` +
+  `desktop/tools/object_store_kill_probe` (crash probe) +
+  `desktop/tools/object_store_kill_test.sh` (kill harness) +
+  `desktop/tools/envelope_fuzz_smoke` (libFuzzer substitute, see §10).
+- `docs/network-os/11-e2e-key-model.md` (E2E key model).
 - Schema version + migration fixtures.
 
 ## 9. Verification Plan (repeated cycles — required)
@@ -213,16 +217,16 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | envelope unit tests | 10 | PASS/FAIL | ... |
-| YYYY-MM-DD | store crash tests | 10 | PASS/FAIL | kill points |
-| YYYY-MM-DD | restart survival | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | quota enforcement | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | TTL expiry | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | dedup | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | memory bounds | 3 | PASS/FAIL | high-water value |
-| YYYY-MM-DD | existing suites | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | native build | 1 | PASS/FAIL | ... |
-| YYYY-MM-DD | fuzz | 1 | PASS/FAIL | 60s |
+| 2026-08-20 | envelope unit tests | 10 | PASS | `object_envelope_test` 131 checks × 10, 0 failures; round-trip, tamper (payload byte flip fails), forwarding-header mutation preserves signature, unknown-field tolerance, malformed rejection |
+| 2026-08-20 | store crash tests | 10 | PASS | `object_store_kill_test.sh` 10 cycles × (burst kill at random arrow + post-commit kill); reopen always clean; killed-after-N-inserts ⇒ exactly N present; committed object always survives SIGKILL |
+| 2026-08-20 | restart survival | 10 | PASS | `object_store_test` reopen sections (also 100× restart from Phase 1 covers identity); TTL unchanged by reopen |
+| 2026-08-20 | quota enforcement | 10 | PASS | namespace/origin/global caps; over-quota insert → `REJECTED_QUOTA`; system reserve untouched |
+| 2026-08-20 | TTL expiry | 10 | PASS | expires at created+ttl; re-insert with new TTL does NOT extend (dedup-idempotent); dedup record survives expiry |
+| 2026-08-20 | dedup | 10 | PASS | same ObjectID re-insert returns existing state; dedup table bounded |
+| 2026-08-20 | memory bounds | 10 | PASS | 1000-object batch: per-object inserts (no whole-batch buffering); byte accounting exact; spot-check read |
+| 2026-08-20 | existing suites | 5 | PASS | `run_all_tests.sh 5` = 13 suites × 5 = 0 failures (added object_envelope_test, object_store_test) |
+| 2026-08-20 | native build | 1 | PASS | `:litep2p-core:externalNativeBuildMultiThreadDebug` SUCCESSFUL (1m44s); C ABI check 56 functions identical |
+| 2026-08-20 | fuzz | 1 | PASS | libFuzzer runtime absent on Apple clang 12 (documented); TU compiles clean; `envelope_fuzz_smoke --seconds 60`: 9,833,167 iterations (≈2.0M parsed), no crash; fuzz_wire_codec extended with envelope input |
 
 ## 11. Risks & mitigations
 
@@ -235,14 +239,22 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [ ] ObjectID + envelope + origin signature implemented and unit-tested 10×.
-- [ ] E2E key model documented and implemented.
-- [ ] SQLite object store with transactions, quotas, TTL, dedup, eviction.
-- [ ] All §9 verification items green at required repetitions.
-- [ ] Invariants 2, 6, 8, 9, 10, 16 asserted by tests.
-- [ ] Native build green; existing suites green.
-- [ ] Status table in `METHODOLOGY.md` updated.
-- [ ] Committed with message:
+- [x] ObjectID + envelope + origin signature implemented and unit-tested 10×
+      (`object_envelope_test`, 131 checks × 10 green).
+- [x] E2E key model documented and implemented (`e2e.h/cpp` — XChaCha20-Poly1305
+      payload AEAD + `crypto_box_seal` content-key wrapping; see
+      `docs/network-os/11-e2e-key-model.md`).
+- [x] SQLite object store with transactions, quotas, TTL, dedup, eviction
+      (`ObjectStore` on `sqlite3_dyn`, WAL, `synchronous=NORMAL`, crash-safe
+      open, forward-migration guard).
+- [x] All §9 verification items green at required repetitions (§10 log).
+- [x] Invariants 2, 6, 8, 9, 10, 16 asserted by tests (never ACK before
+      commit — SIGKILL harness; dedup-before-work; quota-in-transaction;
+      bounded memory; namespace isolation; signed-origin + tamper detect).
+- [x] Native build green; existing suites green (13 suites × 5 passes, 0
+      failures; C ABI 56 functions identical).
+- [x] Status table in `METHODOLOGY.md` updated.
+- [x] Committed with message:
       `Network OS P3: generic network object + durable SQLite object store`.
 
 

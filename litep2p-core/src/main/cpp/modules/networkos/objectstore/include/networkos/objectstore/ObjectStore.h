@@ -1,0 +1,119 @@
+#pragma once
+
+// Network OS — Durable object store (master doc §24/§25/§26/§27/§28/§29,
+// §89 Phase 3; implements the Phase 1 IObjectStore).
+//
+// SQLite (WAL, via the existing dynamic loader sqlite3_dyn) backed store with:
+//   - crash-safe transactions (never ACK before durable commit — invariant 2)
+//   - namespace/origin/global quotas enforced inside the insert transaction
+//   - TTL expiry indexed by expires_at_ms, never refreshed by gossip (§21)
+//   - dedup table (bounded) checked BEFORE expensive work (§65/§29)
+//   - score-based eviction (§27)
+//   - explicit backpressure outcomes (§28)
+//   - schema versioning + forward migration
+//
+// The quota/eviction semantics generalize overlay_mailbox's proven bounded
+// carrier logic (locked decision 9) — not a parallel system.
+
+#include "networkos/IObjectStore.h"
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+
+namespace networkos {
+
+class ObjectStore : public IObjectStore {
+public:
+    static constexpr int kSchemaVersion = 1;
+
+    struct Options {
+        std::string path;                          // sqlite file path
+        bool enable_wal{true};
+        int busy_timeout_ms{5000};
+        uint64_t global_quota_bytes{256ull * 1024ull * 1024ull};
+        uint64_t system_reserve_bytes{4ull * 1024ull * 1024ull};  // peers can't consume
+        uint64_t default_namespace_quota_bytes{64ull * 1024ull * 1024ull};
+        uint64_t default_origin_quota_bytes{16ull * 1024ull * 1024ull};
+        int dedup_ttl_hours{24 * 7};               // TTL + receipt window + margin
+        size_t max_dedup_entries{200000};
+        size_t max_object_bytes{16ull * 1024ull * 1024ull};  // §34 memory bound
+    };
+
+    // Backpressure outcomes (§28) — every receiving path reports one; never
+    // silently drop after pretending to accept.
+    enum class Outcome {
+        Accepted = 0,
+        RejectedAuth,
+        RejectedPolicy,
+        RejectedQuota,
+        Busy,
+        RetryAfter,
+        Unsupported,
+    };
+    static const char* outcome_name(Outcome o);
+
+    ObjectStore();
+    ~ObjectStore() override;
+    ObjectStore(const ObjectStore&) = delete;
+    ObjectStore& operator=(const ObjectStore&) = delete;
+
+    // Open (creates schema if needed; runs integrity check + WAL). Returns
+    // false if SQLite cannot be loaded or the file is corrupt.
+    bool open(const Options& options);
+    void close();
+    bool is_open() const { return m_open; }
+
+    // ---- IObjectStore ------------------------------------------------------
+    Result put(const ObjectMeta& meta, std::string_view payload) override;
+    Result get(const ObjectId& id, ObjectMeta& meta_out,
+               std::string& payload_out) override;
+    Result remove(const ObjectId& id) override;
+    Result forEachExpired(int64_t now_ms,
+                          const std::function<Result(const ObjectId&)>& fn) override;
+    Result quota(const std::string& namespace_id, const std::string& origin,
+                 QuotaInfo& out) const override;
+    Result commit() override;
+
+    // ---- Phase 3 extras ----------------------------------------------------
+    // put + explicit backpressure outcome (the receive-path contract §28).
+    Result putWithOutcome(const ObjectMeta& meta, std::string_view payload,
+                          Outcome& out);
+
+    // Read metadata only (no payload).
+    Result getMeta(const ObjectId& id, ObjectMeta& meta_out) const;
+
+    // True when the object (or its dedup record) is known.
+    bool contains(const ObjectId& id) const;
+    bool isDuplicate(const ObjectId& id) const;
+
+    // Remove all objects expired at or before now_ms. Returns count removed.
+    Result purgeExpired(int64_t now_ms, uint64_t* removed = nullptr);
+
+    // Evict lowest-scoring objects until `need_bytes` are freed within the
+    // namespace+origin (or system reserve is hit). §27.
+    Result evictForQuota(const std::string& namespace_id,
+                         const std::string& origin,
+                         uint64_t need_bytes, uint64_t* freed = nullptr);
+
+    // Configure a namespace quota (hierarchical quotas §26/§53).
+    Result setNamespaceQuota(const std::string& namespace_id, uint64_t quota_bytes);
+
+    uint64_t countObjects() const;
+    uint64_t totalBytes() const;
+    int schemaVersion() const;
+    const Options& options() const { return m_options; }
+
+    // PIMPL (defined in ObjectStore.cpp). Public so the out-of-line definition
+    // is reachable (matches the engine's SessionManager pattern).
+    struct Impl;
+
+private:
+    std::unique_ptr<Impl> m_impl;
+    Options m_options;
+    bool m_open{false};
+};
+
+} // namespace networkos

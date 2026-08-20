@@ -55,6 +55,9 @@ public:
     const unsigned char* column_text(sqlite3_stmt* stmt, int col);
     int column_int(sqlite3_stmt* stmt, int col);
     int64_t column_int64(sqlite3_stmt* stmt, int col);
+    // Number of bytes in the column value (required to read TEXT/BLOB data of
+    // arbitrary length; column_text alone cannot tell the length).
+    int column_bytes(sqlite3_stmt* stmt, int col);
 
     const char* errmsg(sqlite3* db);
 
@@ -76,6 +79,7 @@ private:
     const unsigned char* (*p_column_text)(sqlite3_stmt*, int);
     int (*p_column_int)(sqlite3_stmt*, int);
     int64_t (*p_column_int64)(sqlite3_stmt*, int);
+    int (*p_column_bytes)(sqlite3_stmt*, int);
     const char* (*p_errmsg)(sqlite3*);
 
     bool resolve_symbol_(void** fn, const char* name);

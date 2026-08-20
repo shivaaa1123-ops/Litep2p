@@ -277,6 +277,10 @@ set(NETWORKOS_SOURCES
     ../litep2p-core/src/main/cpp/modules/networkos/platform/desktop/NullPlatformAdapter.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/capability/src/capability.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/session/src/SessionFacade.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/object/src/object_id.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/object/src/envelope.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/object/src/e2e.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/objectstore/src/ObjectStore.cpp
 )
 
 set(ENGINE_SOURCES
@@ -329,6 +333,8 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/networkos/include
     ../litep2p-core/src/main/cpp/modules/networkos/capability/include
     ../litep2p-core/src/main/cpp/modules/networkos/session/include
+    ../litep2p-core/src/main/cpp/modules/networkos/object/include
+    ../litep2p-core/src/main/cpp/modules/networkos/objectstore/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -509,6 +515,27 @@ target_link_libraries(network_runtime_test PRIVATE litep2p_engine)
 add_executable(capability_negotiation_test tests/capability_negotiation_test.cpp)
 target_include_directories(capability_negotiation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(capability_negotiation_test PRIVATE litep2p_engine)
+
+# Network OS Phase 3 verification: network object envelope + E2E key model.
+add_executable(object_envelope_test tests/object_envelope_test.cpp)
+target_include_directories(object_envelope_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(object_envelope_test PRIVATE litep2p_engine)
+
+# Network OS Phase 3 verification: SQLite object store.
+add_executable(object_store_test tests/object_store_test.cpp)
+target_include_directories(object_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(object_store_test PRIVATE litep2p_engine)
+
+# Network OS Phase 3 crash-consistency probe (driven by object_store_kill_test.sh).
+add_executable(object_store_kill_probe tools/object_store_kill_probe.cpp)
+target_include_directories(object_store_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(object_store_kill_probe PRIVATE litep2p_engine)
+
+# Network OS Phase 3 fuzz substitute (Apple clang lacks the libFuzzer runtime;
+# runs the envelope parser against randomized input for --seconds).
+add_executable(envelope_fuzz_smoke tools/envelope_fuzz_smoke.cpp)
+target_include_directories(envelope_fuzz_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(envelope_fuzz_smoke PRIVATE litep2p_engine)
 
 # Network OS Phase 1 SIGKILL restore probe (driven by sigkill_restore_test.sh).
 add_executable(network_runtime_kill_probe tools/network_runtime_kill_probe.cpp)
