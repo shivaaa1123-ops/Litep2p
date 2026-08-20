@@ -87,6 +87,11 @@ public:
     // delivered copy merely because bytes hit a socket. Returns replicas freed.
     size_t sweepReplicas(int64_t now_ms_value);
 
+    // Failure semantics (§61): mark undelivered objects whose TTL has expired
+    // as FAILED with failure_class TERMINAL (TTL_EXPIRED). Idempotent; objects
+    // already DELIVERED/CONFIRMED/FAILED are left untouched. Returns count.
+    size_t sweepExpiredDeliveries(int64_t now_ms_value);
+
     // Receive path (from the runtime frame hook). Never blocks.
     void onFrame(const std::string& peer_id, MessageType type,
                  const std::string& payload, bool i_am_destination);

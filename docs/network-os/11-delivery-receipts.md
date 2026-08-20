@@ -34,7 +34,8 @@ with one dedup and one receipt model:
    reverse-path must already work.
 
 The genuinely new primitive is the **signed destination receipt** — a
-first-class, signed, store-and-forward object.
+first-class, signed, store-and-forward object. The destination verifies the
+origin signature **and the payload hash** (Step 5.1) before committing.
 
 ## 3. Roles (a peer can hold several at once)
 
@@ -58,8 +59,12 @@ namespace: system, type: receipt
 
 - Receipts are themselves NetworkObjects (own ObjectID, short TTL, **high
   priority** — never blocked by bulk, §67).
+- The destination re-verifies the payload hash before ACKing (Step 5.1).
 - They use store-and-forward for the reverse hop (no special-casing), so
-  `CONFIRMED` survives process death on every hop (invariant 17).
+  `CONFIRMED` survives process death on every hop (invariant 17). When the
+  origin is offline, the receipt envelope is tracked so a carrier's
+  `OBJECT_ACCEPT` is answered with `OBJECT_DATA` — the full offer/accept/data
+  handshake completes on the reverse path (Phase 4 machinery).
 - Routing key is the **origin PeerID** of the delivered object (Step 5.3).
 
 ## 5. Idempotency & replica release

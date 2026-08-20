@@ -188,6 +188,25 @@ Run in this order; record every run in §10.
 | 2026-08-21 | C ABI | 1 | PASS | 56 functions identical to snapshot |
 | 2026-08-21 | tcpdump | 1 | pending | wire capture harness (phase4_tcpdump rules reused in p5 harness) |
 
+### Alignment audit (2026-08-21)
+
+Rechecked every doc statement against the code after the initial P5 commit
+(`00287d5`). All originally-claimed features were present; 5 gaps were found
+and **fixed**, each now covered by a delivery_test check (total 72):
+
+| Doc statement | Before | Resolution |
+|---|---|---|
+| Step 5.1 #3 "verifies signature + **hash**" | signature verified, hash NOT | **FIXED** — `handleDataMe_` recomputes `compute_payload_hash(payload)` and rejects mismatch (AUTH_FAILED_HASH) |
+| Step 5.3 store-and-forward receipt when origin offline | offered to carrier but no accept→DATA handshake → CONFIRMED lost | **FIXED** — `routeReceipt_` records the receipt envelope so a carrier's accept is answered with DATA (invariant 17) |
+| Step 5.7 `TTL_EXPIRED`→TERMINAL | enum existed, never triggered | **FIXED** — `sweepExpiredDeliveries` marks undelivered expired objects FAILED/TERMINAL (runs on retry/peer_ready) |
+| Step 5.1 #4 `require_receipt` policy | flag declared but dead | **FIXED** — `require_receipt=false` upgrades DELIVERED→CONFIRMED on RECEIVED_ACK alone |
+| Step 5.8 `DESTINATION_COMMIT` trace | emitted twice | **FIXED** — now emitted only at the destination commit point |
+
+Re-verified: delivery_test 72 checks × 5; handoff 104, object_store 63,
+runtime 941 green; `p5_milestone_scenario.sh` 3× + 20 durability probes = 0
+failures; Android native build green; C ABI 56 identical; full 15-suite × 5
+regression green.
+
 ## 11. Risks & mitigations
 
 | Risk | Mitigation |

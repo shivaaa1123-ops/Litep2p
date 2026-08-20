@@ -252,6 +252,43 @@ size_t DeliveryManager::sweepReplicas(int64_t now_ms_value) {
 }
 
 // ---------------------------------------------------------------------------
+// sweepExpiredDeliveries: failure semantics (§61). Objects whose TTL has
+// expired and that never reached a terminal delivery state are marked FAILED
+// (failure_class TERMINAL / TTL_EXPIRED). Objects already DELIVERED/CONFIRMED/
+// FAILED are untouched. Idempotent.
+// ---------------------------------------------------------------------------
+size_t DeliveryManager::sweepExpiredDeliveries(int64_t now_ms_value) {
+    if (!m_store) return 0;
+    std::vector<networkos::ObjectId> expired;
+    if (m_store->forEachExpired(now_ms_value, [&](const ObjectId& id) -> Result {
+            expired.push_back(id);
+            return Result::kOk;
+        }) != Result::kOk) {
+        return 0;
+    }
+    size_t failed = 0;
+    for (const auto& id : expired) {
+        ObjectStatus status;
+        if (m_store->deliveryReadout(id, &status, nullptr, nullptr, nullptr) !=
+            Result::kOk) {
+            continue;
+        }
+        if (status == ObjectStatus::kDelivered || status == ObjectStatus::kConfirmed ||
+            status == ObjectStatus::kFailed) {
+            continue;  // already terminal / delivered before expiry
+        }
+        if (m_store->failDelivery(id, kFailTerminal) != Result::kOk) continue;
+        ++failed;
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            m_ctr.ttl_expired++;
+        }
+        emit_("TTL_EXPIRED", id.toHex());
+    }
+    return failed;
+}
+
+// ---------------------------------------------------------------------------
 // onFrame: receive path. i_am_destination is true when the runtime resolved
 // that the object's destination field names this peer.
 // ---------------------------------------------------------------------------
@@ -332,6 +369,16 @@ void DeliveryManager::handleDataMe_(const std::string& peer_id, const handoff::D
             emit_("AUTH_FAILED", f.object_id_hex);
             return;
         }
+    }
+
+    // Verify the payload HASH (Step 5.1: "verifies signature + hash"). The
+    // origin-header payload_hash must match the actual payload bytes, or the
+    // frame is corrupt/tampered and must not be durably committed.
+    if (!obj.origin.payload_hash.empty() &&
+        obj::compute_payload_hash(obj.payload) != obj.origin.payload_hash) {
+        m_ctr.auth_failed++;
+        emit_("AUTH_FAILED_HASH", f.object_id_hex);
+        return;
     }
 
     // Idempotent commit: if already delivered, re-ACK the same receipt; never
@@ -425,12 +472,19 @@ void DeliveryManager::handleReceivedAck_(const std::string& peer_id, const Recei
     ObjectMeta meta;
     if (m_store->getMeta(id, meta) != Result::kOk) return;
     m_store->markDelivered(id, f.received_at_ms);
+    // Policy (Step 5.1 #4): if no signed receipt is required, DELIVERED is the
+    // terminal confirmation the sender cares about — upgrade to CONFIRMED
+    // immediately. Otherwise keep DELIVERED until the signed receipt returns.
+    if (!m_cfg.require_receipt) {
+        m_store->confirmObject(id, f.received_at_ms);
+        m_ctr.confirmed_objects++;
+        emit_("CONFIRMED", f.object_id_hex);
+    }
     {
         std::lock_guard<std::mutex> lock(m_mu);
         m_ctr.received_acks++;
         m_direct_pending.erase(f.object_id_hex);
     }
-    emit_("DESTINATION_COMMIT", f.object_id_hex);
     emit_("RECEIVED_ACK", f.object_id_hex);
 }
 
@@ -559,8 +613,14 @@ Result DeliveryManager::routeReceipt_(const ObjectMeta& receipt_meta,
         return Result::kOk;
     }
     // Store-and-forward: hand the envelope to a carrier for the reverse hop.
+    // Record the receipt so the carrier's OBJECT_ACCEPT is answered with
+    // OBJECT_DATA (Step 5.3 / invariant 17: CONFIRMED survives the hop).
     for (const auto& p : peers) {
         if (p.empty() || p == m_cfg.local_peer_id || p == origin) continue;
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            m_direct_pending[receipt_meta.id.toHex()] = receipt_envelope;
+        }
         send_(p, MessageType::OBJECT_OFFER,
               encode_offer([&] {
                   handoff::OfferFrame o;
@@ -650,9 +710,12 @@ void DeliveryManager::handleReceipt_(const std::string& origin,
 // retryPending: re-offer objects that are still queued (no reachable
 // destination / no carrier accepted) to newly-available peers. Idempotent.
 // ---------------------------------------------------------------------------
-size_t DeliveryManager::retryPending(int64_t /*now_ms_value*/,
+size_t DeliveryManager::retryPending(int64_t now_ms_value,
                                      const std::vector<std::string>& new_peers) {
     if (!m_store) return 0;
+    // TTL-expired + undelivered objects surface their TERMINAL failure on any
+    // connectivity/peer_ready retry window (§61).
+    sweepExpiredDeliveries(now_ms_value);
     if (new_peers.empty()) return 0;
     size_t sent = 0;
     // A freshly-reachable destination may have queued/undelivered objects.

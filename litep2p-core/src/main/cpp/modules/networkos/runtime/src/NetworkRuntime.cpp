@@ -104,7 +104,10 @@ public:
                             if (m_handoff) m_handoff->retryPending(now_ms());
                             // Phase 5: a newly-READY peer that is the
                             // destination of stored objects gets them pushed.
-                            if (m_delivery) m_delivery->forwardPending(p.id);
+                            if (m_delivery) {
+                                m_delivery->forwardPending(p.id);
+                                m_delivery->retryPending(now_ms(), {p.id});
+                            }
                         } else {
                             emit_(RuntimeEventType::kPeerState, "peer_disconnected", p.id, "");
                             if (m_session_facade) m_session_facade->onPeerState(p.id, "DISCONNECTED");

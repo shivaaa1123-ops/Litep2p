@@ -90,7 +90,8 @@ struct DNode {
     std::vector<std::string> connected;
     std::vector<std::string> events;
 
-    DNode(const std::string& id, const std::string& dbpath) : peer_id(id), db(dbpath) {
+    DNode(const std::string& id, const std::string& dbpath,
+          bool require_receipt = true) : peer_id(id), db(dbpath) {
         sign_pk.resize(32);
         sign_sk.resize(64);
         crypto_sign_keypair(sign_pk.data(), sign_sk.data());
@@ -99,6 +100,7 @@ struct DNode {
         store.open(opt);
         networkos::delivery::DeliveryManager::Config cfg;
         cfg.local_peer_id = id;
+        cfg.require_receipt = require_receipt;
         mgr = networkos::delivery::createDeliveryManager(&store, cfg);
         mgr->setEventFn([this](const std::string& kind, const std::string& payload) {
             events.push_back(kind + ":" + payload);
@@ -543,6 +545,137 @@ static void test_late_confirmation() {
     std::cout << "late confirmation ok\n";
 }
 
+// ---------------------------------------------------------------------------
+// 8. Payload-hash verification (Step 5.1: "verifies signature + hash"): a
+// frame whose payload does not match its declared hash must be rejected.
+// ---------------------------------------------------------------------------
+static void test_hash_verification() {
+    DNode a("peer-a", db_path("hash_a"));
+    DNode b("peer-b", db_path("hash_b"));
+    wire(a, b);
+
+    networkos::ObjectId id = networkos::ObjectId::generate("chatp2p-mesh", "peer-a");
+    const std::string payload = "tamper-me";
+    const std::string env =
+        make_envelope("peer-a", "peer-b", id, payload, 3600000, a.sign_sk.data(), a.sign_pk.data());
+    b.mgr->onFrame("peer-a", MessageType::OBJECT_DATA, env_to_data(env, id), true);
+    TEST_ASSERT(b.mgr->counters().receipts_created == 1, "valid payload accepted");
+
+    // Sign header for payloadA but send payloadB -> header hash mismatch.
+    const std::string payloadA = "payloadA";
+    const std::string payloadB = "payloadB";
+    networkos::obj::NetworkObject o;
+    o.origin.network_id = "chatp2p-mesh";
+    o.origin.namespace_id = "chat";
+    o.origin.object_id_hex = id.toHex();
+    o.origin.origin = "peer-a";
+    o.origin.destination = "peer-b";
+    o.origin.object_type = "message";
+    o.origin.created_at_ms = now_ms();
+    o.origin.ttl_ms = 3600000;
+    o.origin.priority = 1;
+    o.origin.payload_size = payloadA.size();
+    o.origin.payload_hash = networkos::obj::compute_payload_hash(payloadA);
+    o.payload = payloadB;
+    TEST_ASSERT(networkos::obj::sign_object(o, a.sign_sk.data(), a.sign_pk.data()), "sign");
+    const std::string bad_env = networkos::obj::serialize(o);
+    const uint64_t before = b.mgr->counters().receipts_created;
+    b.mgr->onFrame("peer-a", MessageType::OBJECT_DATA, env_to_data(bad_env, id), true);
+    TEST_ASSERT(b.mgr->counters().receipts_created == before, "hash-mismatched frame rejected");
+    TEST_ASSERT(b.mgr->counters().auth_failed == 1, "hash mismatch counted as auth failure");
+    std::cout << "hash verification ok\n";
+}
+
+// ---------------------------------------------------------------------------
+// 9. TTL expiry -> TERMINAL (§61): undelivered expired objects are swept to
+// FAILED/TERMINAL; delivered objects are untouched.
+// ---------------------------------------------------------------------------
+static void test_ttl_expired_terminal() {
+    DNode a("peer-a", db_path("ttl_a"));
+    DNode b("peer-b", db_path("ttl_b"));
+    (void)b;
+
+    networkos::ObjectId expired = networkos::ObjectId::generate("chatp2p-mesh", "peer-a");
+    networkos::ObjectId delivered = networkos::ObjectId::generate("chatp2p-mesh", "peer-a");
+    networkos::ObjectMeta m;
+    m.namespace_id = "chat"; m.origin = "peer-a"; m.destination = "peer-b";
+    m.object_type = "message"; m.created_at_ms = now_ms() - 7200000;  // 2h ago
+    m.ttl_ms = 3600000;  // expired 1h ago
+    m.priority = 1; m.payload_size = 5;
+    m.payload_hash = networkos::obj::compute_payload_hash("hello");
+    m.id = expired;
+    networkos::ObjectStore::Outcome oc;
+    TEST_ASSERT(a.store.putWithOutcome(m, "hello", oc) == networkos::Result::kOk, "expired obj stored");
+    m.id = delivered;
+    TEST_ASSERT(a.store.putWithOutcome(m, "world", oc) == networkos::Result::kOk, "delivered obj stored");
+    TEST_ASSERT(a.store.markDelivered(delivered, now_ms()) == networkos::Result::kOk, "mark delivered");
+
+    size_t failed = a.mgr->sweepExpiredDeliveries(now_ms());
+    TEST_ASSERT(failed == 1, "only the expired-undeclared object failed");
+    networkos::ObjectStatus st;
+    uint8_t fc;
+    TEST_ASSERT(a.store.deliveryReadout(expired, &st, nullptr, nullptr, &fc) == networkos::Result::kOk &&
+                    st == networkos::ObjectStatus::kFailed &&
+                    fc == networkos::delivery::kFailTerminal,
+                "expired object FAILED/TERMINAL");
+    TEST_ASSERT(a.store.deliveryReadout(delivered, &st, nullptr, nullptr, nullptr) == networkos::Result::kOk &&
+                    st == networkos::ObjectStatus::kDelivered,
+                "delivered object untouched");
+    TEST_ASSERT(a.mgr->counters().ttl_expired == 1, "ttl_expired counter");
+    std::cout << "ttl expired terminal ok\n";
+}
+
+// ---------------------------------------------------------------------------
+// 10. require_receipt=false policy (Step 5.1 #4): with receipts not required,
+// RECEIVED_ACK alone upgrades straight to CONFIRMED (DELIVERED is terminal).
+// ---------------------------------------------------------------------------
+static void test_no_receipt_policy() {
+    DNode a("peer-a", db_path("noreq_a"), false);  // require_receipt=false
+    DNode b("peer-b", db_path("noreq_b"));
+    a.mgr->setConnectedPeersFn([&b]() -> std::vector<std::string> { return {b.peer_id}; });
+    a.mgr->setSendFn([&a, &b](const std::string& pid, MessageType type, const std::string& p) -> bool {
+        if (pid == b.peer_id) {
+            b.mgr->onFrame(a.peer_id, type, p, true);
+            return true;
+        }
+        return false;
+    });
+    a.mgr->setSigningKeysFns(
+        [&a]() { return std::make_pair(a.sign_pk, a.sign_sk); },
+        [&b](const std::string& pid) {
+            return (pid == b.peer_id) ? b.sign_pk : std::vector<uint8_t>{};
+        });
+    b.mgr->setSigningKeysFns(
+        [&b]() { return std::make_pair(b.sign_pk, b.sign_sk); },
+        [&a](const std::string& pid) {
+            return (pid == a.peer_id) ? a.sign_pk : std::vector<uint8_t>{};
+        });
+    // B must be able to receive A's direct offer AND reply (accept/ack/receipt).
+    b.mgr->setConnectedPeersFn([&a]() -> std::vector<std::string> { return {a.peer_id}; });
+    b.mgr->setSendFn([&a, &b](const std::string& pid, MessageType type, const std::string& p) -> bool {
+        if (pid == a.peer_id) {
+            a.mgr->onFrame(b.peer_id, type, p, false);
+            return true;
+        }
+        return false;
+    });
+    networkos::ObjectId id = networkos::ObjectId::generate("chatp2p-mesh", "peer-a");
+    const std::string payload = "noreq";
+    const std::string env =
+        make_envelope("peer-a", "peer-b", id, payload, 3600000, a.sign_sk.data(), a.sign_pk.data());
+    networkos::ObjectMeta meta;
+    meta.id = id; meta.namespace_id = "chat"; meta.origin = "peer-a"; meta.destination = "peer-b";
+    meta.object_type = "message"; meta.created_at_ms = now_ms(); meta.ttl_ms = 3600000;
+    meta.priority = 1; meta.payload_size = payload.size();
+    meta.payload_hash = networkos::obj::compute_payload_hash(payload);
+    a.mgr->storeAndDeliver(meta, env, 0);
+    networkos::ObjectStatus st;
+    TEST_ASSERT(a.store.deliveryReadout(id, &st, nullptr, nullptr, nullptr) == networkos::Result::kOk &&
+                    st == networkos::ObjectStatus::kConfirmed,
+                "no-receipt policy: ACK alone reaches CONFIRMED");
+    std::cout << "require_receipt=false policy ok\n";
+}
+
 } // namespace
 
 int main() {
@@ -554,6 +687,9 @@ int main() {
     test_replica_release();
     test_failure_classes();
     test_late_confirmation();
+    test_hash_verification();
+    test_ttl_expired_terminal();
+    test_no_receipt_policy();
     std::cout << (g_failures == 0 ? "PASS" : "FAIL") << ": " << g_checks
               << " checks, " << g_failures << " failure(s)\n";
     return g_failures == 0 ? 0 : 1;
