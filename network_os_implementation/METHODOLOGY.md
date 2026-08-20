@@ -225,7 +225,7 @@ Update after each phase is approved and committed:
 - [x] Phase 0 — Freeze & Measure (`00_phase_0_freeze_and_measure.md`) — **COMPLETE** (commit `be2b084`; maps `docs/network-os/01..09` + `baseline-2026-08-20.json`; 5× suites green; live-peer + idle baselines recorded in §10)
 - [x] Phase 1 — Core Runtime Refactor (`01_phase_1_core_architecture_refactor.md`) — **COMPLETE** (commit `55d6adc`; `modules/networkos/` skeleton + `NetworkRuntime` lifecycle + `FileIdentityStore` + scheduler + platform adapters; 100× restart + 20× SIGKILL + C ABI diff empty + 5× suites green + native build green)
 - [ ] Phase 2 — Secure Session Layer (`02_phase_2_secure_session_layer.md`)
-- [x] Phase 2 — Secure Session Layer (`02_phase_2_secure_session_layer.md`) — **COMPLETE** (commit pending; capability negotiation on CONTROL_CONNECT, SessionFacade bounds + telemetry, multiplexing contract, stable-PeerID tests; 143-check suite + 5× suites green + live peers + native build)
+- [x] Phase 2 — Secure Session Layer (`02_phase_2_secure_session_layer.md`) — **COMPLETE** (commit `9ef55fa`; capability negotiation on CONTROL_CONNECT, SessionFacade bounds + telemetry, multiplexing contract, stable-PeerID tests; 143-check suite + 5× suites green + live peers + native build)
 - [ ] Phase 3 — Durable Network Object Store (`03_phase_3_durable_network_object_store.md`)
 - [ ] Phase 4 — Confirmed Remote Storage (`04_phase_4_confirmed_remote_storage.md`)
 - [ ] Phase 5 — Direct Delivery + Receipts (`05_phase_5_direct_delivery_and_receipts.md`)
