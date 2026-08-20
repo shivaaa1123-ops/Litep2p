@@ -360,6 +360,10 @@ bool SessionManager::invite_peer(const std::string& peer_id) {
     return m_impl->invite_peer(peer_id);
 }
 
+void SessionManager::set_capability_hooks(CapabilityProvider provider, CapabilityConsumer consumer) {
+    m_impl->set_capability_hooks(std::move(provider), std::move(consumer));
+}
+
 // ============================================================================
 // IMPLEMENTATION
 // ============================================================================
@@ -4866,7 +4870,8 @@ void SessionManager::Impl::handle_nat_punch_result_(const std::string& peer_id, 
                 payload += "|" + pk_hex + "|" + std::to_string(m_local_boot_id);
             }
 #endif
-            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, payload);
+            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT,
+                                                           append_capability_to_payload(payload));
             send_message_to_peer(network_id, connect_msg);
         }
         return;
@@ -5020,16 +5025,19 @@ void SessionManager::Impl::onData(const std::string& network_id, const std::stri
                 }
                 
                 std::string payload = m_localPeerId + "|" + pk_hex + "|" + std::to_string(m_local_boot_id);
-                std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, payload);
+                std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT,
+                                                               append_capability_to_payload(payload));
                 send_message_to_peer(network_id, connect_msg);
                 LOG_INFO("SM: Sent CONTROL_CONNECT with public key to " + peer_id);
             } else {
-                std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, m_localPeerId);
+                std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT,
+                                                               append_capability_to_payload(m_localPeerId));
                 send_message_to_peer(network_id, connect_msg);
                 LOG_INFO("SM: Sent CONTROL_CONNECT to " + peer_id);
             }
 #else
-            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, m_localPeerId);
+            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT,
+                                                           append_capability_to_payload(m_localPeerId));
             send_message_to_peer(network_id, connect_msg);
             LOG_INFO("SM: Sent CONTROL_CONNECT to " + peer_id);
 #endif
@@ -6207,6 +6215,59 @@ bool SessionManager::Impl::invite_peer(const std::string& peer_id) {
     if (peer_id.empty()) return false;
     signaling_send_invite(peer_id);
     return true;
+}
+
+// ==================== Phase 2: capability negotiation hooks ====================
+void SessionManager::Impl::set_capability_hooks(std::function<std::string()> provider,
+                                                std::function<void(const std::string&, const std::string&)> consumer) {
+    std::lock_guard<std::mutex> lock(m_capability_mutex);
+    m_capability_provider = std::move(provider);
+    m_capability_consumer = std::move(consumer);
+}
+
+std::string SessionManager::Impl::append_capability_to_payload(const std::string& payload) {
+    std::string cap_b64;
+    {
+        std::lock_guard<std::mutex> lock(m_capability_mutex);
+        if (m_capability_provider) {
+            cap_b64 = m_capability_provider();
+        }
+    }
+    if (cap_b64.empty()) return payload;
+    // Old peers split on '|' and only read fields[0..2]; a 4th field is ignored
+    // by them, so this stays byte-for-byte backward compatible.
+    return payload + "|" + cap_b64;
+}
+
+void SessionManager::Impl::handle_capability_field(const std::string& peer_id,
+                                                   const std::string& payload) {
+    // Format: "peer_id|pk_hex|boot_id|cap_b64" (cap_b64 optional).
+    std::string cap_b64;
+    {
+        std::stringstream ss(payload);
+        std::string item;
+        size_t idx = 0;
+        while (std::getline(ss, item, '|')) {
+            ++idx;
+            if (idx == 4) {
+                cap_b64 = item;
+                break;
+            }
+        }
+    }
+    if (cap_b64.empty()) return;  // old peer without capabilities
+    std::function<void(const std::string&, const std::string&)> consumer;
+    {
+        std::lock_guard<std::mutex> lock(m_capability_mutex);
+        consumer = m_capability_consumer;
+    }
+    if (consumer) {
+        try {
+            consumer(peer_id, cap_b64);
+        } catch (...) {
+            LOG_WARN("SM: capability consumer threw for peer " + peer_id);
+        }
+    }
 }
 
 void SessionManager::Impl::check_ping_timeouts_() {

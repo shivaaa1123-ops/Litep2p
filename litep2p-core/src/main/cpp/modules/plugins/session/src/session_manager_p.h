@@ -164,6 +164,23 @@ public:
     // Presence bookkeeping (called from signaling handlers / peer lifecycle).
     void note_peer_presence(const std::string& peer_id, bool online);
 
+    // ==================== Phase 2: capability negotiation hooks ====================
+    // The Network OS session facade registers a provider that returns the
+    // base64 capability document to append to every CONTROL_CONNECT payload,
+    // and a consumer that receives decoded peer capabilities on session setup.
+    // When no provider is registered the wire format is byte-for-byte the old
+    // "peer_id|pk_hex|boot_id" (backward compatible).
+    void set_capability_hooks(std::function<std::string()> provider,
+                              std::function<void(const std::string&, const std::string&)> consumer);
+
+    // Appends "|cap_b64" to a CONTROL_CONNECT payload when a provider is set.
+    std::string append_capability_to_payload(const std::string& payload);
+
+    // Parses the 4th (optional) "|cap_b64" field of a received CONTROL_CONNECT
+    // / CONTROL_CONNECT_ACK payload and forwards it to the consumer. Safe no-op
+    // when absent or when no consumer is registered.
+    void handle_capability_field(const std::string& peer_id, const std::string& payload);
+
 private:
     friend class SessionManager;
     friend class detail::MessageHandler;
@@ -176,6 +193,11 @@ private:
     void onDisconnect(const std::string& network_id);
     void timerLoop();
     void processEventQueue();
+
+    // Phase 2 capability hooks (set via set_capability_hooks).
+    std::function<std::string()> m_capability_provider;
+    std::function<void(const std::string&, const std::string&)> m_capability_consumer;
+    std::mutex m_capability_mutex;
     
     // Message handling
     void handleSendMessageWithRetry(const std::string& peer_id, const std::string& network_id, 

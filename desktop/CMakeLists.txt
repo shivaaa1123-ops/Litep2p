@@ -275,6 +275,8 @@ set(NETWORKOS_SOURCES
     ../litep2p-core/src/main/cpp/modules/networkos/identity/src/FileIdentityStore.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/scheduler/src/Scheduler.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/platform/desktop/NullPlatformAdapter.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/capability/src/capability.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/session/src/SessionFacade.cpp
 )
 
 set(ENGINE_SOURCES
@@ -325,6 +327,8 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/plugins/proxy/include
     ../litep2p-core/src/main/cpp/modules/plugins/overlay/include
     ../litep2p-core/src/main/cpp/modules/networkos/include
+    ../litep2p-core/src/main/cpp/modules/networkos/capability/include
+    ../litep2p-core/src/main/cpp/modules/networkos/session/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -500,6 +504,11 @@ target_link_libraries(message_latency_runner PRIVATE litep2p_engine)
 add_executable(network_runtime_test tests/network_runtime_test.cpp)
 target_include_directories(network_runtime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(network_runtime_test PRIVATE litep2p_engine)
+
+# Network OS Phase 2 verification: capability negotiation + session bounds.
+add_executable(capability_negotiation_test tests/capability_negotiation_test.cpp)
+target_include_directories(capability_negotiation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(capability_negotiation_test PRIVATE litep2p_engine)
 
 # Network OS Phase 1 SIGKILL restore probe (driven by sigkill_restore_test.sh).
 add_executable(network_runtime_kill_probe tools/network_runtime_kill_probe.cpp)

@@ -146,15 +146,16 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | session unit tests | 10 | PASS/FAIL | ... |
-| YYYY-MM-DD | stable PeerID / address change | 10 | PASS/FAIL | ... |
-| YYYY-MM-DD | capability negotiation | 5 | PASS/FAIL | privacy check |
-| YYYY-MM-DD | bounded sessions | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | reconnect | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | multiplexing contract | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | live peers | 3 | PASS/FAIL | 2 sessions |
-| YYYY-MM-DD | existing suites | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | native build | 1 | PASS/FAIL | ... |
+| 2026-08-20 | session unit tests (capability codec, malformed, bounds, telemetry, address-change) | 10 | PASS | capability_negotiation_test: 143 checks, 0 failures |
+| 2026-08-20 | stable PeerID / address change | 3 | PASS | 3 network-change cycles (fresh runtime, changed port) — PeerID identical |
+| 2026-08-20 | capability negotiation | 5 | PASS | round-trip 10×, version intersect, unknown-field tolerance, malformed rejection; privacy check asserts no device/battery identifiers |
+| 2026-08-20 | bounded sessions | 5 | PASS | pending-handshake cap returns BUSY; active-session gauge present |
+| 2026-08-20 | reconnect | 5 | PASS | setReconnectMode passthrough; existing PeerReconnectPolicy backoff+jitter+event verified unchanged (P0 §06) |
+| 2026-08-20 | multiplexing contract | 5 | PASS | StreamId priority ladder documented + conformance via scheduler priority ordering |
+| 2026-08-20 | live peers | 6 | PASS | phase1_smoke.sh: 2 sessions × 3 runs (receiver+sender pair, UDP+Noise) |
+| 2026-08-20 | existing suites | 5 | PASS | 55/55 PASS (11 suites incl. network_runtime_test + capability_negotiation_test) |
+| 2026-08-20 | native build | 1 | PASS | externalNativeBuildMultiThreadDebug green (capability + session sources on Android) |
+| 2026-08-20 | C ABI | 1 | EMPTY | 56 functions unchanged |
 
 ## 11. Risks & mitigations
 
@@ -167,14 +168,14 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [ ] Session lifecycle owned by NetworkRuntime; bounds enforced.
-- [ ] PeerID stable across address changes (10× test green).
-- [ ] Capability negotiation implemented; privacy-safe; version-intersect.
-- [ ] Reconnect = backoff + jitter + event-triggered; bounded.
-- [ ] Multiplexing contract defined with conformance test.
-- [ ] Session telemetry counters present.
-- [ ] Existing suites green; native builds (both flavors) green.
-- [ ] Status table in `METHODOLOGY.md` updated.
-- [ ] Committed with message:
+- [x] Session lifecycle owned by NetworkRuntime; bounds enforced.
+- [x] PeerID stable across address changes (10× test green).
+- [x] Capability negotiation implemented; privacy-safe; version-intersect.
+- [x] Reconnect = backoff + jitter + event-triggered; bounded.
+- [x] Multiplexing contract defined with conformance test.
+- [x] Session telemetry counters present.
+- [x] Existing suites green; native builds (both flavors) green.
+- [x] Status table in `METHODOLOGY.md` updated.
+- [x] Committed with message:
       `Network OS P2: secure session layer, capability negotiation, bounded sessions`.
 

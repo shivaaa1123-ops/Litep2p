@@ -1097,7 +1097,8 @@ namespace detail {
                 payload += "|" + pk_hex + "|" + std::to_string(m_sm->m_local_boot_id);
             }
 #endif
-            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, payload);
+            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT,
+                                                           m_sm->append_capability_to_payload(payload));
             m_sm->send_message_to_peer(network_id, connect_msg);
             
             m_sm->pushEvent(FSMEvent{event.peerId, PeerEvent::CONNECT_SUCCESS});
@@ -1388,7 +1389,8 @@ namespace detail {
                 payload += "|" + pk_hex + "|" + std::to_string(m_sm->m_local_boot_id);
             }
 #endif
-            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, payload);
+            std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT,
+                                                           m_sm->append_capability_to_payload(payload));
             m_sm->send_message_to_peer(network_id, connect_msg);
         }
     }

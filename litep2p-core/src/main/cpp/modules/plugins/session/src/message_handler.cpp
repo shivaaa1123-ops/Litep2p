@@ -475,7 +475,11 @@ namespace detail {
                         remote_boot_id = parseBootId(fields[2]);
                     }
                 }
-                
+
+                // Phase 2: deliver the peer's capability document (4th optional
+                // field) to the registered consumer for negotiation.
+                m_sm->handle_capability_field(peer_id, payload);
+
                 // Parse the public key bytes
                 std::vector<uint8_t> incoming_pk;
                 for (size_t i = 0; i + 1 < remote_pk_hex.length(); i += 2) {
@@ -651,7 +655,7 @@ namespace detail {
                 break;
             }
             case MessageType::CONTROL_CONNECT_ACK: {
-                // Format: "peer_id|public_key_hex|boot_id"
+                // Format: "peer_id|public_key_hex|boot_id" (+ optional cap_b64)
                 std::string remote_pk_hex;
                 uint64_t remote_boot_id = 0;
                 {
@@ -663,6 +667,10 @@ namespace detail {
                         remote_boot_id = parseBootId(fields[2]);
                     }
                 }
+
+                // Phase 2: deliver the peer's capability document (4th optional
+                // field) to the registered consumer for negotiation.
+                m_sm->handle_capability_field(peer_id, payload);
 
 #if HAVE_NOISE_PROTOCOL
                 if (m_sm->m_use_noise_protocol && !remote_pk_hex.empty() && m_sm->m_noise_key_store) {
@@ -895,7 +903,7 @@ namespace detail {
                                     }
                                     connect_payload += "|" + pk_hex + "|" + std::to_string(m_sm->m_local_boot_id);
                                 }
-                                const std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, connect_payload);
+                                const std::string connect_msg = wire::encode_message(MessageType::CONTROL_CONNECT, m_sm->append_capability_to_payload(connect_payload));
                                 m_sm->send_message_to_peer(event.network_id, connect_msg);
                                 LOG_INFO("MH: Sent CONTROL_CONNECT to prompt re-handshake with " + peer_id + " after decrypt failure");
                             }

@@ -16,6 +16,7 @@
 #include "networkos/IPlatformAdapter.h"
 #include "networkos/IScheduler.h"
 #include "networkos/ITransport.h"
+#include "networkos/session/SessionFacade.h"
 
 #include "config_manager.h"
 #include "constants.h"
@@ -64,6 +65,11 @@ public:
         } else if (!cfg.files_dir.empty()) {
             cm.loadConfig(cfg.files_dir + "/config.json");
         }
+        // Apply the runtime toggles on top of config.json (mirrors the C ABI).
+        cm.setValueAtPath({"network", "discovery_enabled"},
+                          cfg.enable_discovery ? true : false);
+        cm.setValueAtPath({"nat_traversal", "peer_discovery", "enabled"},
+                          cfg.enable_discovery ? true : false);
 
         // 2. Open identity (create-once; PeerID stable across restarts).
         m_identity = createFileIdentityStore(cfg.files_dir);
@@ -76,7 +82,7 @@ public:
 
         // 3. Open transports — start the existing engine behind the facade.
         const int port = cfg.listen_port > 0 ? cfg.listen_port : DEFAULT_SERVER_PORT;
-        m_session = std::make_unique<SessionManager>();
+        m_session = std::make_shared<SessionManager>();
         m_session->setMessageReceivedCallback(
             [this](const std::string& peer_id, const std::string& message) {
                 emit_(RuntimeEventType::kMessage, "message", peer_id, message);
@@ -89,8 +95,10 @@ public:
                     for (const auto& p : peers) {
                         if (p.connected) {
                             emit_(RuntimeEventType::kPeerState, "peer_ready", p.id, "");
+                            if (m_session_facade) m_session_facade->onPeerState(p.id, "READY");
                         } else {
                             emit_(RuntimeEventType::kPeerState, "peer_disconnected", p.id, "");
+                            if (m_session_facade) m_session_facade->onPeerState(p.id, "DISCONNECTED");
                         }
                     }
                 },
@@ -98,10 +106,15 @@ public:
                 m_peer_id);
         } catch (const std::exception& e) {
             m_session.reset();
+            m_session_facade.reset();
             m_state = RuntimeState::kFailed;
             emit_(RuntimeEventType::kLifecycle, "start_failed", "", e.what());
             return Result::kIo;
         }
+
+        // Phase 2: the runtime owns the session lifecycle — the facade enforces
+        // bounds and negotiates capabilities over the live engine.
+        m_session_facade = std::make_unique<SessionFacade>(m_session, SessionFacade::Bounds{});
 
         // 4. Durable state restore (peer DB bootstrap happens inside
         //    SessionManager::start; nothing extra to do in Phase 1).
@@ -134,6 +147,7 @@ public:
             m_session->stop();
             m_session.reset();
         }
+        m_session_facade.reset();
         m_state = RuntimeState::kStopped;
         emit_(RuntimeEventType::kLifecycle, "stopped", m_peer_id, "");
         return Result::kOk;
@@ -174,6 +188,10 @@ public:
     }
 
     std::string peerId() const override { return m_peer_id; }
+
+    // Phase 2: the session facade the runtime owns (bounds, capabilities,
+    // telemetry). Valid only while running. Returns nullptr when stopped.
+    SessionFacade* sessionFacade() override { return m_session_facade.get(); }
 
     Result sendMessage(const std::string& peer_id, const std::string& payload) override {
         if (!m_session) return Result::kInvalidState;
@@ -225,7 +243,8 @@ private:
     std::unique_ptr<IIdentityStore> m_identity;
     std::unique_ptr<IScheduler> m_scheduler;
     std::unique_ptr<IPlatformAdapter> m_platform;
-    std::unique_ptr<SessionManager> m_session;
+    std::shared_ptr<SessionManager> m_session;
+    std::unique_ptr<SessionFacade> m_session_facade;
 
     mutable std::mutex m_life_mu;
     mutable std::mutex m_cb_mu;

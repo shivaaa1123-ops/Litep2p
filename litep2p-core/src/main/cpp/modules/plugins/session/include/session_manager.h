@@ -259,6 +259,14 @@ public:
     bool lookup_peer(const std::string& alias_hash);
     bool invite_peer(const std::string& peer_id);
 
+    // ==================== Capability negotiation hooks (Network OS Phase 2) ====================
+    // Registers the capability provider/consumer used during session setup
+    // (CONTROL_CONNECT exchange). Backward compatible: no hooks = old wire format.
+    using CapabilityProvider = std::function<std::string()>;
+    using CapabilityConsumer =
+        std::function<void(const std::string& peer_id, const std::string& cap_b64)>;
+    void set_capability_hooks(CapabilityProvider provider, CapabilityConsumer consumer);
+
 // private:
     class Impl;
     std::unique_ptr<Impl> m_impl;

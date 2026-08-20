@@ -15,6 +15,8 @@
 
 namespace networkos {
 
+class SessionFacade;  // declared in networkos/session/SessionFacade.h
+
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
 // ---------------------------------------------------------------------------
@@ -157,6 +159,10 @@ public:
     // as litep2p_send). The object-delivery path arrives in Phase 5.
     virtual Result sendMessage(const std::string& peer_id,
                                const std::string& payload) = 0;
+
+    // Phase 2: session facade owned by the runtime (bounds, capabilities,
+    // telemetry). Default: none (runtimes without a session layer return null).
+    virtual SessionFacade* sessionFacade() { return nullptr; }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).

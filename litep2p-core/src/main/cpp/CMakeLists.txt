@@ -117,6 +117,8 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/session/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/plugins/overlay/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/capability/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/session/include
 )
 
 if(ENABLE_PROXY_MODULE)
@@ -332,6 +334,8 @@ set(NETWORKOS_SOURCES
     "modules/networkos/identity/src/FileIdentityStore.cpp"
     "modules/networkos/scheduler/src/Scheduler.cpp"
     "modules/networkos/platform/android/AndroidPlatformAdapter.cpp"
+    "modules/networkos/capability/src/capability.cpp"
+    "modules/networkos/session/src/SessionFacade.cpp"
 )
 add_library(litep2p_networkos STATIC ${NETWORKOS_SOURCES})
 target_link_libraries(litep2p_networkos litep2p_corep2p litep2p_session)
