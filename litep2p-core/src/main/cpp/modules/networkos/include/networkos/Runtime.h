@@ -20,6 +20,7 @@ class ObjectStore;     // declared in networkos/objectstore/ObjectStore.h
 
 namespace handoff { class HandoffManager; }  // declared in networkos/handoff/HandoffManager.h
 namespace delivery { class DeliveryManager; }  // declared in networkos/delivery/DeliveryManager.h
+namespace anti_entropy { class AntiEntropyManager; }  // declared in networkos/anti_entropy/AntiEntropyManager.h
 
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
@@ -181,6 +182,11 @@ public:
     // Valid only while running and only when the object store is present.
     // Default: none.
     virtual delivery::DeliveryManager* delivery() { return nullptr; }
+
+    // Phase 6: pull-heavy anti-entropy reconciliation manager owned by the
+    // runtime. Valid only while running and only when the object store is
+    // present. Default: none.
+    virtual anti_entropy::AntiEntropyManager* antiEntropy() { return nullptr; }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).

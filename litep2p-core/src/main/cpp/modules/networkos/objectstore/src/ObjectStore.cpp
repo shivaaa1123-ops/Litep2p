@@ -765,6 +765,32 @@ Result ObjectStore::forEachDeliveredReplica(
     return Result::kOk;
 }
 
+Result ObjectStore::enumerateInventory(
+    uint32_t limit,
+    const std::function<Result(const ObjectId&, ObjectStatus, int64_t)>& fn) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    if (limit == 0) return Result::kOk;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT object_id, state, created_at_ms FROM objects"
+        " ORDER BY created_at_ms LIMIT ?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, static_cast<int>(limit));
+    uint32_t yielded = 0;
+    while (st.step() == SQLITE_ROW) {
+        if (yielded >= limit) break;
+        ObjectId id;
+        const std::string hex = st.col_text(0);
+        if (!ObjectId::fromHex(hex, id)) continue;
+        const ObjectStatus s = static_cast<ObjectStatus>(st.col_int(1));
+        const int64_t created = st.col_int64(2);
+        ++yielded;
+        const Result rc = fn(id, s, created);
+        if (rc != Result::kOk) return rc;
+    }
+    return Result::kOk;
+}
+
 Result ObjectStore::markDelivered(const ObjectId& id, int64_t delivered_at_ms) {
     std::lock_guard<std::mutex> lock(m_impl->mu);
     if (!m_open) return Result::kInvalidState;

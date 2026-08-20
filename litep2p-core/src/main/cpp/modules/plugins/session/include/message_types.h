@@ -40,6 +40,13 @@ enum class MessageType : uint8_t {
     // storage lease, then issues a signed receipt object on the reverse path.
     RECEIVED_ACK         = 0x39,   // destination durably committed the object
 
+    // Network OS Phase 6: anti-entropy reconciliation (§82 typed frames).
+    // Pull-heavy: on a useful connection the peers exchange compact inventory
+    // summaries and explicitly WANT only the objects they are missing — no
+    // blind resend. Both frames are bounded (oversized requests rejected).
+    INVENTORY            = 0x3A,   // sender's held-object summary (format-flagged)
+    OBJECT_WANT          = 0x3B,   // explicit request for specific object_ids
+
     // High-volume frames (not batched) for file transfer.
     FILE_TRANSFER        = 0x20,
 

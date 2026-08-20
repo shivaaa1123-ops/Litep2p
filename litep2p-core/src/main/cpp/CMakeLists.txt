@@ -123,6 +123,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/objectstore/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/handoff/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/delivery/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/anti_entropy/include
 )
 
 if(ENABLE_PROXY_MODULE)
@@ -348,6 +349,8 @@ set(NETWORKOS_SOURCES
     "modules/networkos/handoff/src/HandoffManager.cpp"
     "modules/networkos/delivery/src/delivery_frames.cpp"
     "modules/networkos/delivery/src/DeliveryManager.cpp"
+    "modules/networkos/anti_entropy/src/anti_entropy_frames.cpp"
+    "modules/networkos/anti_entropy/src/AntiEntropyManager.cpp"
 )
 add_library(litep2p_networkos STATIC ${NETWORKOS_SOURCES})
 target_link_libraries(litep2p_networkos litep2p_corep2p litep2p_session)

@@ -193,6 +193,15 @@ public:
     Result forEachDeliveredReplica(
         int64_t before_ms, const std::function<Result(const ObjectId&)>& fn) const;
 
+    // Phase 6: inventory enumeration for anti-entropy (§12). Yields up to
+    // `limit` held objects (id, state, created_at_ms), oldest-first, so a peer
+    // can build a compact inventory summary. Bounded by `limit` — never builds
+    // an unbounded list internally.
+    Result enumerateInventory(
+        uint32_t limit,
+        const std::function<Result(const ObjectId&, ObjectStatus, int64_t)>& fn)
+        const;
+
     // Delivery-state transitions (§22) — idempotent: re-marking the same (or a
     // later) terminal state is a no-op and always converges.
     Result markDelivered(const ObjectId& id, int64_t delivered_at_ms);
