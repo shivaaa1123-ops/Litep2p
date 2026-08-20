@@ -19,6 +19,7 @@ class SessionFacade;   // declared in networkos/session/SessionFacade.h
 class ObjectStore;     // declared in networkos/objectstore/ObjectStore.h
 
 namespace handoff { class HandoffManager; }  // declared in networkos/handoff/HandoffManager.h
+namespace delivery { class DeliveryManager; }  // declared in networkos/delivery/DeliveryManager.h
 
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
@@ -175,6 +176,11 @@ public:
     // (signed replica leases). Valid only while running and only when the
     // object store is present. Default: none.
     virtual handoff::HandoffManager* handoff() { return nullptr; }
+
+    // Phase 5: direct-delivery + signed-receipt manager owned by the runtime.
+    // Valid only while running and only when the object store is present.
+    // Default: none.
+    virtual delivery::DeliveryManager* delivery() { return nullptr; }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).

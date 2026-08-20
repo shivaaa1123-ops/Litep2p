@@ -12,7 +12,7 @@ LOOP="${1:-1}"
 SUITES=(c_api_test session_manager_test overlay_test proxy_test file_transfer_test
         crypto_test nat_traversal_test malformed_input_test voice_call_test
         network_runtime_test capability_negotiation_test
-        object_envelope_test object_store_test handoff_test)
+        object_envelope_test object_store_test handoff_test delivery_test)
 
 total_fail=0
 for ((n = 0; n < LOOP; n++)); do

@@ -144,7 +144,10 @@ bool ObjectStore::open(const Options& options) {
         "  envelope_blob BLOB,"
         "  state INTEGER NOT NULL DEFAULT 0,"
         "  lease_expires_at_ms INTEGER,"
-        "  replica_hint INTEGER);",
+        "  replica_hint INTEGER,"
+        "  delivered_at_ms INTEGER,"
+        "  confirmed_at_ms INTEGER,"
+        "  failure_class INTEGER NOT NULL DEFAULT 0);",
         // Incremental usage counter (one row per namespace+origin). Quota
         // checks read this instead of SUM() over objects — otherwise every
         // insert is O(all objects) and the store degrades to O(N^2) (measured
@@ -181,6 +184,19 @@ bool ObjectStore::open(const Options& options) {
         "  carrier_id TEXT NOT NULL,"
         "  evicted_at_ms INTEGER NOT NULL,"
         "  lease_was_until_ms INTEGER NOT NULL);",
+        // Phase 5 (schema v3): direct delivery + signed receipts.
+        // - objects gains delivery state / timestamps / failure class.
+        // - receipts links a delivered object to its signed receipt object.
+        "CREATE TABLE IF NOT EXISTS receipts("
+        "  delivered_object_id TEXT PRIMARY KEY,"
+        "  receipt_object_id TEXT NOT NULL,"
+        "  origin TEXT NOT NULL,"
+        "  destination TEXT NOT NULL,"
+        "  receipt_type INTEGER NOT NULL,"
+        "  received_at_ms INTEGER NOT NULL,"
+        "  object_hash_hex TEXT NOT NULL,"
+        "  signature BLOB,"
+        "  signer_pk_hex TEXT);",
     };
     for (const char* sql : kSchema) {
         if (!m_impl->exec(sql)) { m_impl->teardown(); return false; }
@@ -193,7 +209,9 @@ bool ObjectStore::open(const Options& options) {
         if (st.ok() && st.step() == SQLITE_ROW) current = st.col_int(0);
         if (current > kSchemaVersion) { m_impl->teardown(); return false; }  // future DB
         if (current == 0) {
-            m_impl->exec("INSERT INTO schema_version(version) VALUES (2);");
+            // Fresh database: the CREATEs above already contain every
+            // column/table through schema v3.
+            m_impl->exec("INSERT INTO schema_version(version) VALUES (3);");
         } else if (current < kSchemaVersion) {
             // Migration v1 -> v2: Phase 4 tables (leases, evicted_early —
             // already created by the idempotent CREATEs above) plus the
@@ -213,7 +231,37 @@ bool ObjectStore::open(const Options& options) {
                 m_impl->teardown();
                 return false;
             }
-            if (!m_impl->exec("UPDATE schema_version SET version=2;")) {
+            if (current < 2) {
+                if (!m_impl->exec("UPDATE schema_version SET version=2;")) {
+                    m_impl->teardown();
+                    return false;
+                }
+            }
+            // Migration v2 -> v3: Phase 5 delivery columns on objects.
+            for (const char* col : {"delivered_at_ms", "confirmed_at_ms",
+                                    "failure_class"}) {
+                bool has = false;
+                {
+                    Impl::Stmt info(m_impl->sqlite, m_impl->db,
+                                    "PRAGMA table_info(objects);");
+                    if (info.ok()) {
+                        while (info.step() == SQLITE_ROW) {
+                            if (info.col_text(1) == col) has = true;
+                        }
+                    }
+                }
+                if (!has &&
+                    !m_impl->exec(std::string("ALTER TABLE objects ADD COLUMN " +
+                                              std::string(col) +
+                                              (std::string(col) == "failure_class"
+                                                   ? " INTEGER NOT NULL DEFAULT 0;"
+                                                   : " INTEGER;"))
+                                      .c_str())) {
+                    m_impl->teardown();
+                    return false;
+                }
+            }
+            if (!m_impl->exec("UPDATE schema_version SET version=3;")) {
                 m_impl->teardown();
                 return false;
             }
@@ -589,6 +637,212 @@ Result ObjectStore::updateObjectState(const ObjectId& id, ObjectStatus status) {
             d.step();
         }
     }
+    return Result::kOk;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: direct delivery + signed receipts
+// ---------------------------------------------------------------------------
+Result ObjectStore::recordReceipt(const ReceiptRow& row) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    // Idempotent upsert keyed by delivered_object_id: a duplicate delivery
+    // never creates a duplicate receipt row (invariant 3, 18).
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "INSERT OR REPLACE INTO receipts(delivered_object_id, receipt_object_id,"
+        " origin, destination, receipt_type, received_at_ms, object_hash_hex,"
+        " signature, signer_pk_hex) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, row.delivered_object_id_hex);
+    st.bind_text(2, row.receipt_object_id_hex);
+    st.bind_text(3, row.origin);
+    st.bind_text(4, row.destination);
+    st.bind_int(5, static_cast<int>(row.receipt_type));
+    st.bind_int64(6, row.received_at_ms);
+    st.bind_text(7, row.object_hash_hex);
+    st.bind_text(8, row.signature);
+    st.bind_text(9, row.signer_pk_hex);
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+Result ObjectStore::getReceipt(const std::string& delivered_object_id_hex,
+                               ReceiptRow& out) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT receipt_object_id, origin, destination, receipt_type,"
+        " received_at_ms, object_hash_hex, signature, signer_pk_hex"
+        " FROM receipts WHERE delivered_object_id=?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, delivered_object_id_hex);
+    if (st.step() != SQLITE_ROW) return Result::kNotFound;
+    out.delivered_object_id_hex = delivered_object_id_hex;
+    out.receipt_object_id_hex = st.col_text(0);
+    out.origin = st.col_text(1);
+    out.destination = st.col_text(2);
+    out.receipt_type = static_cast<uint8_t>(st.col_int(3));
+    out.received_at_ms = st.col_int64(4);
+    out.object_hash_hex = st.col_text(5);
+    out.signature = st.col_text(6);
+    out.signer_pk_hex = st.col_text(7);
+    return Result::kOk;
+}
+
+Result ObjectStore::forEachReceiptToward(
+    const std::string& destination,
+    const std::function<Result(const ReceiptRow&)>& fn) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    // "Aimed at `destination`" = the origin/recipient of the delivered object
+    // that the receipt is being returned TO. The recipient is recorded in the
+    // `origin` column (the signer is `destination`).
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT delivered_object_id, receipt_object_id, origin, destination,"
+        " receipt_type, received_at_ms, object_hash_hex, signature, signer_pk_hex"
+        " FROM receipts WHERE origin=?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, destination);
+    while (st.step() == SQLITE_ROW) {
+        ReceiptRow row;
+        row.delivered_object_id_hex = st.col_text(0);
+        row.receipt_object_id_hex = st.col_text(1);
+        row.origin = st.col_text(2);
+        row.destination = st.col_text(3);
+        row.receipt_type = static_cast<uint8_t>(st.col_int(4));
+        row.received_at_ms = st.col_int64(5);
+        row.object_hash_hex = st.col_text(6);
+        row.signature = st.col_text(7);
+        row.signer_pk_hex = st.col_text(8);
+        const Result rc = fn(row);
+        if (rc != Result::kOk) return rc;
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::forEachUndelivered(
+    const std::string& destination,
+    const std::function<Result(const ObjectId&)>& fn) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    // state IN (kStored=1, kDurabilityReached=5): not yet delivered/confirmed/
+    // failed/attempted. Order oldest-first so delivery is fair.
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT object_id FROM objects WHERE destination=?1 AND"
+        " state IN (1,5) ORDER BY created_at_ms;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, destination);
+    std::vector<ObjectId> ids;
+    while (st.step() == SQLITE_ROW) {
+        ObjectId id;
+        if (ObjectId::fromHex(st.col_text(0), id)) ids.push_back(std::move(id));
+    }
+    for (const ObjectId& id : ids) {
+        const Result rc = fn(id);
+        if (rc != Result::kOk) return rc;
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::forEachDeliveredReplica(
+    int64_t before_ms, const std::function<Result(const ObjectId&)>& fn) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    // state == kDelivered (7): the destination durably committed, so this
+    // replica is a candidate for release after its retention window.
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT object_id FROM objects WHERE state=7 AND delivered_at_ms <= ?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int64(1, before_ms);
+    std::vector<ObjectId> ids;
+    while (st.step() == SQLITE_ROW) {
+        ObjectId id;
+        if (ObjectId::fromHex(st.col_text(0), id)) ids.push_back(std::move(id));
+    }
+    for (const ObjectId& id : ids) {
+        const Result rc = fn(id);
+        if (rc != Result::kOk) return rc;
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::markDelivered(const ObjectId& id, int64_t delivered_at_ms) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET state=?1, delivered_at_ms=?2, failure_class=0"
+        " WHERE object_id=?3;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, static_cast<int>(ObjectStatus::kDelivered));
+    st.bind_int64(2, delivered_at_ms);
+    st.bind_text(3, id.toHex());
+    if (st.step() != SQLITE_DONE) return Result::kIo;
+    Impl::Stmt d(m_impl->sqlite, m_impl->db,
+        "UPDATE dedup SET terminal_state=7 WHERE object_id=?1;");
+    if (d.ok()) { d.bind_text(1, id.toHex()); d.step(); }
+    return Result::kOk;
+}
+
+Result ObjectStore::markDeliveryAttempted(const ObjectId& id) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET state=?1 WHERE object_id=?2 AND state < ?1;");
+    // Idempotent forward-only: only lift toward DELIVERY_ATTEMPTED (6).
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, static_cast<int>(ObjectStatus::kDeliveryAttempted));
+    st.bind_text(2, id.toHex());
+    st.step();
+    return Result::kOk;
+}
+
+Result ObjectStore::confirmObject(const ObjectId& id, int64_t confirmed_at_ms) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET state=?1, confirmed_at_ms=?2 WHERE object_id=?3;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, static_cast<int>(ObjectStatus::kConfirmed));
+    st.bind_int64(2, confirmed_at_ms);
+    st.bind_text(3, id.toHex());
+    st.step();
+    Impl::Stmt d(m_impl->sqlite, m_impl->db,
+        "UPDATE dedup SET terminal_state=8 WHERE object_id=?1;");
+    if (d.ok()) { d.bind_text(1, id.toHex()); d.step(); }
+    return Result::kOk;
+}
+
+Result ObjectStore::failDelivery(const ObjectId& id, uint8_t failure_class) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET state=?1, failure_class=?2 WHERE object_id=?3;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, static_cast<int>(ObjectStatus::kFailed));
+    st.bind_int(2, static_cast<int>(failure_class));
+    st.bind_text(3, id.toHex());
+    st.step();
+    Impl::Stmt d(m_impl->sqlite, m_impl->db,
+        "UPDATE dedup SET terminal_state=9 WHERE object_id=?1;");
+    if (d.ok()) { d.bind_text(1, id.toHex()); d.step(); }
+    return Result::kOk;
+}
+
+Result ObjectStore::deliveryReadout(const ObjectId& id, ObjectStatus* status_out,
+                                   int64_t* delivered_at_ms_out,
+                                   int64_t* confirmed_at_ms_out,
+                                   uint8_t* failure_class_out) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT state, delivered_at_ms, confirmed_at_ms, failure_class"
+        " FROM objects WHERE object_id=?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, id.toHex());
+    if (st.step() != SQLITE_ROW) return Result::kNotFound;
+    if (status_out) *status_out = static_cast<ObjectStatus>(st.col_int(0));
+    if (delivered_at_ms_out) *delivered_at_ms_out = st.col_int64(1);
+    if (confirmed_at_ms_out) *confirmed_at_ms_out = st.col_int64(2);
+    if (failure_class_out) *failure_class_out = static_cast<uint8_t>(st.col_int(3));
     return Result::kOk;
 }
 

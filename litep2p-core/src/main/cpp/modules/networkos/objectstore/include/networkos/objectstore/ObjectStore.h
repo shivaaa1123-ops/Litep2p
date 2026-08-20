@@ -27,7 +27,7 @@ namespace networkos {
 
 class ObjectStore : public IObjectStore {
 public:
-    static constexpr int kSchemaVersion = 2;
+    static constexpr int kSchemaVersion = 3;
 
     struct Options {
         std::string path;                          // sqlite file path
@@ -147,6 +147,65 @@ public:
     uint64_t totalBytes() const;
     int schemaVersion() const;
     const Options& options() const { return m_options; }
+
+    // ---- Phase 5: direct delivery + signed receipts ---------------------
+    // A signed receipt linking a delivered object to its receipt object
+    // (master doc §23). The receipt itself is a system-namespace NetworkObject
+    // stored in `objects`; this row tracks the linkage + signature for
+    // verification and dedup.
+    struct ReceiptRow {
+        std::string delivered_object_id_hex;
+        std::string receipt_object_id_hex;
+        std::string origin;             // origin PeerID of the delivered object
+        std::string destination;        // who received + signed
+        uint8_t receipt_type{0};        // delivery::ReceiptType
+        int64_t received_at_ms{0};
+        std::string object_hash_hex;    // delivered object's payload hash
+        std::string signature;          // destination Ed25519 (64 bytes raw)
+        std::string signer_pk_hex;
+    };
+
+    // Persist a receipt (idempotent by delivered_object_id — a duplicate
+    // delivery never produces a duplicate CONFIRMED/dup receipt).
+    Result recordReceipt(const ReceiptRow& row);
+
+    // Lookup the receipt for a delivered object. kNotFound when none.
+    Result getReceipt(const std::string& delivered_object_id_hex,
+                      ReceiptRow& out) const;
+
+    // Every receipt aimed at `destination` (origin side: the receipts for our
+    // delivered objects). Used by the origin to mark CONFIRMED on replay.
+    Result forEachReceiptToward(
+        const std::string& destination,
+        const std::function<Result(const ReceiptRow&)>& fn) const;
+
+    // Every object whose destination == target that has NOT yet reached a
+    // terminal delivery state (still kStored/kDurabilityReached and not
+    // delivered/confirmed/failed). The carrier/delivery manager uses this to
+    // offer stored objects to a destination that just connected.
+    Result forEachUndelivered(
+        const std::string& destination,
+        const std::function<Result(const ObjectId&)>& fn) const;
+
+    // Every object that is DELIVERED and whose delivered_at_ms <= before_ms
+    // (carrier replica-release sweep, §64). Only already-delivered replicas
+    // are candidates — the last-useful-replica rule is enforced by the caller.
+    Result forEachDeliveredReplica(
+        int64_t before_ms, const std::function<Result(const ObjectId&)>& fn) const;
+
+    // Delivery-state transitions (§22) — idempotent: re-marking the same (or a
+    // later) terminal state is a no-op and always converges.
+    Result markDelivered(const ObjectId& id, int64_t delivered_at_ms);
+    Result markDeliveryAttempted(const ObjectId& id);
+    Result confirmObject(const ObjectId& id, int64_t confirmed_at_ms);
+    Result failDelivery(const ObjectId& id, uint8_t failure_class);
+
+    // Read back the delivered/confirmed timestamps + failure class (used by
+    // tests and telemetry). Optional outputs may be null.
+    Result deliveryReadout(const ObjectId& id, ObjectStatus* status_out,
+                           int64_t* delivered_at_ms_out,
+                           int64_t* confirmed_at_ms_out,
+                           uint8_t* failure_class_out) const;
 
     // PIMPL (defined in ObjectStore.cpp). Public so the out-of-line definition
     // is reachable (matches the engine's SessionManager pattern).

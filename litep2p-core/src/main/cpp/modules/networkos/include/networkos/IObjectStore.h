@@ -31,6 +31,12 @@ enum class ObjectStatus : uint8_t {
     // Phase 4: two-phase durable handoff states (master doc §22/§93 inv. 4).
     kRemoteAccepted = 4,    // a carrier accepted and is storing/transferring
     kDurabilityReached = 5, // >=1 validated signed lease persisted (target met)
+    // Phase 5: direct destination delivery states (§22).
+    kDeliveryAttempted = 6, // an offer was sent to the destination
+    kDelivered = 7,         // destination durably committed (RECEIVED_ACK seen)
+    kConfirmed = 8,         // signed receipt returned; origin knows delivery
+    kFailed = 9,            // terminal failure (e.g. TTL_EXPIRED before delivery)
+    kCancelled = 10,        // policy/user cancellation (reserved; set externally)
 };
 
 struct ObjectMeta {

@@ -283,6 +283,8 @@ set(NETWORKOS_SOURCES
     ../litep2p-core/src/main/cpp/modules/networkos/objectstore/src/ObjectStore.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/handoff/src/handoff_frames.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/handoff/src/HandoffManager.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/delivery/src/delivery_frames.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/delivery/src/DeliveryManager.cpp
 )
 
 set(ENGINE_SOURCES
@@ -338,6 +340,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/networkos/object/include
     ../litep2p-core/src/main/cpp/modules/networkos/objectstore/include
     ../litep2p-core/src/main/cpp/modules/networkos/handoff/include
+    ../litep2p-core/src/main/cpp/modules/networkos/delivery/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -533,10 +536,21 @@ add_executable(handoff_test tests/handoff_test.cpp)
 target_include_directories(handoff_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(handoff_test PRIVATE litep2p_engine)
 
+# Network OS Phase 5 verification: direct delivery + signed receipts.
+add_executable(delivery_test tests/delivery_test.cpp)
+target_include_directories(delivery_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(delivery_test PRIVATE litep2p_engine)
+
 # Network OS Phase 3 crash-consistency probe (driven by object_store_kill_test.sh).
 add_executable(object_store_kill_probe tools/object_store_kill_probe.cpp)
 target_include_directories(object_store_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(object_store_kill_probe PRIVATE litep2p_engine)
+
+# Network OS Phase 5 durable-delivery probe (driven by p5_milestone_scenario.sh):
+# proves delivery state + signed receipt survive process death (invariant 4/17).
+add_executable(delivery_kill_probe tools/delivery_kill_probe.cpp)
+target_include_directories(delivery_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(delivery_kill_probe PRIVATE litep2p_engine)
 
 # Network OS Phase 3 fuzz substitute (Apple clang lacks the libFuzzer runtime;
 # runs the envelope parser against randomized input for --seconds).

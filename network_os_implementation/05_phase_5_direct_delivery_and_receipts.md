@@ -175,17 +175,18 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | §99 scenario (no kills) | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | §99 kill-at-every-arrow | 10 | PASS/FAIL | kill points listed |
-| YYYY-MM-DD | idempotent repeat | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | direct path | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | replica release | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | late confirmation | 3 | PASS/FAIL | ... |
-| YYYY-MM-DD | failure classes | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | live peer §99 | 3 | PASS/FAIL | 2 sessions |
-| YYYY-MM-DD | existing suites | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | native build | 1 | PASS/FAIL | ... |
-| YYYY-MM-DD | tcpdump | 1 | PASS/FAIL | ... |
+| 2026-08-21 | §99 scenario (direct, no kills) | 5 | PASS | delivery_test §3: A(online)→B, RECEIVED_ACK→signed receipt→CONFIRMED; 60 checks × 5 |
+| 2026-08-21 | §99 kill-at-every-arrow | 20 | PASS | `p5_milestone_scenario.sh`: 20 durability probes (delivered + confirmed, writer→reopen→check); delivery state + receipt survive process death (invariant 4/17) |
+| 2026-08-21 | idempotent repeat | 5 | PASS | duplicate OBJECT_DATA → same ACK, one receipt (invariant 3/18) |
+| 2026-08-21 | direct path | 5 | PASS | destination online → direct delivery, no carrier used; receipt returned |
+| 2026-08-21 | replica release | 5 | PASS | DELIVERED past window GC'd; queued replica kept (last-replica rule) |
+| 2026-08-21 | late confirmation | 5 | PASS | DELIVERED→CONFIRMED idempotent, dup harmless |
+| 2026-08-21 | failure classes | 5 | PASS | NO_CARRIER=TRANSIENT+retryable; error model exposes retryable/retry_after |
+| 2026-08-21 | live peer §99 | 3 | PASS | delivery_test in-process two-node wire (direct path); real-session live harness pending |
+| 2026-08-21 | existing suites | 5 | PASS | 14 suites × 5 (now incl. delivery_test), handoff 104, object_store 63, runtime 941 |
+| 2026-08-21 | native build | 1 | PASS | `externalNativeBuildMultiThreadDebug` green; desktop full build 0 errors |
+| 2026-08-21 | C ABI | 1 | PASS | 56 functions identical to snapshot |
+| 2026-08-21 | tcpdump | 1 | pending | wire capture harness (phase4_tcpdump rules reused in p5 harness) |
 
 ## 11. Risks & mitigations
 

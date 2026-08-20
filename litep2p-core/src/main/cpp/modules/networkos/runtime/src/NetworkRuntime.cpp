@@ -18,6 +18,7 @@
 #include "networkos/ITransport.h"
 #include "networkos/objectstore/ObjectStore.h"
 #include "networkos/handoff/HandoffManager.h"
+#include "networkos/delivery/DeliveryManager.h"
 #include "networkos/session/SessionFacade.h"
 
 #include "config_manager.h"
@@ -101,6 +102,9 @@ public:
                             // Phase 4: a new READY peer is a carrier
                             // opportunity — re-offer queued objects.
                             if (m_handoff) m_handoff->retryPending(now_ms());
+                            // Phase 5: a newly-READY peer that is the
+                            // destination of stored objects gets them pushed.
+                            if (m_delivery) m_delivery->forwardPending(p.id);
                         } else {
                             emit_(RuntimeEventType::kPeerState, "peer_disconnected", p.id, "");
                             if (m_session_facade) m_session_facade->onPeerState(p.id, "DISCONNECTED");
@@ -167,11 +171,89 @@ public:
                 [this](const std::string& kind, const std::string& payload) {
                     emit_(RuntimeEventType::kDelivery, kind, "", payload);
                 });
-            // Incoming frames -> handoff state machine.
+            // Incoming frames -> route to handoff (storage) and/or delivery
+            // (direct-to-me) based on the object's destination.
             m_session->set_handoff_frame_handler(
                 [this](const std::string& peer_id, MessageType type,
                        const std::string& payload) {
-                    if (m_handoff) m_handoff->onFrame(peer_id, type, payload);
+                    switch (type) {
+                        case MessageType::OBJECT_OFFER:
+                        case MessageType::OBJECT_DATA: {
+                            // Is this object addressed to us (direct delivery)?
+                            // Offer: read destination from the offer. Data:
+                            // from the envelope (needs deserialize).
+                            bool to_me = false;
+                            if (type == MessageType::OBJECT_OFFER) {
+                                handoff::OfferFrame f;
+                                if (decode_offer(payload, f) &&
+                                    f.destination == m_peer_id) {
+                                    to_me = true;
+                                }
+                            } else {
+                                handoff::DataFrame df;
+                                obj::NetworkObject obj;
+                                if (decode_data(payload, df) &&
+                                    obj::deserialize(df.envelope, obj) &&
+                                    obj.origin.destination == m_peer_id) {
+                                    to_me = true;
+                                }
+                            }
+                            if (to_me) {
+                                if (m_delivery)
+                                    m_delivery->onFrame(peer_id, type, payload, true);
+                            } else {
+                                if (m_handoff) m_handoff->onFrame(peer_id, type, payload);
+                            }
+                            break;
+                        }
+                        case MessageType::OBJECT_ACCEPT:
+                            if (m_handoff) m_handoff->onFrame(peer_id, type, payload);
+                            if (m_delivery)
+                                m_delivery->onFrame(peer_id, type, payload, false);
+                            break;
+                        case MessageType::OBJECT_REJECT:
+                        case MessageType::STORED_ACK:
+                            if (m_handoff) m_handoff->onFrame(peer_id, type, payload);
+                            break;
+                        case MessageType::RECEIVED_ACK:
+                            if (m_delivery)
+                                m_delivery->onFrame(peer_id, type, payload, false);
+                            break;
+                        default:
+                            break;
+                    }
+                });
+
+            // Phase 5: direct delivery + signed receipts over the same session
+            // channel + object store.
+            delivery::DeliveryManager::Config dcfg;
+            dcfg.local_peer_id = m_peer_id;
+            m_delivery = std::make_unique<delivery::DeliveryManager>(
+                m_object_store.get(), dcfg);
+            m_delivery->setSendFn(
+                [this](const std::string& peer_id, MessageType type,
+                       const std::string& payload) -> bool {
+                    return m_session && m_session->send_handoff_frame(
+                                            peer_id, type, payload);
+                });
+            m_delivery->setConnectedPeersFn(
+                [this]() -> std::vector<std::string> {
+                    if (!m_session) return {};
+                    return m_session->getConnectedPeerIds();
+                });
+            m_delivery->setSigningKeysFns(
+                [this]() -> std::pair<std::vector<uint8_t>,
+                                      std::vector<uint8_t>> {
+                    if (!m_session) return {};
+                    return m_session->get_local_signing_keys();
+                },
+                [this](const std::string& peer_id) -> std::vector<uint8_t> {
+                    if (!m_session) return {};
+                    return m_session->get_peer_signing_key(peer_id);
+                });
+            m_delivery->setEventFn(
+                [this](const std::string& kind, const std::string& payload) {
+                    emit_(RuntimeEventType::kDelivery, kind, "", payload);
                 });
         }
 
@@ -208,6 +290,7 @@ public:
             m_session.reset();
         }
         m_handoff.reset();
+        m_delivery.reset();
         m_session_facade.reset();
         m_object_store.reset();
         m_state = RuntimeState::kStopped;
@@ -263,6 +346,10 @@ public:
     // Phase 4: the two-phase durable handoff manager. Valid while running and
     // only when the object store is present.
     handoff::HandoffManager* handoff() override { return m_handoff.get(); }
+
+    // Phase 5: direct delivery + signed receipts. Valid while running and only
+    // when the object store is present.
+    delivery::DeliveryManager* delivery() override { return m_delivery.get(); }
 
     Result sendMessage(const std::string& peer_id, const std::string& payload) override {
         if (!m_session) return Result::kInvalidState;
@@ -327,6 +414,7 @@ private:
     std::unique_ptr<SessionFacade> m_session_facade;
     std::unique_ptr<ObjectStore> m_object_store;
     std::unique_ptr<handoff::HandoffManager> m_handoff;
+    std::unique_ptr<delivery::DeliveryManager> m_delivery;
 
     mutable std::mutex m_life_mu;
     mutable std::mutex m_cb_mu;

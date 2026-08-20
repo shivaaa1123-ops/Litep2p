@@ -34,6 +34,12 @@ enum class MessageType : uint8_t {
     OBJECT_DATA          = 0x37,   // payload: serialized NetworkObject envelope
     STORED_ACK           = 0x38,   // signed storage lease (carrier->sender)
 
+    // Network OS Phase 5: direct destination delivery + signed receipts. A
+    // direct delivery reuses OBJECT_OFFER/ACCEPT/DATA but the *destination*
+    // (destination == the receiving peer) replies RECEIVED_ACK instead of a
+    // storage lease, then issues a signed receipt object on the reverse path.
+    RECEIVED_ACK         = 0x39,   // destination durably committed the object
+
     // High-volume frames (not batched) for file transfer.
     FILE_TRANSFER        = 0x20,
 
