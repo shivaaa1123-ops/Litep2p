@@ -290,6 +290,7 @@ set(NETWORKOS_SOURCES
     ../litep2p-core/src/main/cpp/modules/networkos/replication/src/ReplicaPlanner.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/resources/src/ResourceManager.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/discovery/src/DiscoveryManager.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/largeobject/src/largeobject.cpp
 )
 
 set(ENGINE_SOURCES
@@ -350,6 +351,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/networkos/replication/include
     ../litep2p-core/src/main/cpp/modules/networkos/resources/include
     ../litep2p-core/src/main/cpp/modules/networkos/discovery/include
+    ../litep2p-core/src/main/cpp/modules/networkos/largeobject/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -569,6 +571,11 @@ target_link_libraries(resource_manager_test PRIVATE litep2p_engine)
 add_executable(discovery_manager_test tests/discovery_manager_test.cpp)
 target_include_directories(discovery_manager_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(discovery_manager_test PRIVATE litep2p_engine)
+
+# Network OS Phase 10 test: large object layer (manifest, chunks, resume, bulk).
+add_executable(large_object_test tests/large_object_test.cpp)
+target_include_directories(large_object_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(large_object_test PRIVATE litep2p_engine)
 
 # Network OS Phase 3 crash-consistency probe (driven by object_store_kill_test.sh).
 add_executable(object_store_kill_probe tools/object_store_kill_probe.cpp)

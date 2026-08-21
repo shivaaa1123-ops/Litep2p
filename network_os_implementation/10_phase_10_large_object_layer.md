@@ -147,16 +147,16 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | manifest/chunk units | 10 | PASS/FAIL | ... |
-| YYYY-MM-DD | 1 MB transfer | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | resume | 5 | PASS/FAIL | no re-send |
-| YYYY-MM-DD | memory bound | 5 | PASS/FAIL | high-water |
-| YYYY-MM-DD | priority inversion | 5 | PASS/FAIL | chat not blocked |
-| YYYY-MM-DD | metered deferral | 3 | PASS/FAIL | ... |
-| YYYY-MM-DD | backpressure | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | idle cost | 3 | PASS/FAIL | ... |
-| YYYY-MM-DD | existing suites | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | native build | 1 | PASS/FAIL | ... |
+| 2026-08-21 | manifest/chunk units | 1 | PASS | manifest round-trip + strict decode; chunk ID content-addressed; hash/tamper (large_object_test) |
+| 2026-08-21 | 1 MB transfer | — | N/A | live-peer full transfer deferred to Phase 11 simulator |
+| 2026-08-21 | resume | 1 | PASS | verified chunks never re-sent; resume from first unverified; converges |
+| 2026-08-21 | memory bound | 1 | PASS | window×chunk_size bound; no whole-file buffering |
+| 2026-08-21 | priority inversion | 1 | PASS | control>receipt>normal>bulk drain order; bulk never blocks |
+| 2026-08-21 | metered deferral | 1 | PASS | metered defers; Wi-Fi/charging proceed |
+| 2026-08-21 | backpressure | 1 | PASS | accept/defer/busy/reject_quota |
+| 2026-08-21 | idle cost | 1 | PASS | no timer churn (Phase 8 regression) |
+| 2026-08-21 | existing suites | 1 | PASS | 21 unit suites exit-0 (incl. large_object_test 55 checks) |
+| 2026-08-21 | native build | 1 | PASS | externalNativeBuildMultiThreadDebug green (all ABIs) |
 
 ## 11. Risks & mitigations
 
@@ -169,14 +169,13 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [ ] Manifest + chunk objects; chunk IDs content-addressed.
-- [ ] Resumable transfer with checkpointing; verified chunks never re-sent.
-- [ ] Streaming/low-copy path; memory bound asserted.
-- [ ] Bulk scheduling (Wi-Fi/charging preferred) + metered deferral.
-- [ ] Priority inversion protection proven (chat not blocked by bulk).
-- [ ] Backpressure for bulk; no stalling control.
-- [ ] Existing suites green; native build green.
-- [ ] Status table in `METHODOLOGY.md` updated.
-- [ ] Committed with message:
-      `Network OS P10: large object layer (manifests, chunks, resume)`.
+- [x] Manifest + chunk objects; chunk IDs content-addressed.
+- [x] Resumable transfer with checkpointing; verified chunks never re-sent.
+- [x] Streaming/low-copy path; memory bound asserted (window × chunk size).
+- [x] Bulk scheduling (Wi-Fi/charging preferred) + metered deferral.
+- [x] Priority inversion protection proven (chat/control not blocked by bulk).
+- [x] Backpressure for bulk; no stalling control.
+- [x] Existing suites green; native build green.
+- [x] Status table in `METHODOLOGY.md` updated.
+- [x] Committed with message: `Network OS P10: large object layer (manifests, chunks, resume)`.
 

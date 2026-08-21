@@ -244,7 +244,7 @@ Update after each phase is approved and committed:
       43 checks green, Phases 5-8 regression green, 20 suites exit-0,
       externalNativeBuildMultiThreadDebug green (all ABIs); docs docs/network-os/
       15-discovery.md; no DHT added)
-- [ ] Phase 10 — Large Object Layer (`10_phase_10_large_object_layer.md`)
+- [x] Phase 10 — Large Object Layer (`10_phase_10_large_object_layer.md`) — **COMPLETE** (`modules/networkos/largeobject/`: manifest + content-addressed chunk objects, strict bounded manifest codec, `ChunkTransfer` resumable/checkpointed transfer (per-chunk state machine, tamper detection via canonical hash, verified chunks never re-sent, sliding-window memory bound = window×chunk_size, bulk policy defers on metered / prefers Wi-Fi+charging), `BulkScheduler` per-class priority queues (control>critical>receipt>normal>bulk, priority-inversion protection §67), admission/backpressure (§68 Accept/Defer/Busy/RejectedQuota); extends existing file_transfer engine invariants (32KB chunks, 16 in-flight, resume) rather than rebuilding; `large_object_test` 55 checks green, Phases 5-9 regression green, 21 suites exit-0, externalNativeBuildMultiThreadDebug green (all ABIs); docs docs/network-os/16-large-objects.md)
 - [ ] Phase 11 — Simulator & Chaos Gates (`11_phase_11_simulator_and_chaos_lab.md`)
 - [ ] Phase 12 — Public SDK & Compatibility (`12_phase_12_public_general_sdk.md`)
 

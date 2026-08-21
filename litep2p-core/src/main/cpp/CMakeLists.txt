@@ -127,6 +127,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/replication/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/resources/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/discovery/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/largeobject/include
 )
 
 if(ENABLE_PROXY_MODULE)
@@ -357,6 +358,7 @@ set(NETWORKOS_SOURCES
     "modules/networkos/replication/src/ReplicaPlanner.cpp"
     "modules/networkos/resources/src/ResourceManager.cpp"
     "modules/networkos/discovery/src/DiscoveryManager.cpp"
+    "modules/networkos/largeobject/src/largeobject.cpp"
 )
 add_library(litep2p_networkos STATIC ${NETWORKOS_SOURCES})
 target_link_libraries(litep2p_networkos litep2p_corep2p litep2p_session)
