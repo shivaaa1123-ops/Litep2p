@@ -22,6 +22,7 @@
 #include "networkos/anti_entropy/AntiEntropyManager.h"
 #include "networkos/replication/ReplicaPlanner.h"
 #include "networkos/resources/ResourceManager.h"
+#include "networkos/discovery/DiscoveryManager.h"
 #include "networkos/session/SessionFacade.h"
 
 #include "config_manager.h"
@@ -51,6 +52,7 @@ public:
         m_identity = createFileIdentityStore("");
         m_platform = createDesktopPlatformAdapter();
         m_resources = resources::createResourceManager();
+        m_discovery = discovery::createDiscoveryManager({});
     }
 
     ~NetworkRuntime() override {
@@ -410,6 +412,7 @@ public:
         m_anti_entropy.reset();
         m_replication.reset();
         m_resources.reset();
+        m_discovery.reset();
         m_session_facade.reset();
         m_object_store.reset();
         m_state = RuntimeState::kStopped;
@@ -482,6 +485,9 @@ public:
     // accounting). Valid once start()/restore() built it.
     resources::ResourceManager* resources() override { return m_resources.get(); }
 
+    // Phase 9: modular DiscoveryManager. Valid once constructed.
+    discovery::DiscoveryManager* discovery() override { return m_discovery.get(); }
+
     Result sendMessage(const std::string& peer_id, const std::string& payload) override {
         if (!m_session) return Result::kInvalidState;
         m_session->sendMessageToPeer(peer_id, payload);
@@ -522,6 +528,11 @@ public:
             // it would actually wake work; idle signals carry no wakeup cost.
             if (m_resources->budget().maintenance_allowance_ms > 0) {
                 m_resources->noteWakeup("maintenance", 0);
+            }
+            // Phase 9: discovery intensity follows the resource budget (ECO/
+            // low-battery/metered => on-demand; active => fuller scans).
+            if (m_discovery) {
+                m_discovery->setIntensity(m_resources->budget().discovery_intensity);
             }
         }
         // Any connectivity/foreground/charging signal is a scheduler event.
@@ -571,6 +582,7 @@ private:
     std::unique_ptr<anti_entropy::AntiEntropyManager> m_anti_entropy;
     std::unique_ptr<replication::ReplicaPlanner> m_replication;
     std::unique_ptr<resources::ResourceManager> m_resources;
+    std::unique_ptr<discovery::DiscoveryManager> m_discovery;
 
     mutable std::mutex m_life_mu;
     mutable std::mutex m_cb_mu;

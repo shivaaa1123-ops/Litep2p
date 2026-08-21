@@ -23,6 +23,7 @@ namespace delivery { class DeliveryManager; }  // declared in networkos/delivery
 namespace anti_entropy { class AntiEntropyManager; }  // networkos/anti_entropy/AntiEntropyManager.h
 namespace replication { class ReplicaPlanner; }  // networkos/replication/ReplicaPlanner.h
 namespace resources { class ResourceManager; }  // networkos/resources/ResourceManager.h
+namespace discovery { class DiscoveryManager; }  // networkos/discovery/DiscoveryManager.h
 
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
@@ -198,6 +199,11 @@ public:
     // Phase 8: resource-aware ResourceManager (profiles + budgets + wakeup
     // accounting). Owned by the runtime. Valid once start()/restore() built it.
     virtual resources::ResourceManager* resources() { return nullptr; }
+
+    // Phase 9: modular DiscoveryManager (LAN/known-peer/peer-exchange/optional
+    // bootstrap+relay backends, graceful degradation, NAT layering). Owned by
+    // the runtime. Valid once constructed.
+    virtual discovery::DiscoveryManager* discovery() { return nullptr; }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).

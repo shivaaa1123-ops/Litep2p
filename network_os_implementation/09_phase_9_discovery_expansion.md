@@ -196,18 +196,17 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [ ] Modular DiscoveryManager with LAN, known-peer, peer-exchange,
+- [x] Modular DiscoveryManager with LAN, known-peer, peer-exchange,
       optional bootstrap/rendezvous backends.
-- [ ] Signaling server mapped as optional infrastructure; graceful
-      degradation proven.
-- [ ] NAT layering (direct → hole punch → relay → store-and-forward).
-- [ ] Carrier willingness + HA-peer capabilities work.
-- [ ] Serverless presence + peer-fallback alias resolution work (server down).
-- [ ] Gate A — decentralization acceptance test green (no SPOF).
-- [ ] No DHT added; privacy/censorship-resistance preserved.
-- [ ] Invariants 12, 19, 20 asserted by tests.
-- [ ] Phase 8 regression green; existing suites green; native build green.
-- [ ] Status table in `METHODOLOGY.md` updated.
-- [ ] Committed with message:
-      `Network OS P9: modular discovery, optional infrastructure, graceful degradation`.
+- [x] Signaling server mapped as optional infrastructure; graceful
+      degradation proven (invariant 19).
+- [x] NAT layering (direct → hole punch → relay → store-and-forward).
+- [x] Carrier willingness + HA-peer capabilities work.
+- [x] Serverless presence + peer-fallback alias resolution work (server down).
+- [x] Gate A — decentralization acceptance test green (no SPOF).
+- [x] No DHT added; privacy/censorship-resistance preserved.
+- [x] Invariants 12, 19, 20 asserted by tests.
+- [x] Phase 8 regression green; existing suites green; native build green.
+- [x] Status table in `METHODOLOGY.md` updated.
+- [x] Committed with message: `Network OS P9: modular discovery, optional infrastructure, graceful degradation`.
 

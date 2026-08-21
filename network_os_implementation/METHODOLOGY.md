@@ -233,7 +233,17 @@ Update after each phase is approved and committed:
 - [x] Phase 8 — Android Resource Manager (`08_phase_8_android_resource_manager.md`) — **COMPLETE** (`modules/networkos/resources/ResourceManager`: full signal→budget engine, profiles ECO/BALANCED/RELIABLE/CRITICAL (§43), concrete `ResourceBudget` outputs (connection/replication/bandwidth/CPU/discovery/storage/lease/maintenance), wakeup-budget accounting (§77, per-subsystem, no unattributed), dormant snapshot/restore (`resource_state.json`, invariants 11/17), Doze/offline => zero radio work; runtime owns `resources()` + feeds platform signals + propagates budgets to replication (`setBudgetBackground`) + persists/restores resource state; event-driven (IScheduler, no subsystem timers); `resource_manager_test` 29 checks green, Phases 5–7 regression green, 19 suites exit-0, `externalNativeBuildMultiThreadDebug` green (all ABIs); docs `docs/network-os/14-resource-manager.md`)
 - [ ] Phase 7 — Adaptive Replication (`07_phase_7_adaptive_replication.md`)
 - [ ] Phase 8 — Android Resource Manager (`08_phase_8_android_resource_manager.md`)
-- [ ] Phase 9 — Discovery Expansion (`09_phase_9_discovery_expansion.md`)
+- [x] Phase 9 — Discovery Expansion (`09_phase_9_discovery_expansion.md`) — **COMPLETE** (
+      modular DiscoveryManager + IDiscoveryBackend (LAN/known-peer/peer-exchange/
+      bootstrap/relay), intensity scaling from ResourceManager (P8), graceful
+      degradation (invariant 19: functional without any optional infra), NAT
+      reachability layering (direct→NAT→relay→S&F), carrier willingness + HA
+      capabilities (§52/§79), bounded peer-exchange with dedup, serverless
+      presence + alias fallback (decision 11), Gate A decentralization (no
+      SPOF); runtime owns discovery() + wires intensity; discovery_manager_test
+      43 checks green, Phases 5-8 regression green, 20 suites exit-0,
+      externalNativeBuildMultiThreadDebug green (all ABIs); docs docs/network-os/
+      15-discovery.md; no DHT added)
 - [ ] Phase 10 — Large Object Layer (`10_phase_10_large_object_layer.md`)
 - [ ] Phase 11 — Simulator & Chaos Gates (`11_phase_11_simulator_and_chaos_lab.md`)
 - [ ] Phase 12 — Public SDK & Compatibility (`12_phase_12_public_general_sdk.md`)
