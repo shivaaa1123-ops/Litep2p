@@ -291,6 +291,7 @@ set(NETWORKOS_SOURCES
     ../litep2p-core/src/main/cpp/modules/networkos/resources/src/ResourceManager.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/discovery/src/DiscoveryManager.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/largeobject/src/largeobject.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/metrics/src/ReliabilityMetrics.cpp
 )
 
 set(ENGINE_SOURCES
@@ -352,6 +353,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/networkos/resources/include
     ../litep2p-core/src/main/cpp/modules/networkos/discovery/include
     ../litep2p-core/src/main/cpp/modules/networkos/largeobject/include
+    ../litep2p-core/src/main/cpp/modules/networkos/metrics/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -577,6 +579,11 @@ add_executable(large_object_test tests/large_object_test.cpp)
 target_include_directories(large_object_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(large_object_test PRIVATE litep2p_engine)
 
+# Network OS Phase 11: the §93 rugged-invariant manifest as a single gate.
+add_executable(invariants_test tests/invariants_test.cpp)
+target_include_directories(invariants_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(invariants_test PRIVATE litep2p_engine)
+
 # Network OS Phase 3 crash-consistency probe (driven by object_store_kill_test.sh).
 add_executable(object_store_kill_probe tools/object_store_kill_probe.cpp)
 target_include_directories(object_store_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -600,6 +607,18 @@ target_link_libraries(envelope_fuzz_smoke PRIVATE litep2p_engine)
 add_executable(anti_entropy_fuzz_smoke tools/anti_entropy_fuzz_smoke.cpp)
 target_include_directories(anti_entropy_fuzz_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(anti_entropy_fuzz_smoke PRIVATE litep2p_engine)
+
+# Network OS Phase 11 deterministic churn/chaos simulator: real ObjectStore +
+# ReplicaPlanner per peer under injected faults; JSON reliability report.
+add_executable(churn_simulator tools/churn_simulator.cpp)
+target_include_directories(churn_simulator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(churn_simulator PRIVATE litep2p_engine)
+
+# Network OS Phase 11 fuzz expansion: every network-facing parser under a
+# time-budgeted mutation loop (runnable substitute for libFuzzer targets).
+add_executable(parser_fuzz_smoke tools/parser_fuzz_smoke.cpp)
+target_include_directories(parser_fuzz_smoke PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(parser_fuzz_smoke PRIVATE litep2p_engine)
 
 # Network OS Phase 3 performance probe (put/get throughput, open latency,
 # size overhead, commit latency).

@@ -29,10 +29,25 @@ double jitter_unit() {
     return d(rng);
 }
 
+// Deterministic variant for seeded runs (simulator/tests): xorshift64*.
+double jitter_unit_seeded(uint64_t& state) {
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    const uint64_t r = state * 2685821657736338717ULL;
+    return static_cast<double>(r >> 11) * (1.0 / 9007199254740992.0) * 2.0 - 1.0;
+}
+
 } // namespace
 
 ReplicaPlanner::ReplicaPlanner(ObjectStore* store, const Config& cfg)
-    : m_store(store), m_cfg(cfg) {}
+    : m_store(store), m_cfg(cfg) {
+    if (m_cfg.jitter_seed != 0) {
+        m_jitter_seeded = true;
+        m_jitter_state = m_cfg.jitter_seed ? m_cfg.jitter_seed
+                                           : 0x9E3779B97F4A7C15ULL;
+    }
+}
 
 ReplicaPlanner::~ReplicaPlanner() = default;
 
@@ -202,9 +217,14 @@ size_t ReplicaPlanner::repairObject(const ObjectId& id, int64_t now) {
     }
     if (issued == 0) {
         // No route/candidate this tick: schedule a backoff (±jitter) so the
-        // next plan/second doesn't hammer it (§76). Persisted marker.
+        // next plan/second doesn't hammer it (§76). Persisted marker. Jitter
+        // source: deterministic when Config::jitter_seed was set (simulator/
+        // tests), thread-local random otherwise (production default).
         const int64_t base = m_cfg.retry_base_ms;
-        const int64_t jit = static_cast<int64_t>(base * m_cfg.jitter_fraction * jitter_unit());
+        const int64_t jit = m_jitter_seeded
+            ? static_cast<int64_t>(base * m_cfg.jitter_fraction *
+                                   jitter_unit_seeded(m_jitter_state))
+            : static_cast<int64_t>(base * m_cfg.jitter_fraction * jitter_unit());
         const int64_t next = now + base + jit;
         m_store->setRepairBackoff(id, next);
     } else {

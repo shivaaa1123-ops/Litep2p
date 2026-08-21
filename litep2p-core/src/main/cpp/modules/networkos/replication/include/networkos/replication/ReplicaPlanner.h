@@ -54,6 +54,10 @@ public:
         int64_t lease_takeover_lead_ms{5 * 60 * 1000};
         // Peer aging (§75).
         int64_t peer_stale_after_ms{14LL * 24LL * 3600 * 1000};
+        // Retry-jitter RNG seed. 0 (default) = non-deterministic thread-local
+        // RNG (production). Non-zero = fully deterministic backoff jitter
+        // (required by the Phase 11 simulator/chaos lab for reproducible runs).
+        uint64_t jitter_seed{0};
         std::string local_peer_id;
     };
 
@@ -152,6 +156,9 @@ private:
     ObjectStore* m_store{nullptr};
     Config m_cfg;
     std::atomic<bool> m_background{false};
+    // Deterministic-jitter state (used only when m_cfg.jitter_seed != 0).
+    uint64_t m_jitter_state{0};
+    bool m_jitter_seeded{false};
 
     IssueHandoffFn m_issue_handoff;
     ConnectedPeersFn m_connected;
