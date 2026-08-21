@@ -288,6 +288,7 @@ set(NETWORKOS_SOURCES
     ../litep2p-core/src/main/cpp/modules/networkos/anti_entropy/src/anti_entropy_frames.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/anti_entropy/src/AntiEntropyManager.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/replication/src/ReplicaPlanner.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/resources/src/ResourceManager.cpp
 )
 
 set(ENGINE_SOURCES
@@ -346,6 +347,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/networkos/delivery/include
     ../litep2p-core/src/main/cpp/modules/networkos/anti_entropy/include
     ../litep2p-core/src/main/cpp/modules/networkos/replication/include
+    ../litep2p-core/src/main/cpp/modules/networkos/resources/include
 )
 
 target_link_libraries(litep2p_engine PUBLIC
@@ -555,6 +557,11 @@ target_link_libraries(anti_entropy_test PRIVATE litep2p_engine)
 add_executable(replication_test tests/replication_test.cpp)
 target_include_directories(replication_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(replication_test PRIVATE litep2p_engine)
+
+# Network OS Phase 8 test: resource manager + profiles + wakeup budget.
+add_executable(resource_manager_test tests/resource_manager_test.cpp)
+target_include_directories(resource_manager_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(resource_manager_test PRIVATE litep2p_engine)
 
 # Network OS Phase 3 crash-consistency probe (driven by object_store_kill_test.sh).
 add_executable(object_store_kill_probe tools/object_store_kill_probe.cpp)

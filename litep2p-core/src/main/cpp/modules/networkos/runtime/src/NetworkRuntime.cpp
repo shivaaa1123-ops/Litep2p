@@ -21,6 +21,7 @@
 #include "networkos/delivery/DeliveryManager.h"
 #include "networkos/anti_entropy/AntiEntropyManager.h"
 #include "networkos/replication/ReplicaPlanner.h"
+#include "networkos/resources/ResourceManager.h"
 #include "networkos/session/SessionFacade.h"
 
 #include "config_manager.h"
@@ -28,7 +29,9 @@
 #include "session_manager.h"
 
 #include <chrono>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <string>
 
 namespace networkos {
@@ -47,6 +50,7 @@ public:
         m_scheduler = createScheduler();
         m_identity = createFileIdentityStore("");
         m_platform = createDesktopPlatformAdapter();
+        m_resources = resources::createResourceManager();
     }
 
     ~NetworkRuntime() override {
@@ -75,6 +79,17 @@ public:
                           cfg.enable_discovery ? true : false);
         cm.setValueAtPath({"nat_traversal", "peer_discovery", "enabled"},
                           cfg.enable_discovery ? true : false);
+
+        // Phase 8: restore resource state (profile + budgets) if persisted from
+        // a previous run (§6, invariant 17 — reconstruct on resume).
+        if (m_resources && !cfg.files_dir.empty()) {
+            std::ifstream in(cfg.files_dir + "/resource_state.json");
+            if (in.good()) {
+                std::stringstream ss;
+                ss << in.rdbuf();
+                m_resources->restore(ss.str());
+            }
+        }
 
         // 2. Open identity (create-once; PeerID stable across restarts).
         m_identity = createFileIdentityStore(cfg.files_dir);
@@ -378,6 +393,13 @@ public:
         }
         m_state = RuntimeState::kStopping;
         emit_(RuntimeEventType::kLifecycle, "stopping", "", "");
+        // Phase 8: persist resource state so a later restore()/start() can
+        // rebuild without re-deriving (§6, invariant 11/17 dormant persistence).
+        if (m_resources && !m_cfg.files_dir.empty()) {
+            std::ofstream out(m_cfg.files_dir + "/resource_state.json",
+                              std::ios::trunc);
+            if (out.good()) out << m_resources->snapshot();
+        }
         if (m_session) {
             m_session->set_handoff_frame_handler(nullptr);
             m_session->stop();
@@ -387,6 +409,7 @@ public:
         m_delivery.reset();
         m_anti_entropy.reset();
         m_replication.reset();
+        m_resources.reset();
         m_session_facade.reset();
         m_object_store.reset();
         m_state = RuntimeState::kStopped;
@@ -455,6 +478,10 @@ public:
     // running and only when the object store is present.
     replication::ReplicaPlanner* replication() override { return m_replication.get(); }
 
+    // Phase 8: resource-aware ResourceManager (profiles + budgets + wakeup
+    // accounting). Valid once start()/restore() built it.
+    resources::ResourceManager* resources() override { return m_resources.get(); }
+
     Result sendMessage(const std::string& peer_id, const std::string& payload) override {
         if (!m_session) return Result::kInvalidState;
         m_session->sendMessageToPeer(peer_id, payload);
@@ -477,6 +504,25 @@ public:
         // battery / metering (Step 4.2/4.7).
         if (m_handoff) {
             m_handoff->resourceManager().onSignal(s, value);
+        }
+        // Phase 8: the central ResourceManager recomputes concrete budgets from
+        // the signal, then we propagate the result to the subsystems that
+        // consume budgets (replication connection budget). This keeps the
+        // energy/liveness policy in ONE place (§42/§43).
+        if (m_resources) {
+            m_resources->onSignal(s, value);
+            if (m_replication) {
+                // Background/dormant/ECO => restrict replication fan-out to the
+                // background budget; foreground/active => full repair budgets.
+                const bool background = m_resources->isBackground() ||
+                                        m_resources->budget().replication_budget <= 1;
+                m_replication->setBudgetBackground(background);
+            }
+            // Record the platform event as an attributed wakeup (§77) only when
+            // it would actually wake work; idle signals carry no wakeup cost.
+            if (m_resources->budget().maintenance_allowance_ms > 0) {
+                m_resources->noteWakeup("maintenance", 0);
+            }
         }
         // Any connectivity/foreground/charging signal is a scheduler event.
         if (s == PlatformSignal::kConnectivity || s == PlatformSignal::kForeground ||
@@ -524,6 +570,7 @@ private:
     std::unique_ptr<delivery::DeliveryManager> m_delivery;
     std::unique_ptr<anti_entropy::AntiEntropyManager> m_anti_entropy;
     std::unique_ptr<replication::ReplicaPlanner> m_replication;
+    std::unique_ptr<resources::ResourceManager> m_resources;
 
     mutable std::mutex m_life_mu;
     mutable std::mutex m_cb_mu;

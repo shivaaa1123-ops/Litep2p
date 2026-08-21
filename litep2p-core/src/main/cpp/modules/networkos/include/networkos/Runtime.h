@@ -22,6 +22,7 @@ namespace handoff { class HandoffManager; }  // declared in networkos/handoff/Ha
 namespace delivery { class DeliveryManager; }  // declared in networkos/delivery/DeliveryManager.h
 namespace anti_entropy { class AntiEntropyManager; }  // networkos/anti_entropy/AntiEntropyManager.h
 namespace replication { class ReplicaPlanner; }  // networkos/replication/ReplicaPlanner.h
+namespace resources { class ResourceManager; }  // networkos/resources/ResourceManager.h
 
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
@@ -193,6 +194,10 @@ public:
     // by the runtime. Valid only while running and only when the object store
     // is present. Default: none.
     virtual replication::ReplicaPlanner* replication() { return nullptr; }
+
+    // Phase 8: resource-aware ResourceManager (profiles + budgets + wakeup
+    // accounting). Owned by the runtime. Valid once start()/restore() built it.
+    virtual resources::ResourceManager* resources() { return nullptr; }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).
