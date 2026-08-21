@@ -167,18 +167,18 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | durability ladder | 10 | PASS/FAIL | D0→D5 |
-| YYYY-MM-DD | target repair | 10 | PASS/FAIL | no over-replication |
-| YYYY-MM-DD | lease expiry repair | 5 | PASS/FAIL | takeover |
-| YYYY-MM-DD | diversity placement | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | no fixed gossip | 5 | PASS/FAIL | idle silence |
-| YYYY-MM-DD | backoff + event retry | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | connection budgets | 3 | PASS/FAIL | ... |
-| YYYY-MM-DD | churn harness | 5 | PASS/FAIL | measure % |
-| YYYY-MM-DD | Phase 5 regression | 5 | PASS/FAIL | §99 |
-| YYYY-MM-DD | Phase 6 regression | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | existing suites | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | native build | 1 | PASS/FAIL | ... |
+| 2026-08-21 | durability ladder | 1 | PASS | D0→D5 monotonic + idempotent + persisted across reopen (replication_test) |
+| 2026-08-21 | target repair | 1 | PASS | D2 target: 2 handoffs, no over-replication at target, replenish 1 after loss |
+| 2026-08-21 | peer scoring + diversity | 1 | PASS | same failure domain not double-selected; highest-score diverse peer chosen |
+| 2026-08-21 | lease expiry repair | 1 | PASS | D2→D1 on expiry → replenish to D2 |
+| 2026-08-21 | backoff + event retry | 1 | PASS | no-carrier→backoff marker; connectivity triggers retry |
+| 2026-08-21 | connection budgets | 1 | PASS | background ≤1 handoff; foreground full repair |
+| 2026-08-21 | no fixed gossip | 1 | PASS | idle at full durability → zero replication traffic |
+| 2026-08-21 | churn harness | 1 | PASS | 10 peers × 5 objects, random churn → 50/50 reached D2 (100%) — Phase 11 baseline |
+| 2026-08-21 | Phase 5 regression | 1 | PASS | delivery_test 72 checks green |
+| 2026-08-21 | Phase 6 regression | 1 | PASS | anti_entropy_test 27 checks green |
+| 2026-08-21 | existing suites | 1 | PASS | 18 unit suites × exit-0 (incl. replication_test 34 checks) |
+| 2026-08-21 | native build | 1 | PASS | `externalNativeBuildMultiThreadDebug` green (all ABIs) |
 
 ## 11. Risks & mitigations
 
@@ -191,15 +191,18 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done
 
-- [ ] Durability tracking D0–D5 with crash-safe, idempotent transitions.
-- [ ] ReplicationPolicy + per-namespace policies; no hardcoded constants.
-- [ ] Local peer scoring + trust tiers; diversity-aware placement.
-- [ ] Lease expiry/repair replenishes to target without over-replication.
-- [ ] Retry = backoff + jitter + event-triggered; bounded.
-- [ ] Churn harness baseline recorded (this is Phase 11's starting number).
-- [ ] Invariants 5, 6, 15 asserted by tests.
-- [ ] Phases 5 & 6 regression green; existing suites green; native build green.
-- [ ] Status table in `METHODOLOGY.md` updated.
-- [ ] Committed with message:
+- [x] Durability tracking D0–D5 with crash-safe, idempotent transitions.
+- [x] ReplicationPolicy + per-namespace policies; no hardcoded constants (all
+      policy-driven via `repl_policies`).
+- [x] Local peer scoring + trust tiers; diversity-aware placement.
+- [x] Lease expiry/repair replenishes to target without over-replication.
+- [x] Retry = backoff + jitter + event-triggered; bounded.
+- [x] Churn harness baseline recorded (this is Phase 11's starting number):
+      `replication_test` churn harness — 50/50 objects reached D2 (100%).
+- [x] Invariants 5, 6, 15 asserted by tests (backoff/repair-loop, durability
+      target, no-over-replication counters).
+- [x] Phases 5 & 6 regression green; existing suites green; native build green.
+- [x] Status table in `METHODOLOGY.md` updated.
+- [x] Committed with message:
       `Network OS P7: adaptive replication, peer scoring, replica repair`.
 

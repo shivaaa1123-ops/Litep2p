@@ -27,7 +27,7 @@ namespace networkos {
 
 class ObjectStore : public IObjectStore {
 public:
-    static constexpr int kSchemaVersion = 3;
+    static constexpr int kSchemaVersion = 4;
 
     struct Options {
         std::string path;                          // sqlite file path
@@ -215,6 +215,114 @@ public:
                            int64_t* delivered_at_ms_out,
                            int64_t* confirmed_at_ms_out,
                            uint8_t* failure_class_out) const;
+
+    // ---- Phase 7: adaptive replication + peer scoring --------------------
+    // Durability ladder (master doc §10). Approximate durability is tracked per
+    // object in a `durability_level` column; the planner repairs toward the
+    // policy target (Step 5.1). Higher = more durable.
+    enum DurabilityLevel : int {
+        kDLocalOnly = 0,           // D0 — local copy only
+        kDOneRemote = 1,           // D1 — 1 confirmed remote copy (signed lease)
+        kDTwoRemote = 2,           // D2 — 2 independent remote copies (default)
+        kDThreeRemote = 3,         // D3 — 3 independent remote copies
+        kDDestinationAccepted = 4, // D4 — destination accepted
+        kDDestSignedAck = 5,       // D5 — destination signed ACK (receipt)
+    };
+    static const char* durability_name(DurabilityLevel d);
+
+    // Durability snapshot for an object: current level + the policy target this
+    // object is subject to (so the planner can compute the deficit).
+    struct DurabilityReadout {
+        DurabilityLevel level{kDLocalOnly};
+        uint8_t desired_remote_copies{2};
+        uint8_t maximum_remote_copies{4};
+    };
+
+    // Read current durability level (kNotFound if absent).
+    Result getDurability(const ObjectId& id, DurabilityReadout& out) const;
+
+    // Set the current durability level (idempotent, crash-safe), clamped to
+    // [kDLocalOnly, kDDestSignedAck].
+    Result setDurability(const ObjectId& id, DurabilityLevel level);
+
+    // Raise durability (monotonic — never lowers); idempotent.
+    Result raiseDurability(const ObjectId& id, DurabilityLevel level);
+
+    // Lower durability after a loss event (lease expiry / carrier loss /
+    // eviction). Requires an explicit call so the planner knows to repair.
+    Result lowerDurability(const ObjectId& id, DurabilityLevel level);
+
+    // Yield every object whose durability is strictly below `level` (used by
+    // the replica planner to find deficits). Bounded enumeration.
+    Result forEachObjectBelowDurability(
+        DurabilityLevel level, const std::function<Result(const ObjectId&)>& fn) const;
+
+    // ReplicationPolicy per namespace (Step 5.2/§10). Persisted so it survives
+    // restart and is queryable by the planner.
+    struct ReplicationPolicy {
+        std::string namespace_id;
+        uint8_t minimum_remote_copies{0};
+        uint8_t desired_remote_copies{2};
+        uint8_t maximum_remote_copies{4};
+        int64_t ttl_ms{3600000};
+        int priority{0};
+        bool prefer_network_diversity{true};
+        bool prefer_high_uptime_peers{true};
+        bool require_destination_receipt{false};
+    };
+
+    Result setReplicationPolicy(const ReplicationPolicy& policy);
+    Result getReplicationPolicy(const std::string& namespace_id,
+                                ReplicationPolicy& out) const;
+    // Default policy for an unconfigured namespace (desired=2, max=4).
+    ReplicationPolicy defaultPolicy(const std::string& namespace_id) const;
+
+    // Peer observation record (§13): accumulated local evidence about a peer.
+    // No global reputation — every field is measured locally. Persisted in the
+    // `peer_scores` table, bounded + aged.
+    struct PeerScore {
+        std::string peer_id;
+        uint64_t observations{0};
+        uint32_t reachability{100};          // 0..100 (connect success %)
+        int64_t avg_latency_ms{0};
+        uint32_t success_count{0};
+        uint32_t failure_count{0};
+        int trust_tier{0};                    // §81 unknown/known/trusted/blocked
+        uint8_t storage_willing{0};           // 0=unknown 1=yes 2=no (capabilities)
+        std::string diversity_group;          // failure domain tag (LAN/net-type)
+        double score{0.0};                    // computed composite local score
+        int64_t last_seen_ms{0};
+    };
+
+    // Record one local observation (reachability hit/miss, handoff success/fail,
+    // latency sample) and recompute + persist the composite score (§13).
+    Result recordPeerObservation(const std::string& peer_id,
+                                 bool reachable, bool handoff_success,
+                                 int64_t latency_ms);
+
+    // Set/refresh the failure-domain tag for a peer (diversity-aware placement,
+    // Step 5.4 #3). Idempotent upsert; last write wins.
+    Result setPeerDiversityGroup(const std::string& peer_id,
+                                 const std::string& group);
+    // Set the persisted storage-willingness flag (from capabilities §39).
+    Result setPeerStorageWilling(const std::string& peer_id, bool willing);
+
+    // Read a peer's persisted score (kNotFound when unknown).
+    Result getPeerScore(const std::string& peer_id, PeerScore& out) const;
+    // Every known peer score (bounded), newest-first. Candidate selection.
+    Result forEachPeerScore(const std::function<Result(const PeerScore&)>& fn) const;
+
+    // Age-out stale peer records: peers not seen for > stale_after_ms are
+    // dropped (below trust floor) or decayed. Returns pruned count.
+    Result agePeerScores(int64_t now_ms, int64_t stale_after_ms);
+
+    // Telemetry: count of objects at a given durability level (index 0..5).
+    uint64_t durabilityDistribution(int level) const;
+
+    // De-facto monotonic repair marker: persists `next_retry_ms` so the planner
+    // can avoid tight repair loops (§76, invariant 5).
+    Result setRepairBackoff(const ObjectId& id, int64_t next_retry_ms);
+    Result getRepairBackoff(const ObjectId& id, int64_t* next_retry_ms) const;
 
     // PIMPL (defined in ObjectStore.cpp). Public so the out-of-line definition
     // is reachable (matches the engine's SessionManager pattern).

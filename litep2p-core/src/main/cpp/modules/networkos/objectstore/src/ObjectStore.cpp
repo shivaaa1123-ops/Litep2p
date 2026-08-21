@@ -147,7 +147,8 @@ bool ObjectStore::open(const Options& options) {
         "  replica_hint INTEGER,"
         "  delivered_at_ms INTEGER,"
         "  confirmed_at_ms INTEGER,"
-        "  failure_class INTEGER NOT NULL DEFAULT 0);",
+        "  failure_class INTEGER NOT NULL DEFAULT 0,"
+        "  durability_level INTEGER NOT NULL DEFAULT 0);",
         // Incremental usage counter (one row per namespace+origin). Quota
         // checks read this instead of SUM() over objects — otherwise every
         // insert is O(all objects) and the store degrades to O(N^2) (measured
@@ -197,6 +198,33 @@ bool ObjectStore::open(const Options& options) {
         "  object_hash_hex TEXT NOT NULL,"
         "  signature BLOB,"
         "  signer_pk_hex TEXT);",
+        // Phase 7 (schema v4): adaptive replication + peer scoring.
+        "CREATE TABLE IF NOT EXISTS repl_policies("
+        "  namespace_id TEXT PRIMARY KEY,"
+        "  min_copies INTEGER NOT NULL DEFAULT 0,"
+        "  desired_copies INTEGER NOT NULL DEFAULT 2,"
+        "  max_copies INTEGER NOT NULL DEFAULT 4,"
+        "  ttl_ms INTEGER NOT NULL DEFAULT 3600000,"
+        "  priority INTEGER NOT NULL DEFAULT 0,"
+        "  prefer_diversity INTEGER NOT NULL DEFAULT 1,"
+        "  prefer_high_uptime INTEGER NOT NULL DEFAULT 1,"
+        "  require_receipt INTEGER NOT NULL DEFAULT 0);",
+        "CREATE TABLE IF NOT EXISTS peer_scores("
+        "  peer_id TEXT PRIMARY KEY,"
+        "  observations INTEGER NOT NULL DEFAULT 0,"
+        "  reachability INTEGER NOT NULL DEFAULT 100,"
+        "  avg_latency_ms INTEGER NOT NULL DEFAULT 0,"
+        "  success_count INTEGER NOT NULL DEFAULT 0,"
+        "  failure_count INTEGER NOT NULL DEFAULT 0,"
+        "  trust_tier INTEGER NOT NULL DEFAULT 0,"
+        "  storage_willing INTEGER NOT NULL DEFAULT 0,"
+        "  diversity_group TEXT,"
+        "  score REAL NOT NULL DEFAULT 0,"
+        "  last_seen_ms INTEGER NOT NULL DEFAULT 0);",
+        "CREATE INDEX IF NOT EXISTS idx_peer_scores_score ON peer_scores(score);",
+        "CREATE TABLE IF NOT EXISTS replica_backoff("
+        "  object_id TEXT PRIMARY KEY,"
+        "  next_retry_ms INTEGER NOT NULL DEFAULT 0);",
     };
     for (const char* sql : kSchema) {
         if (!m_impl->exec(sql)) { m_impl->teardown(); return false; }
@@ -210,8 +238,8 @@ bool ObjectStore::open(const Options& options) {
         if (current > kSchemaVersion) { m_impl->teardown(); return false; }  // future DB
         if (current == 0) {
             // Fresh database: the CREATEs above already contain every
-            // column/table through schema v3.
-            m_impl->exec("INSERT INTO schema_version(version) VALUES (3);");
+            // column/table through schema v4.
+            m_impl->exec("INSERT INTO schema_version(version) VALUES (4);");
         } else if (current < kSchemaVersion) {
             // Migration v1 -> v2: Phase 4 tables (leases, evicted_early —
             // already created by the idempotent CREATEs above) plus the
@@ -262,6 +290,31 @@ bool ObjectStore::open(const Options& options) {
                 }
             }
             if (!m_impl->exec("UPDATE schema_version SET version=3;")) {
+                m_impl->teardown();
+                return false;
+            }
+            // Migration v3 -> v4: Phase 7 durability + peer scores + policies.
+            // The new tables are already created by the idempotent CREATEs above;
+            // only the objects.durability_level column needs adding + version bump.
+            bool has_durability_col = false;
+            {
+                Impl::Stmt info(m_impl->sqlite, m_impl->db,
+                                "PRAGMA table_info(objects);");
+                if (info.ok()) {
+                    while (info.step() == SQLITE_ROW) {
+                        if (info.col_text(1) == "durability_level") {
+                            has_durability_col = true;
+                        }
+                    }
+                }
+            }
+            if (!has_durability_col &&
+                !m_impl->exec("ALTER TABLE objects ADD COLUMN durability_level"
+                              " INTEGER NOT NULL DEFAULT 0;")) {
+                m_impl->teardown();
+                return false;
+            }
+            if (!m_impl->exec("UPDATE schema_version SET version=4;")) {
                 m_impl->teardown();
                 return false;
             }
@@ -869,6 +922,422 @@ Result ObjectStore::deliveryReadout(const ObjectId& id, ObjectStatus* status_out
     if (delivered_at_ms_out) *delivered_at_ms_out = st.col_int64(1);
     if (confirmed_at_ms_out) *confirmed_at_ms_out = st.col_int64(2);
     if (failure_class_out) *failure_class_out = static_cast<uint8_t>(st.col_int(3));
+    return Result::kOk;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7: adaptive replication + peer scoring
+// ---------------------------------------------------------------------------
+const char* ObjectStore::durability_name(DurabilityLevel d) {
+    switch (d) {
+        case kDLocalOnly: return "D0_LOCAL_ONLY";
+        case kDOneRemote: return "D1_ONE_REMOTE";
+        case kDTwoRemote: return "D2_TWO_REMOTE";
+        case kDThreeRemote: return "D3_THREE_REMOTE";
+        case kDDestinationAccepted: return "D4_DEST_ACCEPTED";
+        case kDDestSignedAck: return "D5_DEST_SIGNED_ACK";
+    }
+    return "D_UNKNOWN";
+}
+
+namespace {
+inline ObjectStore::DurabilityLevel clamp_durability(int v) {
+    if (v < static_cast<int>(ObjectStore::kDLocalOnly)) return ObjectStore::kDLocalOnly;
+    if (v > static_cast<int>(ObjectStore::kDDestSignedAck)) return ObjectStore::kDDestSignedAck;
+    return static_cast<ObjectStore::DurabilityLevel>(v);
+}
+
+// Read a namespace's replication policy WITHOUT acquiring the store mutex
+// (caller must already hold it). Used by getDurability so we never re-lock the
+// non-recursive mutex (recursive-lock deadlock). Falls back to defaults.
+void queryPolicyLocked(ObjectStore::Impl& impl, const std::string& ns,
+                       ObjectStore::ReplicationPolicy& out) {
+    ObjectStore::Impl::Stmt st(impl.sqlite, impl.db,
+        "SELECT min_copies, desired_copies, max_copies, ttl_ms, priority,"
+        " prefer_diversity, prefer_high_uptime, require_receipt FROM repl_policies"
+        " WHERE namespace_id=?1;");
+    if (!st.ok()) {
+        out = ObjectStore::ReplicationPolicy{};
+        out.namespace_id = ns;
+        return;
+    }
+    st.bind_text(1, ns);
+    if (st.step() != SQLITE_ROW) {
+        out.namespace_id = ns;
+        out.minimum_remote_copies = 0;
+        out.desired_remote_copies = 2;
+        out.maximum_remote_copies = 4;
+        out.ttl_ms = 3600000;
+        out.priority = 0;
+        out.prefer_network_diversity = true;
+        out.prefer_high_uptime_peers = true;
+        out.require_destination_receipt = false;
+        return;
+    }
+    out.namespace_id = ns;
+    out.minimum_remote_copies = static_cast<uint8_t>(st.col_int(0));
+    out.desired_remote_copies = static_cast<uint8_t>(st.col_int(1));
+    out.maximum_remote_copies = static_cast<uint8_t>(st.col_int(2));
+    out.ttl_ms = st.col_int64(3);
+    out.priority = st.col_int(4);
+    out.prefer_network_diversity = st.col_int(5) != 0;
+    out.prefer_high_uptime_peers = st.col_int(6) != 0;
+    out.require_destination_receipt = st.col_int(7) != 0;
+}
+} // namespace
+
+Result ObjectStore::getDurability(const ObjectId& id, DurabilityReadout& out) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT durability_level, namespace_id FROM objects WHERE object_id=?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, id.toHex());
+    if (st.step() != SQLITE_ROW) return Result::kNotFound;
+    out.level = clamp_durability(st.col_int(0));
+    const std::string ns = st.col_text(1);
+    ReplicationPolicy rc;
+    queryPolicyLocked(*m_impl, ns, rc);
+    out.desired_remote_copies = rc.desired_remote_copies;
+    out.maximum_remote_copies = rc.maximum_remote_copies;
+    return Result::kOk;
+}
+
+Result ObjectStore::setDurability(const ObjectId& id, DurabilityLevel level) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET durability_level=?1 WHERE object_id=?2;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, static_cast<int>(clamp_durability(static_cast<int>(level))));
+    st.bind_text(2, id.toHex());
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+Result ObjectStore::raiseDurability(const ObjectId& id, DurabilityLevel level) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    // Monotonic: only raise if the new level is strictly higher.
+    Impl::Stmt sel(m_impl->sqlite, m_impl->db,
+        "SELECT durability_level FROM objects WHERE object_id=?1;");
+    if (!sel.ok()) return Result::kIo;
+    sel.bind_text(1, id.toHex());
+    if (sel.step() != SQLITE_ROW) return Result::kNotFound;
+    const int cur = clamp_durability(sel.col_int(0));
+    const int want = static_cast<int>(clamp_durability(static_cast<int>(level)));
+    if (want <= cur) return Result::kOk;   // idempotent no-op
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET durability_level=?1 WHERE object_id=?2;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, want);
+    st.bind_text(2, id.toHex());
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+Result ObjectStore::lowerDurability(const ObjectId& id, DurabilityLevel level) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "UPDATE objects SET durability_level=?1 WHERE object_id=?2;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int(1, static_cast<int>(clamp_durability(static_cast<int>(level))));
+    st.bind_text(2, id.toHex());
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+Result ObjectStore::forEachObjectBelowDurability(
+    DurabilityLevel level, const std::function<Result(const ObjectId&)>& fn) const {
+    // Snapshot the matching ids under the lock, then invoke the callback
+    // OUTSIDE it. This lets the callback safely call back into other store
+    // methods (e.g. the replica planner's repairObject) without a recursive
+    // non-recursive-mutex deadlock.
+    std::vector<ObjectId> ids;
+    {
+        std::lock_guard<std::mutex> lock(m_impl->mu);
+        if (!m_open) return Result::kInvalidState;
+        Impl::Stmt st(m_impl->sqlite, m_impl->db,
+            "SELECT object_id FROM objects WHERE durability_level < ?1"
+            " AND state NOT IN (8,9,10);");   // skip confirmed/failed/cancelled
+        if (!st.ok()) return Result::kIo;
+        st.bind_int(1, static_cast<int>(level));
+        while (st.step() == SQLITE_ROW) {
+            ObjectId id;
+            if (ObjectId::fromHex(st.col_text(0), id)) ids.push_back(id);
+        }
+    }
+    for (const auto& id : ids) {
+        const Result r = fn(id);
+        if (r != Result::kOk) return r;
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::setReplicationPolicy(const ReplicationPolicy& policy) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "INSERT OR REPLACE INTO repl_policies(namespace_id, min_copies,"
+        " desired_copies, max_copies, ttl_ms, priority, prefer_diversity,"
+        " prefer_high_uptime, require_receipt)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, policy.namespace_id);
+    st.bind_int(2, policy.minimum_remote_copies);
+    st.bind_int(3, policy.desired_remote_copies);
+    st.bind_int(4, policy.maximum_remote_copies);
+    st.bind_int64(5, policy.ttl_ms);
+    st.bind_int(6, policy.priority);
+    st.bind_int(7, policy.prefer_network_diversity ? 1 : 0);
+    st.bind_int(8, policy.prefer_high_uptime_peers ? 1 : 0);
+    st.bind_int(9, policy.require_destination_receipt ? 1 : 0);
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+Result ObjectStore::getReplicationPolicy(const std::string& namespace_id,
+                                        ReplicationPolicy& out) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT min_copies, desired_copies, max_copies, ttl_ms, priority,"
+        " prefer_diversity, prefer_high_uptime, require_receipt FROM repl_policies"
+        " WHERE namespace_id=?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, namespace_id);
+    if (st.step() != SQLITE_ROW) {
+        out = defaultPolicy(namespace_id);
+        return Result::kNotFound;
+    }
+    out.namespace_id = namespace_id;
+    out.minimum_remote_copies = static_cast<uint8_t>(st.col_int(0));
+    out.desired_remote_copies = static_cast<uint8_t>(st.col_int(1));
+    out.maximum_remote_copies = static_cast<uint8_t>(st.col_int(2));
+    out.ttl_ms = st.col_int64(3);
+    out.priority = st.col_int(4);
+    out.prefer_network_diversity = st.col_int(5) != 0;
+    out.prefer_high_uptime_peers = st.col_int(6) != 0;
+    out.require_destination_receipt = st.col_int(7) != 0;
+    return Result::kOk;
+}
+
+Result ObjectStore::recordPeerObservation(const std::string& peer_id,
+                                          bool reachable, bool handoff_success,
+                                          int64_t latency_ms) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    PeerScore cur;
+    {
+        Impl::Stmt sel(m_impl->sqlite, m_impl->db,
+            "SELECT observations, reachability, avg_latency_ms, success_count,"
+            " failure_count, trust_tier, storage_willing, diversity_group, score,"
+            " last_seen_ms FROM peer_scores WHERE peer_id=?1;");
+        if (sel.ok()) {
+            sel.bind_text(1, peer_id);
+            if (sel.step() == SQLITE_ROW) {
+                cur.observations = static_cast<uint64_t>(sel.col_int64(0));
+                cur.reachability = static_cast<uint32_t>(sel.col_int(1));
+                cur.avg_latency_ms = sel.col_int64(2);
+                cur.success_count = static_cast<uint32_t>(sel.col_int(3));
+                cur.failure_count = static_cast<uint32_t>(sel.col_int(4));
+                cur.trust_tier = sel.col_int(5);
+                cur.storage_willing = static_cast<uint8_t>(sel.col_int(6));
+                cur.diversity_group = sel.col_text(7);
+                cur.score = static_cast<double>(sel.col_int64(8)) / 1000.0;
+                cur.last_seen_ms = sel.col_int64(9);
+            }
+        }
+    }
+    const uint64_t today_obs = cur.observations + 1;
+    const int lat = latency_ms > 0 ? static_cast<int>(latency_ms) : 0;
+    if (cur.observations == 0) {
+        cur.reachability = reachable ? 100 : 0;
+        cur.avg_latency_ms = lat;
+    } else {
+        const double rw_old = cur.observations;
+        cur.reachability = static_cast<uint32_t>(
+            (cur.reachability * rw_old + (reachable ? 100.0 : 0.0)) / today_obs);
+        cur.avg_latency_ms =
+            lat > 0 ? (cur.avg_latency_ms * static_cast<int64_t>(rw_old) + lat) /
+                          static_cast<int64_t>(today_obs)
+                    : cur.avg_latency_ms;
+    }
+    if (handoff_success) cur.success_count += 1;
+    if (!handoff_success && reachable) cur.failure_count += 1;
+    cur.observations = today_obs;
+    const double uptime = today_obs > 0
+        ? static_cast<double>(cur.success_count) / static_cast<double>(today_obs)
+        : 0.0;
+    double s = 0.0;
+    s += 0.35 * (cur.reachability / 100.0);
+    s += 0.25 * uptime;
+    if (cur.avg_latency_ms > 0) s += 0.15 * (1.0 - std::min(1.0, cur.avg_latency_ms / 500.0));
+    else s += 0.15;
+    if (cur.storage_willing == 1) s += 0.15;
+    s += 0.10 * (cur.trust_tier >= 0 ? std::min(1.0, 0.25 * (cur.trust_tier + 1)) : 0.0);
+    cur.score = std::min(1.0, s);
+    cur.peer_id = peer_id;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+    cur.last_seen_ms = now;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "INSERT OR REPLACE INTO peer_scores(peer_id, observations, reachability,"
+        " avg_latency_ms, success_count, failure_count, trust_tier,"
+        " storage_willing, diversity_group, score, last_seen_ms)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11);");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, peer_id);
+    st.bind_int64(2, static_cast<int64_t>(cur.observations));
+    st.bind_int(3, static_cast<int>(cur.reachability));
+    st.bind_int64(4, cur.avg_latency_ms);
+    st.bind_int(5, static_cast<int>(cur.success_count));
+    st.bind_int(6, static_cast<int>(cur.failure_count));
+    st.bind_int(7, cur.trust_tier);
+    st.bind_int(8, static_cast<int>(cur.storage_willing));
+    st.bind_text(9, cur.diversity_group);
+    st.bind_int64(10, static_cast<int64_t>(cur.score * 1000.0));
+    st.bind_int64(11, cur.last_seen_ms);
+    if (st.step() != SQLITE_DONE) return Result::kIo;
+    return Result::kOk;
+}
+
+Result ObjectStore::setPeerDiversityGroup(const std::string& peer_id,
+                                          const std::string& group) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "INSERT INTO peer_scores(peer_id, diversity_group) VALUES(?1,?2)"
+        " ON CONFLICT(peer_id) DO UPDATE SET diversity_group=excluded.diversity_group;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, peer_id);
+    st.bind_text(2, group);
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+Result ObjectStore::setPeerStorageWilling(const std::string& peer_id, bool willing) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "INSERT INTO peer_scores(peer_id, storage_willing) VALUES(?1,?2)"
+        " ON CONFLICT(peer_id) DO UPDATE SET"
+        " storage_willing=excluded.storage_willing;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, peer_id);
+    st.bind_int(2, willing ? 1 : 2);
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+ObjectStore::ReplicationPolicy ObjectStore::defaultPolicy(
+    const std::string& namespace_id) const {
+    ReplicationPolicy p;
+    p.namespace_id = namespace_id;
+    p.minimum_remote_copies = 0;
+    p.desired_remote_copies = 2;   // normal chat target D2 (§10)
+    p.maximum_remote_copies = 4;   // never over-replicate (§68)
+    p.ttl_ms = 3600000;
+    p.priority = 0;
+    p.prefer_network_diversity = true;
+    p.prefer_high_uptime_peers = true;
+    p.require_destination_receipt = false;
+    return p;
+}
+
+Result ObjectStore::getPeerScore(const std::string& peer_id, PeerScore& out) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT peer_id, observations, reachability, avg_latency_ms,"
+        " success_count, failure_count, trust_tier, storage_willing,"
+        " diversity_group, score, last_seen_ms FROM peer_scores WHERE peer_id=?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, peer_id);
+    if (st.step() != SQLITE_ROW) return Result::kNotFound;
+    out.peer_id = st.col_text(0);
+    out.observations = static_cast<uint64_t>(st.col_int64(1));
+    out.reachability = static_cast<uint32_t>(st.col_int(2));
+    out.avg_latency_ms = st.col_int64(3);
+    out.success_count = static_cast<uint32_t>(st.col_int(4));
+    out.failure_count = static_cast<uint32_t>(st.col_int(5));
+    out.trust_tier = st.col_int(6);
+    out.storage_willing = static_cast<uint8_t>(st.col_int(7));
+    out.diversity_group = st.col_text(8);
+    out.score = static_cast<double>(st.col_int64(9)) / 1000.0;
+    out.last_seen_ms = st.col_int64(10);
+    return Result::kOk;
+}
+
+Result ObjectStore::forEachPeerScore(
+    const std::function<Result(const PeerScore&)>& fn) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT peer_id, observations, reachability, avg_latency_ms,"
+        " success_count, failure_count, trust_tier, storage_willing,"
+        " diversity_group, score, last_seen_ms FROM peer_scores"
+        " ORDER BY last_seen_ms DESC LIMIT 5000;");
+    if (!st.ok()) return Result::kIo;
+    while (st.step() == SQLITE_ROW) {
+        PeerScore s;
+        s.peer_id = st.col_text(0);
+        s.observations = static_cast<uint64_t>(st.col_int64(1));
+        s.reachability = static_cast<uint32_t>(st.col_int(2));
+        s.avg_latency_ms = st.col_int64(3);
+        s.success_count = static_cast<uint32_t>(st.col_int(4));
+        s.failure_count = static_cast<uint32_t>(st.col_int(5));
+        s.trust_tier = st.col_int(6);
+        s.storage_willing = static_cast<uint8_t>(st.col_int(7));
+        s.diversity_group = st.col_text(8);
+        s.score = static_cast<double>(st.col_int64(9)) / 1000.0;
+        s.last_seen_ms = st.col_int64(10);
+        const Result r = fn(s);
+        if (r != Result::kOk) return r;
+    }
+    return Result::kOk;
+}
+
+Result ObjectStore::agePeerScores(int64_t now_ms, int64_t stale_after_ms) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "DELETE FROM peer_scores WHERE last_seen_ms < ?1 AND trust_tier <= 1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_int64(1, now_ms - stale_after_ms);
+    if (st.step() != SQLITE_DONE) return Result::kIo;
+    return Result::kOk;
+}
+
+uint64_t ObjectStore::durabilityDistribution(int level) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return 0;
+    if (level < 0 || level > static_cast<int>(kDDestSignedAck)) return 0;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT COUNT(*) FROM objects WHERE durability_level=?1;");
+    if (st.ok() && st.step() == SQLITE_ROW) {
+        return static_cast<uint64_t>(st.col_int64(0));
+    }
+    return 0;
+}
+
+Result ObjectStore::setRepairBackoff(const ObjectId& id, int64_t next_retry_ms) {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "INSERT OR REPLACE INTO replica_backoff(object_id, next_retry_ms)"
+        " VALUES(?1,?2);");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, id.toHex());
+    st.bind_int64(2, next_retry_ms);
+    return st.step() == SQLITE_DONE ? Result::kOk : Result::kIo;
+}
+
+Result ObjectStore::getRepairBackoff(const ObjectId& id, int64_t* next_retry_ms) const {
+    std::lock_guard<std::mutex> lock(m_impl->mu);
+    if (!m_open) return Result::kInvalidState;
+    Impl::Stmt st(m_impl->sqlite, m_impl->db,
+        "SELECT next_retry_ms FROM replica_backoff WHERE object_id=?1;");
+    if (!st.ok()) return Result::kIo;
+    st.bind_text(1, id.toHex());
+    if (st.step() != SQLITE_ROW) return Result::kNotFound;
+    if (next_retry_ms) *next_retry_ms = st.col_int64(0);
     return Result::kOk;
 }
 

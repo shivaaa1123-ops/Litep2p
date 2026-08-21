@@ -20,6 +20,7 @@
 #include "networkos/handoff/HandoffManager.h"
 #include "networkos/delivery/DeliveryManager.h"
 #include "networkos/anti_entropy/AntiEntropyManager.h"
+#include "networkos/replication/ReplicaPlanner.h"
 #include "networkos/session/SessionFacade.h"
 
 #include "config_manager.h"
@@ -112,6 +113,10 @@ public:
                             // Phase 6: on a useful connection, run pull-heavy
                             // anti-entropy reconciliation (pull-first; no timers).
                             if (m_anti_entropy) m_anti_entropy->onPeerReady(p.id);
+                            // Phase 7: a new READY peer is a replication +
+                            // scoring event — snapshot the peer and repair any
+                            // durability deficits toward it (Step 5.5/5.7).
+                            if (m_replication) m_replication->onPeerReady(p.id);
                         } else {
                             emit_(RuntimeEventType::kPeerState, "peer_disconnected", p.id, "");
                             if (m_session_facade) m_session_facade->onPeerState(p.id, "DISCONNECTED");
@@ -221,10 +226,31 @@ public:
                         case MessageType::OBJECT_REJECT:
                         case MessageType::STORED_ACK:
                             if (m_handoff) m_handoff->onFrame(peer_id, type, payload);
+                            // Phase 7: a signed storage lease confirms a remote
+                            // copy — bump durability (Step 5.1).
+                            if (m_replication && type == MessageType::STORED_ACK) {
+                                handoff::StoredAckFrame f;
+                                if (handoff::decode_stored_ack(payload, f)) {
+                                    ObjectId id;
+                                    if (ObjectId::fromHex(f.object_id_hex, id)) {
+                                        m_replication->noteStoredAck(id);
+                                    }
+                                }
+                            }
                             break;
                         case MessageType::RECEIVED_ACK:
                             if (m_delivery)
                                 m_delivery->onFrame(peer_id, type, payload, false);
+                            // Phase 7: destination signed-ack = D5 durability.
+                            if (m_replication) {
+                                delivery::ReceivedAckFrame f;
+                                if (delivery::decode_received_ack(payload, f)) {
+                                    ObjectId id;
+                                    if (ObjectId::fromHex(f.object_id_hex, id)) {
+                                        m_replication->noteDeliveryAcked(id);
+                                    }
+                                }
+                            }
                             break;
                         case MessageType::INVENTORY:
                         case MessageType::OBJECT_WANT:
@@ -285,6 +311,44 @@ public:
                 [this](const std::string& kind, const std::string& payload) {
                     emit_(RuntimeEventType::kDelivery, kind, "", payload);
                 });
+
+            // Phase 7: target-driven adaptive replication + peer scoring.
+            // The planner reuses the Phase 4 handoff to actually replicate:
+            // issuing a handoff to a peer re-offers the queued object(s) to it.
+            replication::ReplicaPlanner::Config recfg;
+            recfg.local_peer_id = m_peer_id;
+            m_replication = std::make_unique<replication::ReplicaPlanner>(
+                m_object_store.get(), recfg);
+            m_replication->setIssueHandoffFn(
+                [this](const std::string& /*peer_id*/) -> bool {
+                    if (!m_handoff) return false;
+                    return m_handoff->retryPending(now_ms()) > 0;
+                });
+            m_replication->setConnectedPeersFn(
+                [this]() -> std::vector<std::string> {
+                    if (!m_session) return {};
+                    return m_session->getConnectedPeerIds();
+                });
+            m_replication->setEventFn(
+                [this](const std::string& kind, const std::string& payload) {
+                    emit_(RuntimeEventType::kDelivery, kind, "", payload);
+                });
+            // Feed the planner from protocol events: STORED_ACK, delivery ack,
+            // peer_ready, lease-expiry (repair), and connectivity change.
+            // LEASE_EXPIRING events emitted by the handoff sweep feed repairs.
+            m_handoff->setEventFn(
+                [this](const std::string& kind, const std::string& payload) {
+                    emit_(RuntimeEventType::kDelivery, kind, "", payload);
+                    if (m_replication && kind == "LEASE_EXPIRING") {
+                        ObjectId id;
+                        const std::string hex =
+                            payload.substr(0, payload.find(':'));
+                        if (!hex.empty() && ObjectId::fromHex(hex, id)) {
+                            m_replication->noteLeaseExpired(id, now_ms());
+                            m_replication->plan(now_ms());
+                        }
+                    }
+                });
         }
 
         // 4. Durable state restore (peer DB bootstrap happens inside
@@ -322,6 +386,7 @@ public:
         m_handoff.reset();
         m_delivery.reset();
         m_anti_entropy.reset();
+        m_replication.reset();
         m_session_facade.reset();
         m_object_store.reset();
         m_state = RuntimeState::kStopped;
@@ -386,6 +451,10 @@ public:
     // only when the object store is present.
     anti_entropy::AntiEntropyManager* antiEntropy() override { return m_anti_entropy.get(); }
 
+    // Phase 7: target-driven adaptive replication + peer scoring. Valid while
+    // running and only when the object store is present.
+    replication::ReplicaPlanner* replication() override { return m_replication.get(); }
+
     Result sendMessage(const std::string& peer_id, const std::string& payload) override {
         if (!m_session) return Result::kInvalidState;
         m_session->sendMessageToPeer(peer_id, payload);
@@ -416,6 +485,9 @@ public:
             // Step 4.6: envoy-triggered lease-expiry sweep (emits
             // LEASE_EXPIRING so the Phase 7 planner can renew/replicate).
             if (m_handoff) m_handoff->sweepLeases(now_ms());
+            // Phase 7: a connectivity change is an event-triggered retry for
+            // any backed-off replication work (Step 5.7).
+            if (m_replication) m_replication->onConnectivityChange(now_ms());
         }
         emit_(RuntimeEventType::kPlatform, signal, "", value);
         return Result::kOk;
@@ -451,6 +523,7 @@ private:
     std::unique_ptr<handoff::HandoffManager> m_handoff;
     std::unique_ptr<delivery::DeliveryManager> m_delivery;
     std::unique_ptr<anti_entropy::AntiEntropyManager> m_anti_entropy;
+    std::unique_ptr<replication::ReplicaPlanner> m_replication;
 
     mutable std::mutex m_life_mu;
     mutable std::mutex m_cb_mu;

@@ -231,9 +231,11 @@ static void test_store_schema_v3() {
     ObjectStore::Options opt;
     opt.path = db;
     TEST_ASSERT(store.open(opt), "store opens");
+    // Schema advanced by later phases (P5 v3, P7 v4); assert it matches the
+    // engine's current schema and is forward-compatible with delivery (>= 3).
     TEST_ASSERT(store.schemaVersion() == ObjectStore::kSchemaVersion &&
-                    store.schemaVersion() == 3,
-                "schema version 3");
+                    store.schemaVersion() >= 3,
+                "schema version supports delivery");
 
     ObjectId id = ObjectId::generate("chatp2p-mesh", "peer-a");
     ObjectMeta meta;

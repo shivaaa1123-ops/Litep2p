@@ -20,7 +20,8 @@ class ObjectStore;     // declared in networkos/objectstore/ObjectStore.h
 
 namespace handoff { class HandoffManager; }  // declared in networkos/handoff/HandoffManager.h
 namespace delivery { class DeliveryManager; }  // declared in networkos/delivery/DeliveryManager.h
-namespace anti_entropy { class AntiEntropyManager; }  // declared in networkos/anti_entropy/AntiEntropyManager.h
+namespace anti_entropy { class AntiEntropyManager; }  // networkos/anti_entropy/AntiEntropyManager.h
+namespace replication { class ReplicaPlanner; }  // networkos/replication/ReplicaPlanner.h
 
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
@@ -187,6 +188,11 @@ public:
     // runtime. Valid only while running and only when the object store is
     // present. Default: none.
     virtual anti_entropy::AntiEntropyManager* antiEntropy() { return nullptr; }
+
+    // Phase 7: target-driven adaptive replication + peer scoring planner owned
+    // by the runtime. Valid only while running and only when the object store
+    // is present. Default: none.
+    virtual replication::ReplicaPlanner* replication() { return nullptr; }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).
