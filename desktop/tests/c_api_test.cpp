@@ -564,11 +564,12 @@ static bool test_feature_flags() {
     TEST_ASSERT((flags & LITEP2P_FEATURE_ENCRYPTION) != 0,
                 "encryption feature flag should be set");
 
-    // No reserved/unknown bits set.
+    // No reserved/unknown bits set. (Phase 12 adds LITEP2P_FEATURE_NETWORK_OS.)
     TEST_ASSERT((flags & ~(LITEP2P_FEATURE_FILE_TRANSFER | LITEP2P_FEATURE_VOICE_CALL |
                            LITEP2P_FEATURE_OVERLAY | LITEP2P_FEATURE_PROXY |
                            LITEP2P_FEATURE_ENCRYPTION |
-                           LITEP2P_FEATURE_DISCOVERY | LITEP2P_FEATURE_TELEMETRY)) == 0,
+                           LITEP2P_FEATURE_DISCOVERY | LITEP2P_FEATURE_TELEMETRY |
+                           LITEP2P_FEATURE_NETWORK_OS)) == 0,
                 "no unknown feature bits should be set");
 
     std::cout << "Feature flags Passed!" << std::endl;

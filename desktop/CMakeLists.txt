@@ -584,6 +584,14 @@ add_executable(invariants_test tests/invariants_test.cpp)
 target_include_directories(invariants_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(invariants_test PRIVATE litep2p_engine)
 
+# Network OS Phase 12: compatibility contract tests (ABI snapshot, version
+# negotiation, schema migration fixtures, policy clamps, diagnostics shape).
+add_executable(compat_test tests/compat_test.cpp)
+target_include_directories(compat_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ../litep2p-core/src/main/cpp/modules/plugins/session/include)
+target_link_libraries(compat_test PRIVATE litep2p_engine)
+
 # Network OS Phase 3 crash-consistency probe (driven by object_store_kill_test.sh).
 add_executable(object_store_kill_probe tools/object_store_kill_probe.cpp)
 target_include_directories(object_store_kill_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)

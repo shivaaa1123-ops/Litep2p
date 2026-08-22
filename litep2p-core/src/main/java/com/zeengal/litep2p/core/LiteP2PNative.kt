@@ -304,6 +304,50 @@ internal object LiteP2PNative {
     /** Reliable sends in the durable outbox (QUEUED or SENT). */
     external fun reliablePendingCount(): Int
 
+    /* ------------------------------------------------------------------ */
+    /* Phase 12 — Network OS object runtime (litep2p_nos_* C ABI)          */
+    /* ------------------------------------------------------------------ */
+
+    /** Wire protocol version of this build (capability-negotiated). */
+    external fun nosWireProtocolVersion(): Int
+
+    /** Register/replace a namespace policy (values clamped natively). */
+    external fun nosRegisterNamespace(
+        namespaceId: String,
+        quotaBytes: Long,
+        priorityCeiling: Int,
+        maxObjectBytes: Int,
+        allowCarrier: Boolean,
+        protocolVersion: Int,
+    ): Int
+
+    /**
+     * Sign + publish an object. Returns the hex ObjectId when the code written
+     * into [resultOut][0] is OK; empty string otherwise.
+     */
+    external fun nosSend(
+        destination: String,
+        namespaceId: String,
+        payload: ByteArray,
+        ttlMs: Long,
+        priority: Int,
+        minRemoteCopies: Int,
+        desiredRemoteCopies: Int,
+        requireReceipt: Boolean,
+        allowStoreAndForward: Boolean,
+        maxPayloadBytes: Int,
+        resultOut: IntArray,
+    ): String
+
+    /** Cancel a not-yet-delivered object. */
+    external fun nosCancel(objectId: String): Int
+
+    /** Delivery status JSON for one object (null when not runnable). */
+    external fun nosStatus(objectId: String): String?
+
+    /** Public diagnostics snapshot JSON (null when not runnable). */
+    external fun nosDiagnostics(): String?
+
     init {
         System.loadLibrary("litep2p")
     }

@@ -2308,6 +2308,98 @@ int main(void) {
 
 ---
 
+## 16. Network OS object runtime (Phase 12, v0.4 feature set)
+
+The Network OS (Phases 3–11) is exposed **additively**: the frozen v0.4
+messaging/file/overlay ABI is untouched; a new `litep2p_nos_*` family plus one
+feature flag gives integrators access to the durable object runtime.
+
+### 16.1 Versioning contract (§40/§83)
+
+| Version | Meaning | Where |
+|---|---|---|
+| SDK version | `0.4.0` — the Kotlin/C API surface | `LITEP2P_VERSION_*` |
+| Wire protocol version | `1` — negotiated per connection via capabilities | `litep2p_wire_protocol_version()`, `kWireProtocolMax` |
+| App protocol version | per-namespace tag carried in `NamespacePolicy` | application-defined |
+
+Rules: semver; additive changes bump MINOR, breaking changes bump MAJOR;
+deprecations keep working for at least one minor release and are marked in
+this document. Old peers never crash on new fields (unknown optional envelope
+fields are skipped); disjoint wire majors refuse to negotiate safely.
+
+### 16.2 C ABI additions (`litep2p.h`)
+
+```c
+#define LITEP2P_FEATURE_NETWORK_OS    (1u << 7)
+#define LITEP2P_WIRE_PROTOCOL_VERSION 1
+
+typedef struct litep2p_delivery_policy  { int64_t ttl_ms; int32_t priority;
+  uint8_t min_remote_copies; uint8_t desired_remote_copies;
+  int require_receipt; int allow_store_and_forward; uint32_t max_payload_bytes; }
+  litep2p_delivery_policy_t;
+
+typedef struct litep2p_namespace_policy { const char* namespace_id;
+  uint64_t quota_bytes; uint32_t priority_ceiling; uint32_t max_object_bytes;
+  int allow_carrier; uint8_t protocol_version; } litep2p_namespace_policy_t;
+
+uint8_t litep2p_wire_protocol_version(void);
+void    litep2p_delivery_policy_clamp(litep2p_delivery_policy_t*);
+litep2p_result_t litep2p_nos_register_namespace(const litep2p_namespace_policy_t*);
+litep2p_result_t litep2p_nos_send(const char* destination, const char* ns,
+    const uint8_t* payload, uint32_t len,
+    const litep2p_delivery_policy_t* policy, char* out_object_id, uint32_t n);
+litep2p_result_t litep2p_nos_cancel(const char* object_id);
+litep2p_result_t litep2p_nos_status(const char* object_id, char** out_json);
+litep2p_result_t litep2p_nos_set_delivery_event_cb(litep2p_delivery_event_cb, void*);
+litep2p_result_t litep2p_nos_diagnostics(char** out_json);
+```
+
+Semantics:
+- `nos_send` is **accepted ≠ delivered** (same contract as `send`). On OK it
+  returns the hex ObjectId; final state arrives through the delivery-event
+  callback or `nos_status`.
+- Every policy value is clamped (ttl `[60 s, 30 d]`, priority `[0, ceiling]`,
+  replicas `[0,4]`, payload ≤ namespace cap ≤ 16 MiB). Unsafe values can never
+  reach the engine.
+- `allow_store_and_forward = 0` requests direct-only delivery: an honest
+  `NOT_FOUND` when the destination has no direct route.
+- Receipts are always on in v1 (`require_receipt` is clamped true).
+- The NOS runtime is created lazily on first use while the engine is RUNNING
+  and listens on `main_port + 11`.
+
+### 16.3 Kotlin additions (`com.zeengal.litep2p.core.NetworkOs`)
+
+```kotlin
+NetworkOs.registerNamespace(NamespacePolicy("chat", quotaBytes = 32 shl 20))
+val res: SendResult = NetworkOs.send(dest, "chat", bytes)
+if (res.ok) { /* collect NetworkOs.deliveryEvents for final state */ }
+NetworkOs.cancel(res.objectId)
+NetworkOs.status(res.objectId)   // JSON status string
+NetworkOs.diagnostics()          // snapshot JSON (§48/§87)
+NetworkOs.deliveryEvents         // SharedFlow<String> of event lines
+```
+
+The wrapper stays thin: no routing/replication/dedup logic exists in Kotlin.
+
+### 16.4 Diagnostics snapshot
+
+`litep2p_nos_diagnostics()` / `NetworkOs.diagnostics()` return stable-key JSON:
+`sdk_version`, `wire_protocol_version`, `config_fingerprint` (FNV-1a over the
+runtime config), `state`, `peer_id`, `connected_peers`, `objects_d0..d3plus`,
+and subsystem telemetry objects. Privacy-safe: identifiers only, never
+payloads or keys.
+
+### 16.5 Compatibility & migration
+
+- Schema migrations ship with fixture tests (`desktop/tests/compat_test`):
+  v1-era databases upgrade to v4 with data intact; a future schema is refused
+  cleanly and preserved (forward-migration guard).
+- The ABI symbol set is snapshotted in `desktop/tests/c_abi_reference.txt`;
+  removing any frozen symbol fails the gate. Additions require regenerating
+  the reference as part of the release process.
+
+---
+
 *End of SDK reference. For engine-internal engineering templates, see
 [`docs/IMPLEMENTATION_TEMPLATES.md`](./IMPLEMENTATION_TEMPLATES.md) — that
 document is not part of the public SDK surface.*

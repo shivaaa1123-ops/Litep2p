@@ -141,4 +141,13 @@ object NativeEvents {
     fun onInviteReceived(fromPeerId: String) {
         LiteP2P.dispatchInviteReceived(fromPeerId)
     }
+
+    /**
+     * Phase 12 — Network OS delivery/diagnostic event (flat JSON line).
+     * Forwarded into [NetworkOs.deliveryEvents]. Called from a native thread.
+     */
+    @JvmStatic
+    fun onNosDeliveryEvent(json: String) {
+        NetworkOs.dispatchDeliveryEvent(json)
+    }
 }

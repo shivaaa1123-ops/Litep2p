@@ -209,6 +209,56 @@ public:
     // external triggers, e.g. network change -> scheduler wakeup).
     virtual Result onPlatformSignal(const std::string& signal,
                                     const std::string& value) = 0;
+
+    // ---- Phase 12: public Network OS object surface (§54/§55) --------------
+    // Per-send delivery policy. Every field is clamped to safe ranges by the
+    // runtime; integrators cannot inject unsafe values (doc §5.3).
+    struct NosPolicy {
+        int64_t ttl_ms{3600000};            // clamped [60_000, 2_592_000_000]
+        int priority{64};                   // clamped [0, 255] and ns ceiling
+        uint8_t min_remote_copies{0};       // clamped [0, 4]
+        uint8_t desired_remote_copies{2};   // clamped [min, 4]
+        bool require_receipt{true};         // v1: receipts are always on
+        bool allow_store_and_forward{true}; // false => direct-only (NO_ROUTE
+                                            //  when destination unreachable)
+        uint32_t max_payload_bytes{262144}; // clamped to ns cap / 16 MiB
+    };
+
+    // Per-namespace registration policy (§53). Registered namespaces get
+    // quota/ceiling enforcement; unregistered namespaces use safe defaults.
+    struct NosNamespacePolicy {
+        std::string namespace_id;           // [a-z0-9_-]{1,32}
+        uint64_t quota_bytes{16ull << 20};  // per-namespace store quota
+        uint32_t priority_ceiling{200};     // max priority sends may request
+        uint32_t max_object_bytes{1u << 20};
+        bool allow_carrier{true};           // third-party carriage permitted
+        uint8_t protocol_version{1};        // app protocol version tag
+    };
+
+    // Sign + publish an object addressed to `destination` through the durable
+    // delivery path (direct when connected, store-and-forward otherwise).
+    // Returns kOk and the hex ObjectId on acceptance (accepted != delivered;
+    // subscribe to delivery events for final state).
+    virtual Result nosSend(const std::string& destination,
+                           const std::string& namespace_id,
+                           const uint8_t* payload, size_t len,
+                           const NosPolicy* policy /* nullable = defaults */,
+                           std::string& out_object_id_hex) = 0;
+
+    // Cancel a not-yet-delivered object (removes local pending copy).
+    virtual Result nosCancel(const std::string& object_id_hex) = 0;
+
+    // Delivery status for one object as a flat JSON object.
+    virtual Result nosStatusJson(const std::string& object_id_hex,
+                                 std::string& out) = 0;
+
+    // Register/replace a namespace policy (clamped). kOk on success.
+    virtual Result nosRegisterNamespace(const NosNamespacePolicy& policy) = 0;
+
+    // Public diagnostics snapshot (§48/§87): versions, config fingerprint,
+    // runtime state, peer summary, store/durability counts, subsystem
+    // telemetry. Privacy-safe: identifiers only, never payloads.
+    virtual Result diagnosticsJson(std::string& out) = 0;
 };
 
 // Factory (defined in NetworkRuntime.cpp). Returns a new facade instance.

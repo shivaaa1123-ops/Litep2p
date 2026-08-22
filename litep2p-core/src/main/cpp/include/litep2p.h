@@ -480,6 +480,88 @@ void litep2p_free(void* ptr);
 /* Logging level: 0=DEBUG 1=INFO 2=WARN 3=ERROR. */
 litep2p_result_t litep2p_set_log_level(int level);
 
+/* ------------------------------------------------------------------------ */
+/* Network OS object runtime (Phases 3–12) — additive v0.4 surface          */
+/* (master doc §54/§55; locked decision 10: singleton, no handles).         */
+/*                                                                          */
+/* The NOS runtime is an independent engine instance created lazily on the  */
+/* first litep2p_nos_* call while the engine is RUNNING; it listens on      */
+/* main_port + 11 so the two engines never bind the same socket. Delivery   */
+/* events arrive via a single callback; status/diagnostics are pull JSON.   */
+/* ------------------------------------------------------------------------ */
+#define LITEP2P_FEATURE_NETWORK_OS    (1u << 7)
+
+/* Wire protocol version this build speaks (negotiated per connection). */
+#define LITEP2P_WIRE_PROTOCOL_VERSION 1
+
+/* Per-send delivery policy (§55). Every field is clamped by
+ * litep2p_delivery_policy_clamp() / the runtime — unsafe values never reach
+ * the engine. NULL policy = documented defaults. */
+typedef struct litep2p_delivery_policy {
+    int64_t  ttl_ms;                /* clamped [60_000 .. 2_592_000_000]       */
+    int32_t  priority;              /* clamped [0 .. ns.priority_ceiling]      */
+    uint8_t  min_remote_copies;     /* clamped [0 .. 4]                        */
+    uint8_t  desired_remote_copies; /* clamped [min .. 4]                      */
+    int      require_receipt;       /* v1: receipts always on (clamped true)   */
+    int      allow_store_and_forward; /* 0 => direct-only (NOT_FOUND if down)  */
+    uint32_t max_payload_bytes;     /* clamped to ns cap / 16 MiB             */
+} litep2p_delivery_policy_t;
+
+/* Per-namespace registration policy (§53): quota, priority ceiling,
+ * per-object cap, carrier permission, app protocol version tag. */
+typedef struct litep2p_namespace_policy {
+    const char* namespace_id;       /* [a-z0-9_-]{1,32}                        */
+    uint64_t    quota_bytes;        /* per-namespace storage quota             */
+    uint32_t    priority_ceiling;   /* clamped [0..255]                        */
+    uint32_t    max_object_bytes;   /* clamped [1 .. 16 MiB]                   */
+    int         allow_carrier;      /* third-party carriage permitted          */
+    uint8_t     protocol_version;   /* app-level protocol version for this ns  */
+} litep2p_namespace_policy_t;
+
+/* Delivery state changes (DELIVERED / CONFIRMED / FAILED / TTL_EXPIRED ...).
+ * json_event is a flat JSON object; cb runs on an engine thread — do not
+ * block. Register NULL to unregister. */
+typedef void (*litep2p_delivery_event_cb)(const char* json_event, void* user);
+
+/* Wire protocol version of this build (for pre-connect capability checks). */
+uint8_t litep2p_wire_protocol_version(void);
+
+/* Clamp a caller-supplied policy in place (pure; safe to call anytime). */
+void litep2p_delivery_policy_clamp(litep2p_delivery_policy_t* policy);
+
+/* Register/replace a namespace policy (id validated, values clamped). */
+litep2p_result_t litep2p_nos_register_namespace(
+    const litep2p_namespace_policy_t* ns);
+
+/* Sign + publish an object for `destination`. On LITEP2P_OK writes the hex
+ * ObjectId into out_object_id (NUL-terminated). Accepted ≠ delivered —
+ * subscribe to delivery events for final state. Errors: INVALID_ARG,
+ * INVALID_STATE (not started), NOT_FOUND (direct-only w/o route), IO. */
+litep2p_result_t litep2p_nos_send(const char* destination,
+                                  const char* namespace_id,
+                                  const uint8_t* payload, uint32_t len,
+                                  const litep2p_delivery_policy_t* policy,
+                                  char* out_object_id, uint32_t buf_len);
+
+/* Cancel a not-yet-delivered object. Errors: NOT_FOUND, INVALID_STATE
+ * (already delivered), INVALID_ARG. */
+litep2p_result_t litep2p_nos_cancel(const char* object_id);
+
+/* Delivery status as flat JSON (*out_json malloc'd; free with litep2p_free):
+ * {"object_id","present","destination","namespace","ttl_ms","priority",
+ *  "durability","desired_remote_copies"} */
+litep2p_result_t litep2p_nos_status(const char* object_id, char** out_json);
+
+/* Register/unregister the delivery-event callback. */
+litep2p_result_t litep2p_nos_set_delivery_event_cb(
+    litep2p_delivery_event_cb cb, void* user);
+
+/* Public diagnostics snapshot (§48/§87) — stable keys, privacy-safe:
+ * {"sdk_version","wire_protocol_version","config_fingerprint","state",
+ *  "peer_id","connected_peers","objects_d0..d3plus","delivery",
+ *  "anti_entropy","replication","resources"} (*out_json → litep2p_free). */
+litep2p_result_t litep2p_nos_diagnostics(char** out_json);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

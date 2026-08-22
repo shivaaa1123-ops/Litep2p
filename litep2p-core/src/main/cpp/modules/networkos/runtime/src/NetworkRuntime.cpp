@@ -24,16 +24,24 @@
 #include "networkos/resources/ResourceManager.h"
 #include "networkos/discovery/DiscoveryManager.h"
 #include "networkos/session/SessionFacade.h"
+#include "networkos/capability.h"
+#include "networkos/object/envelope.h"
+#include "networkos/object/object_id.h"
+
+#include "litep2p.h"   // LITEP2P_VERSION_STRING (public SDK version)
 
 #include "config_manager.h"
 #include "constants.h"
 #include "session_manager.h"
 
 #include <chrono>
+#include <cctype>
+#include <cstdio>
 #include <fstream>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 namespace networkos {
 
@@ -45,12 +53,41 @@ int64_t now_ms() {
         .count();
 }
 
+// Phase 12 diagnostics helpers (stable, privacy-safe names only).
+const char* durability_name_(ObjectStore::DurabilityLevel lvl) {
+    switch (lvl) {
+        case ObjectStore::kDLocalOnly: return "D0_LOCAL";
+        case ObjectStore::kDOneRemote: return "D1";
+        case ObjectStore::kDTwoRemote: return "D2";
+        case ObjectStore::kDThreeRemote: return "D3";
+        case ObjectStore::kDDestinationAccepted: return "D4_DELIVERED";
+        case ObjectStore::kDDestSignedAck: return "D5_ACKED";
+    }
+    return "UNKNOWN";
+}
+
+const char* rt_state_name_(RuntimeState s) {
+    switch (s) {
+        case RuntimeState::kStopped: return "STOPPED";
+        case RuntimeState::kStarting: return "STARTING";
+        case RuntimeState::kRunning: return "RUNNING";
+        case RuntimeState::kStopping: return "STOPPING";
+        case RuntimeState::kRestoring: return "RESTORING";
+        case RuntimeState::kFailed: return "FAILED";
+    }
+    return "UNKNOWN";
+}
+
 class NetworkRuntime : public Runtime {
 public:
     NetworkRuntime() {
         m_scheduler = createScheduler();
         m_identity = createFileIdentityStore("");
+#if defined(__ANDROID__)
+        m_platform = createAndroidPlatformAdapter();
+#else
         m_platform = createDesktopPlatformAdapter();
+#endif
         m_resources = resources::createResourceManager();
         m_discovery = discovery::createDiscoveryManager({});
     }
@@ -494,6 +531,195 @@ public:
         return Result::kOk;
     }
 
+    // ---- Phase 12: Network OS object surface (§54/§55) ----------------------
+    Result nosRegisterNamespace(const NosNamespacePolicy& policy) override {
+        if (policy.namespace_id.empty() || policy.namespace_id.size() > 32)
+            return Result::kInvalidArg;
+        for (const char c : policy.namespace_id) {
+            if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-'))
+                return Result::kInvalidArg;
+        }
+        NosNamespacePolicy p = policy;   // clamped copy
+        p.quota_bytes = std::max<uint64_t>(4096, p.quota_bytes);
+        p.max_object_bytes = std::min<uint32_t>(p.max_object_bytes, 16u << 20);
+        p.priority_ceiling = std::min<uint32_t>(p.priority_ceiling, 255);
+        std::lock_guard<std::mutex> lock(m_nos_mu_);
+        m_ns_policies_[p.namespace_id] = p;
+        return Result::kOk;
+    }
+
+    Result nosSend(const std::string& destination,
+                   const std::string& namespace_id,
+                   const uint8_t* payload, size_t len,
+                   const NosPolicy* policy,
+                   std::string& out_object_id_hex) override {
+        if (!payload && len > 0) return Result::kInvalidArg;
+        if (destination.empty() || namespace_id.empty()) return Result::kInvalidArg;
+        if (m_state != RuntimeState::kRunning || !m_delivery || !m_object_store ||
+            !m_session)
+            return Result::kInvalidState;
+
+        // Namespace resolution + clamping (§53/§55): unsafe values never pass.
+        NosNamespacePolicy ns;
+        {
+            std::lock_guard<std::mutex> lock(m_nos_mu_);
+            const auto it = m_ns_policies_.find(namespace_id);
+            if (it != m_ns_policies_.end()) ns = it->second;
+        }
+        NosPolicy pol = policy ? *policy : NosPolicy{};
+        pol.ttl_ms = std::clamp<int64_t>(pol.ttl_ms, 60000, 2592000000LL);
+        pol.priority = std::clamp<int>(pol.priority, 0,
+                                       static_cast<int>(ns.priority_ceiling));
+        pol.min_remote_copies = std::min<uint8_t>(pol.min_remote_copies, 4);
+        pol.desired_remote_copies =
+            std::max(pol.desired_remote_copies, pol.min_remote_copies);
+        pol.desired_remote_copies = std::min<uint8_t>(pol.desired_remote_copies, 4);
+        pol.max_payload_bytes = std::min<uint32_t>(
+            pol.max_payload_bytes,
+            std::min<uint32_t>(ns.max_object_bytes == 0 ? 16u << 20
+                                                        : ns.max_object_bytes,
+                               16u << 20));
+        if (len > pol.max_payload_bytes) return Result::kInvalidArg;
+
+        // Persist the per-namespace replication target so the planner repairs
+        // toward the caller's policy (Phase 7 seam).
+        ObjectStore::ReplicationPolicy rp;
+        rp.namespace_id = namespace_id;
+        rp.minimum_remote_copies = pol.min_remote_copies;
+        rp.desired_remote_copies = pol.desired_remote_copies;
+        rp.maximum_remote_copies = 4;
+        rp.ttl_ms = pol.ttl_ms;
+        rp.priority = pol.priority;
+        rp.require_destination_receipt = true;
+        (void)m_object_store->setReplicationPolicy(rp);
+
+        // Signed envelope (origin authentication — invariant 8).
+        auto keys = m_session->get_local_signing_keys();
+        if (keys.first.size() != 32 || keys.second.size() != 64)
+            return Result::kInvalidState;
+
+        ObjectId id = ObjectId::generate("litep2p-nos", m_peer_id);
+        obj::NetworkObject obj;
+        obj.origin.network_id = "litep2p-nos";
+        obj.origin.namespace_id = namespace_id;
+        obj.origin.object_id_hex = id.toHex();
+        obj.origin.origin = m_peer_id;
+        obj.origin.destination = destination;
+        obj.origin.object_type = "nos.object";
+        obj.origin.created_at_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        obj.origin.ttl_ms = pol.ttl_ms;
+        obj.origin.priority = pol.priority;
+        const std::string body(reinterpret_cast<const char*>(payload), len);
+        obj.origin.payload_size = len;
+        obj.origin.payload_hash = obj::compute_payload_hash(body);
+        obj.payload = body;
+        if (!obj::sign_object(obj, keys.second.data(), keys.first.data()))
+            return Result::kIo;
+        const std::string envelope = obj::serialize(obj);
+        if (envelope.empty()) return Result::kIo;
+
+        // Direct-only policy: honest NO_ROUTE instead of silent carriage.
+        if (!pol.allow_store_and_forward) {
+            bool dest_connected = false;
+            for (const std::string& p : m_session->getConnectedPeerIds())
+                if (p == destination) { dest_connected = true; break; }
+            if (!dest_connected) return Result::kNotFound;  // no direct route
+        }
+
+        ObjectMeta meta;
+        meta.id = id;
+        meta.namespace_id = namespace_id;
+        meta.origin = m_peer_id;
+        meta.destination = destination;
+        meta.object_type = "nos.object";
+        meta.created_at_ms = obj.origin.created_at_ms;
+        meta.ttl_ms = pol.ttl_ms;
+        meta.priority = pol.priority;
+        meta.payload_size = len;
+        meta.payload_hash = obj.origin.payload_hash;
+        meta.status = ObjectStatus::kStored;
+
+        const auto out = m_delivery->storeAndDeliver(meta, envelope, 0);
+        if (out.rc != Result::kOk) return out.rc;
+        out_object_id_hex = id.toHex();
+        return Result::kOk;
+    }
+
+    Result nosCancel(const std::string& object_id_hex) override {
+        if (!m_object_store) return Result::kInvalidState;
+        ObjectId id;
+        if (!ObjectId::fromHex(object_id_hex, id)) return Result::kInvalidArg;
+        ObjectStore::DurabilityReadout dr;
+        if (m_object_store->getDurability(id, dr) != Result::kOk)
+            return Result::kNotFound;
+        if (dr.level >= ObjectStore::kDDestinationAccepted) return Result::kInvalidState;
+        return m_object_store->remove(id);
+    }
+
+    Result nosStatusJson(const std::string& object_id_hex, std::string& out) override {
+        if (!m_object_store) return Result::kInvalidState;
+        ObjectId id;
+        if (!ObjectId::fromHex(object_id_hex, id)) return Result::kInvalidArg;
+        ObjectMeta meta;
+        ObjectStore::DurabilityReadout dr;
+        const bool present = m_object_store->getMeta(id, meta) == Result::kOk;
+        const bool have_dur = m_object_store->getDurability(id, dr) == Result::kOk;
+        std::ostringstream o;
+        o << "{\"object_id\":\"" << object_id_hex << "\",\"present\":"
+          << (present ? "true" : "false");
+        if (present) {
+            o << ",\"destination\":\"" << meta.destination.value_or("") <<"\",\"namespace\":\""
+              << meta.namespace_id << "\",\"ttl_ms\":" << meta.ttl_ms
+              << ",\"priority\":" << meta.priority;
+        }
+        o << ",\"durability\":\""
+          << (have_dur ? durability_name_(dr.level) : "NOT_FOUND") << "\""
+          << ",\"desired_remote_copies\":"
+          << (have_dur ? static_cast<int>(dr.desired_remote_copies) : 0) << "}";
+        out = o.str();
+        return Result::kOk;
+    }
+
+    Result diagnosticsJson(std::string& out) override {
+        uint64_t fp = 14695981039346656037ULL;   // FNV-1a config fingerprint
+        for (const char c : m_cfg.ToString()) {
+            fp ^= static_cast<uint8_t>(c);
+            fp *= 1099511628211ULL;
+        }
+        char fpbuf[24];
+        std::snprintf(fpbuf, sizeof(fpbuf), "%016llx",
+                      static_cast<unsigned long long>(fp));
+        std::ostringstream o;
+        o << "{\"sdk_version\":\"" << LITEP2P_VERSION_STRING << "\""
+          << ",\"wire_protocol_version\":" << static_cast<int>(kWireProtocolMax)
+          << ",\"config_fingerprint\":\"" << fpbuf << "\""
+          << ",\"state\":\"" << rt_state_name_(m_state) << "\""
+          << ",\"peer_id\":\"" << m_peer_id << "\""
+          << ",\"connected_peers\":"
+          << (m_session ? m_session->getConnectedPeerIds().size() : 0);
+        if (m_object_store) {
+            o << ",\"objects_d0\":" << m_object_store->durabilityDistribution(0)
+              << ",\"objects_d1\":" << m_object_store->durabilityDistribution(1)
+              << ",\"objects_d2\":" << m_object_store->durabilityDistribution(2)
+              << ",\"objects_d3plus\":"
+              << (m_object_store->durabilityDistribution(3) +
+                  m_object_store->durabilityDistribution(4) +
+                  m_object_store->durabilityDistribution(5));
+        }
+        o << ",\"delivery\":"
+          << (m_delivery ? m_delivery->telemetryJson() : "{}")
+          << ",\"anti_entropy\":"
+          << (m_anti_entropy ? m_anti_entropy->telemetryJson() : "{}")
+          << ",\"replication\":"
+          << (m_replication ? m_replication->telemetryJson() : "{}")
+          << ",\"resources\":"
+          << (m_resources ? m_resources->budgetJson() : "{}")
+          << "}";
+        out = o.str();
+        return Result::kOk;
+    }
     Result onPlatformSignal(const std::string& signal, const std::string& value) override {
         PlatformSignal s;
         if (signal == "connectivity") s = PlatformSignal::kConnectivity;
@@ -583,6 +809,11 @@ private:
     std::unique_ptr<replication::ReplicaPlanner> m_replication;
     std::unique_ptr<resources::ResourceManager> m_resources;
     std::unique_ptr<discovery::DiscoveryManager> m_discovery;
+
+    // Phase 12: namespace policy registry + its lock.
+    std::mutex m_nos_mu_;
+    std::unordered_map<std::string, NosNamespacePolicy> m_ns_policies_;
+
 
     mutable std::mutex m_life_mu;
     mutable std::mutex m_cb_mu;

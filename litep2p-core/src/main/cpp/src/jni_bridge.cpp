@@ -73,6 +73,8 @@ void clear_any_exception(JNIEnv* env) {
 // ---------------------------------------------------------------------------
 static jclass g_eventsClass = nullptr;
 static jmethodID g_onPeersUpdated = nullptr;
+// Phase 12: Network OS delivery/diagnostic events (optional convenience).
+static jmethodID g_onNosDeliveryEvent = nullptr;
 static jmethodID g_onEngineStartComplete = nullptr;
 static jmethodID g_onEngineStopComplete = nullptr;
 static jmethodID g_onMessageReceived = nullptr;
@@ -135,6 +137,21 @@ void cabi_on_engine_stopped(void* /*user_data*/) {
     env->CallStaticVoidMethod(g_eventsClass, g_onEngineStopComplete);
     if (env->ExceptionCheck()) {
         nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onEngineStopComplete");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+
+// Phase 12: Network OS delivery/diagnostic event → NativeEvents.
+void cabi_on_nos_delivery_event(const char* json, void* /*user*/) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onNosDeliveryEvent || !json) return;
+    jstring jjson = env->NewStringUTF(json);
+    if (!jjson) return;
+    env->CallStaticVoidMethod(g_eventsClass, g_onNosDeliveryEvent, jjson);
+    env->DeleteLocalRef(jjson);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onNosDeliveryEvent");
         env->ExceptionDescribe();
         env->ExceptionClear();
     }
@@ -600,6 +617,10 @@ void register_cabi_callbacks() {
                   std::string(litep2p_result_string(rc)));
     }
 
+    // Phase 12: Network OS delivery/diagnostic event callback (independent of
+    // litep2p_callbacks_t; registration itself never touches the engine).
+    litep2p_nos_set_delivery_event_cb(cabi_on_nos_delivery_event, nullptr);
+
     // File-transfer offer/progress/completion callbacks (offer/accept model).
     litep2p_transfer_callbacks_t tc{};
     tc.struct_size = sizeof(litep2p_transfer_callbacks_t);
@@ -984,6 +1005,18 @@ bool jniBridgeInit(JNIEnv* env) {
         env->GetStaticMethodID(newEventsClass, "onOverlayDelivery",
                                "(Ljava/lang/String;Z)V");
     if (!newOnOverlayDeliveryMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onOverlayDelivery not found (overlay UI disabled)");
+        clear_any_exception(env);
+    }
+    // Phase 12 (optional): Network OS delivery/diagnostic event surface.
+    jmethodID newOnNosDeliveryEventMethod =
+        env->GetStaticMethodID(newEventsClass, "onNosDeliveryEvent",
+                               "(Ljava/lang/String;)V");
+    if (!newOnNosDeliveryEventMethod) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onNosDeliveryEvent not found (NOS events disabled)");
+        clear_any_exception(env);
+    }
+    if (!newOnOverlayDeliveryMethod) {
         nativeLog("JNI_BRIDGE: NativeEvents.onOverlayDelivery not found (overlay ACK UI disabled)");
         clear_any_exception(env);
     }
@@ -1111,6 +1144,7 @@ bool jniBridgeInit(JNIEnv* env) {
     g_addTelemetryJsonMethod = newAddTelemetryJsonMethod;
     g_onAckReceivedMethod = newOnAckReceivedMethod;
     g_onOverlayDeliveryMethod = newOnOverlayDeliveryMethod;
+    g_onNosDeliveryEvent = newOnNosDeliveryEventMethod;
     g_onFileTransferOfferedMethod = newOnFileTransferOfferedMethod;
     g_onTransferProgressMethod = newOnTransferProgressMethod;
     g_onTransferCompletedMethod = newOnTransferCompletedMethod;
@@ -1528,6 +1562,116 @@ Java_com_zeengal_litep2p_core_LiteP2PNative_nativeGetFeatureFlags(
     JNIEnv* env, jobject /*thiz*/) {
     (void)env;
     return (jint)litep2p_get_feature_flags();
+}
+
+/* ------------------------------------------------------------------------ */
+/* Phase 12 — Network OS object runtime (litep2p_nos_* C ABI).               */
+/* ------------------------------------------------------------------------ */
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nosWireProtocolVersion(
+    JNIEnv* /*env*/, jobject /*thiz*/) {
+    return (jint)litep2p_wire_protocol_version();
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nosRegisterNamespace(
+    JNIEnv* env, jobject /*thiz*/, jstring namespaceId, jlong quotaBytes,
+    jint priorityCeiling, jint maxObjectBytes, jboolean allowCarrier,
+    jint protocolVersion) {
+    litep2p_namespace_policy_t ns{};
+    const std::string ns_id = jstring_to_utf8(env, namespaceId);
+    ns.namespace_id = ns_id.c_str();
+    if (!ns.namespace_id) return (jint)LITEP2P_ERR_INVALID_ARG;
+    ns.quota_bytes = (uint64_t)quotaBytes;
+    ns.priority_ceiling = (uint32_t)priorityCeiling;
+    ns.max_object_bytes = (uint32_t)maxObjectBytes;
+    ns.allow_carrier = allowCarrier != JNI_FALSE;
+    ns.protocol_version = (uint8_t)protocolVersion;
+    return (jint)litep2p_nos_register_namespace(&ns);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nosSend(
+    JNIEnv* env, jobject /*thiz*/, jstring destination, jstring namespaceId,
+    jbyteArray payload, jlong ttlMs, jint priority, jint minRemoteCopies,
+    jint desiredRemoteCopies, jboolean requireReceipt,
+    jboolean allowStoreAndForward, jint maxPayloadBytes, jintArray resultOut) {
+    const std::string dest = jstring_to_utf8(env, destination);
+    const std::string ns = jstring_to_utf8(env, namespaceId);
+
+    litep2p_delivery_policy_t policy{};
+    policy.ttl_ms = (int64_t)ttlMs;
+    policy.priority = (int32_t)priority;
+    policy.min_remote_copies = (uint8_t)std::min(4, std::max(0, (int)minRemoteCopies));
+    policy.desired_remote_copies =
+        (uint8_t)std::min(4, std::max(0, (int)desiredRemoteCopies));
+    policy.require_receipt = 1;                    /* v1 contract: receipts on */
+    policy.allow_store_and_forward = allowStoreAndForward != JNI_FALSE ? 1 : 0;
+    policy.max_payload_bytes =
+        maxPayloadBytes > 0 ? (uint32_t)maxPayloadBytes : (16u << 20);
+
+    jint rc = (jint)LITEP2P_ERR_INVALID_ARG;
+    jstring result = nullptr;
+
+    if (dest.empty() || ns.empty() || !payload) {
+        if (resultOut) env->SetIntArrayRegion(resultOut, 0, 1, &rc);
+        return env->NewStringUTF("");
+    }
+    const jsize len = env->GetArrayLength(payload);
+    std::vector<uint8_t> bytes;
+    bytes.reserve((size_t)len);
+    jbyte* elems = env->GetByteArrayElements(payload, nullptr);
+    if (elems) {
+        bytes.assign(elems, elems + len);
+        env->ReleaseByteArrayElements(payload, elems, JNI_ABORT);
+    }
+
+    char object_id[128] = {0};
+    const litep2p_result_t lrc = litep2p_nos_send(
+        dest.c_str(), ns.c_str(),
+        bytes.empty() ? nullptr : bytes.data(), (uint32_t)bytes.size(),
+        &policy, object_id, sizeof(object_id));
+    rc = (jint)lrc;
+    result = env->NewStringUTF(lrc == LITEP2P_OK ? object_id : "");
+    if (resultOut) env->SetIntArrayRegion(resultOut, 0, 1, &rc);
+    return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nosCancel(
+    JNIEnv* env, jobject /*thiz*/, jstring objectId) {
+    const std::string id = jstring_to_utf8(env, objectId);
+    if (id.empty()) return (jint)LITEP2P_ERR_INVALID_ARG;
+    return (jint)litep2p_nos_cancel(id.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nosStatus(
+    JNIEnv* env, jobject /*thiz*/, jstring objectId) {
+    const std::string id = jstring_to_utf8(env, objectId);
+    if (id.empty()) return nullptr;
+    char* json = nullptr;
+    if (litep2p_nos_status(id.c_str(), &json) != LITEP2P_OK || !json) {
+        if (json) litep2p_free(json);
+        return nullptr;
+    }
+    jstring out = env->NewStringUTF(json);
+    litep2p_free(json);
+    return out;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nosDiagnostics(
+    JNIEnv* env, jobject /*thiz*/) {
+    char* json = nullptr;
+    if (litep2p_nos_diagnostics(&json) != LITEP2P_OK || !json) {
+        if (json) litep2p_free(json);
+        return nullptr;
+    }
+    jstring out = env->NewStringUTF(json);
+    litep2p_free(json);
+    return out;
 }
 
 

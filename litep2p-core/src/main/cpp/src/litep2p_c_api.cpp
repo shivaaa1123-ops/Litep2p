@@ -31,6 +31,11 @@
 #include "device_utils.h"
 #include "constants.h"
 
+// Phase 12: Network OS object runtime behind the additive litep2p_nos_* ABI.
+#include "networkos/Runtime.h"
+#include "networkos/capability.h"     // kWireProtocolMax (wire version)
+
+
 #if ENABLE_PROXY_MODULE
 #include "proxy_endpoint.h"
 #endif
@@ -83,6 +88,90 @@ litep2p_voice_callbacks_t g_voice_callbacks{};
 bool g_voice_callbacks_set = false;
 
 std::thread g_stop_completion_thread;
+
+// ---------------------------------------------------------------------------
+// Phase 12: Network OS (NOS) runtime state — lazily created on the first
+// litep2p_nos_* call while the engine is RUNNING (locked decision 10: still a
+// process-wide singleton, no handles). The runtime is an independent engine
+// instance with its own listen port (config key `nos.listen_port`, default
+// main port + 11) so the two engines never bind the same socket.
+// ---------------------------------------------------------------------------
+std::mutex g_nos_mu;
+std::unique_ptr<networkos::Runtime> g_nos_runtime;
+litep2p_delivery_event_cb g_nos_event_cb = nullptr;
+void* g_nos_event_user = nullptr;
+
+const char* nos_event_type_name_(networkos::RuntimeEventType t) {
+    switch (t) {
+        case networkos::RuntimeEventType::kLifecycle: return "lifecycle";
+        case networkos::RuntimeEventType::kPeerState: return "peer_state";
+        case networkos::RuntimeEventType::kMessage: return "message";
+        case networkos::RuntimeEventType::kDelivery: return "delivery";
+        case networkos::RuntimeEventType::kPlatform: return "platform";
+    }
+    return "unknown";
+}
+
+// Single dispatch boundary (§35): runtime events → the registered C callback
+// as one flat JSON line. Never invoked after g_nos_runtime.reset().
+class NosEventSink : public networkos::RuntimeEventSink {
+public:
+    void onRuntimeEvent(const networkos::RuntimeEvent& ev) override {
+        litep2p_delivery_event_cb cb = nullptr;
+        void* user = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_nos_mu);
+            cb = g_nos_event_cb;
+            user = g_nos_event_user;
+        }
+        if (!cb) return;
+        char buf[1024];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"type\":\"%s\",\"kind\":\"%s\",\"peer\":\"%s\","
+                      "\"at_ms\":%lld,\"data\":%s}",
+                      nos_event_type_name_(ev.type), ev.kind.c_str(),
+                      ev.peer_id.c_str(), static_cast<long long>(ev.at_ms),
+                      ev.payload.empty() ? "{}" : ev.payload.c_str());
+        cb(buf, user);
+    }
+};
+
+// Lazily create + start the NOS runtime. Returns nullptr when the engine is
+// not RUNNING or the runtime failed to start (logged; non-fatal for the
+// legacy engine — the feature flag still reports compile-time support).
+networkos::Runtime* nos_get_runtime() {
+    std::lock_guard<std::mutex> lk(g_nos_mu);
+    if (g_nos_runtime) return g_nos_runtime.get();
+    if (g_state.load(std::memory_order_acquire) != (int)LITEP2P_STATE_RUNNING)
+        return nullptr;
+
+    networkos::RuntimeConfig cfg;
+    cfg.files_dir = g_config.files_dir;
+    cfg.peer_id = g_resolved_peer_id;
+    cfg.comms_mode = g_config.comms_mode == "TCP" ? "TCP" : "UDP";
+    cfg.listen_port = (g_config.listen_port > 0 ? g_config.listen_port
+                                                : DEFAULT_SERVER_PORT) + 11;
+    cfg.enable_discovery = false;   // direct/known-peer model on the NOS port
+    cfg.event_sink = std::make_shared<NosEventSink>();
+    auto rt = networkos::createRuntime();
+    if (rt->start(cfg) != networkos::Result::kOk) {
+        nativeLog("CABI: NOS runtime start failed");
+        return nullptr;
+    }
+    g_nos_runtime = std::move(rt);
+    nativeLog("CABI: NOS runtime started");
+    return g_nos_runtime.get();
+}
+
+void nos_shutdown() {
+    std::lock_guard<std::mutex> lk(g_nos_mu);
+    if (g_nos_runtime) {
+        g_nos_runtime->stop();
+        g_nos_runtime.reset();
+        nativeLog("CABI: NOS runtime stopped");
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -389,6 +478,7 @@ const char* litep2p_version_string(void) {
 
 uint32_t litep2p_get_feature_flags(void) {
     uint32_t flags = 0u;
+    flags |= LITEP2P_FEATURE_NETWORK_OS;   // Network OS compiled in (P3–P12)
 #ifdef HAVE_FILE_TRANSFER
     flags |= LITEP2P_FEATURE_FILE_TRANSFER;
 #endif
@@ -761,6 +851,7 @@ litep2p_result_t litep2p_shutdown(void) {
     }
 
     std::lock_guard<std::mutex> lock(g_api_mutex);
+    nos_shutdown();
     g_engine.reset();
     g_resolved_peer_id.clear();
     g_initialized = false;
@@ -1374,6 +1465,134 @@ litep2p_result_t litep2p_set_log_level(int level) {
         case 3: set_log_level(LogLevel::ERROR); break;
         default: return LITEP2P_ERR_INVALID_ARG;
     }
+    return LITEP2P_OK;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Network OS object runtime — additive Phase 12 surface (§54/§55).          */
+/* ------------------------------------------------------------------------ */
+
+uint8_t litep2p_wire_protocol_version(void) {
+    return static_cast<uint8_t>(LITEP2P_WIRE_PROTOCOL_VERSION);
+}
+
+void litep2p_delivery_policy_clamp(litep2p_delivery_policy_t* p) {
+    if (!p) return;
+    if (p->ttl_ms < 60000) p->ttl_ms = 60000;
+    if (p->ttl_ms > 2592000000LL) p->ttl_ms = 2592000000LL;
+    if (p->priority < 0) p->priority = 0;
+    if (p->priority > 255) p->priority = 255;      /* ns ceiling applied later */
+    if (p->min_remote_copies > 4) p->min_remote_copies = 4;
+    if (p->desired_remote_copies > 4) p->desired_remote_copies = 4;
+    if (p->desired_remote_copies < p->min_remote_copies)
+        p->desired_remote_copies = p->min_remote_copies;
+    if (p->max_payload_bytes == 0 || p->max_payload_bytes > (16u << 20))
+        p->max_payload_bytes = 16u << 20;
+}
+
+litep2p_result_t litep2p_nos_register_namespace(
+    const litep2p_namespace_policy_t* ns) {
+    if (!ns || !ns->namespace_id) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    networkos::Runtime::NosNamespacePolicy np;
+    np.namespace_id = ns->namespace_id;
+    np.quota_bytes = ns->quota_bytes;
+    np.priority_ceiling = ns->priority_ceiling;
+    np.max_object_bytes = ns->max_object_bytes;
+    np.allow_carrier = ns->allow_carrier != 0;
+    np.protocol_version = ns->protocol_version;
+    return rt->nosRegisterNamespace(np) == networkos::Result::kOk
+               ? LITEP2P_OK
+               : LITEP2P_ERR_INVALID_ARG;
+}
+
+litep2p_result_t litep2p_nos_send(const char* destination,
+                                  const char* namespace_id,
+                                  const uint8_t* payload, uint32_t len,
+                                  const litep2p_delivery_policy_t* policy,
+                                  char* out_object_id, uint32_t buf_len) {
+    if (!destination || !namespace_id || (!payload && len > 0) || !out_object_id ||
+        buf_len == 0)
+        return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+
+    litep2p_delivery_policy_t pol;
+    if (policy) {
+        pol = *policy;
+        litep2p_delivery_policy_clamp(&pol);
+    }
+    networkos::Runtime::NosPolicy np;
+    np.ttl_ms = policy ? pol.ttl_ms : networkos::Runtime::NosPolicy{}.ttl_ms;
+    np.priority = policy ? pol.priority : 64;
+    np.min_remote_copies = pol.min_remote_copies;
+    np.desired_remote_copies = pol.desired_remote_copies;
+    np.require_receipt = true;                       /* v1 contract */
+    np.allow_store_and_forward =
+        policy ? (pol.allow_store_and_forward != 0) : true;
+    np.max_payload_bytes = pol.max_payload_bytes;
+
+    std::string id_hex;
+    const networkos::Result rc = rt->nosSend(destination, namespace_id, payload,
+                                             len, &np, id_hex);
+    switch (rc) {
+        case networkos::Result::kOk: break;
+        case networkos::Result::kInvalidArg: return LITEP2P_ERR_INVALID_ARG;
+        case networkos::Result::kInvalidState: return LITEP2P_ERR_INVALID_STATE;
+        case networkos::Result::kNotFound: return LITEP2P_ERR_NOT_FOUND;
+        case networkos::Result::kBusy: return LITEP2P_ERR_BUSY;
+        case networkos::Result::kIo: return LITEP2P_ERR_IO;
+        default: return LITEP2P_ERR_INTERNAL;
+    }
+    if (id_hex.size() + 1 > buf_len) return LITEP2P_ERR_INVALID_ARG;
+    std::snprintf(out_object_id, buf_len, "%s", id_hex.c_str());
+    return LITEP2P_OK;
+}
+
+litep2p_result_t litep2p_nos_cancel(const char* object_id) {
+    if (!object_id) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    switch (rt->nosCancel(object_id)) {
+        case networkos::Result::kOk: return LITEP2P_OK;
+        case networkos::Result::kNotFound: return LITEP2P_ERR_NOT_FOUND;
+        case networkos::Result::kInvalidState: return LITEP2P_ERR_INVALID_STATE;
+        default: return LITEP2P_ERR_INVALID_ARG;
+    }
+}
+
+litep2p_result_t litep2p_nos_status(const char* object_id, char** out_json) {
+    if (!object_id || !out_json) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    std::string json;
+    if (rt->nosStatusJson(object_id, json) != networkos::Result::kOk)
+        return LITEP2P_ERR_NOT_FOUND;
+    *out_json = static_cast<char*>(std::malloc(json.size() + 1));
+    if (!*out_json) return LITEP2P_ERR_IO;
+    std::memcpy(*out_json, json.c_str(), json.size() + 1);
+    return LITEP2P_OK;
+}
+
+litep2p_result_t litep2p_nos_set_delivery_event_cb(
+    litep2p_delivery_event_cb cb, void* user) {
+    std::lock_guard<std::mutex> lk(g_nos_mu);
+    g_nos_event_cb = cb;
+    g_nos_event_user = user;
+    return LITEP2P_OK;
+}
+
+litep2p_result_t litep2p_nos_diagnostics(char** out_json) {
+    if (!out_json) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    std::string json;
+    if (rt->diagnosticsJson(json) != networkos::Result::kOk)
+        return LITEP2P_ERR_IO;
+    *out_json = static_cast<char*>(std::malloc(json.size() + 1));
+    if (!*out_json) return LITEP2P_ERR_IO;
+    std::memcpy(*out_json, json.c_str(), json.size() + 1);
     return LITEP2P_OK;
 }
 

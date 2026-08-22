@@ -153,17 +153,24 @@ Run in this order; record every run in §10.
 
 | Date | Suite / metric | Runs | Result | Notes |
 |---|---|---|---|---|
-| YYYY-MM-DD | C ABI snapshot | 5 | PASS/FAIL | drift-free |
-| YYYY-MM-DD | Kotlin API tests | 5 | PASS/FAIL | both flavors |
-| YYYY-MM-DD | version negotiation | 5 | PASS/FAIL | old↔new |
-| YYYY-MM-DD | migration + rollback | 5 | PASS/FAIL | fixtures |
-| YYYY-MM-DD | compatibility matrix | 5 | PASS/FAIL | §86 list |
-| YYYY-MM-DD | namespace policies | 5 | PASS/FAIL | ... |
-| YYYY-MM-DD | diagnostics surface | 3 | PASS/FAIL | ... |
-| YYYY-MM-DD | full regression sweep | 5 | PASS/FAIL | P1–P11 |
-| YYYY-MM-DD | three-phone scenario | 3 | PASS/FAIL | 2 sessions |
-| YYYY-MM-DD | final bench numbers | 5 | PASS/FAIL | vs P1 |
-| YYYY-MM-DD | publication check | 1 | PASS/FAIL | Maven + zip |
+| 2026-08-22 | C ABI snapshot | 5 | PASS | 64-symbol frozen reference (`c_abi_reference.txt`); drift gate green ×5 |
+| 2026-08-22 | Kotlin API tests | 5 | PASS | wrapper compiles both flavors; `NetworkOs` surface + deliveryEvents Flow; native build green |
+| 2026-08-22 | version negotiation | 5 | PASS | old↔new matrix + wire v1 + envelope forward tolerance (inv 13) |
+| 2026-08-22 | migration + rollback | 5 | PASS | v1 fixture → v4 data-intact ×5; future-DB guard ×5 |
+| 2026-08-22 | compatibility matrix | 0 | DEFER | §86 device matrix — awaiting the two physical devices |
+| 2026-08-22 | namespace policies | 5 | PASS | registry validation + clamps ×5 (quota/ceiling/caps) |
+| 2026-08-22 | diagnostics surface | 5 | PASS | stable keys, config fingerprint, privacy-safe ×5 |
+| 2026-08-22 | full regression sweep | 5 | PASS | all suites ×5 rounds = 0 failures (P1–P11) |
+| 2026-08-22 | three-phone scenario | 0 | DEFER | Appendix C — awaiting physical devices |
+| 2026-08-22 | final bench numbers | 0 | DEFER | vs P1 — run in device session |
+| 2026-08-22 | publication check | 1 | PASS | Maven local both flavors + sources + dokka + portable zip |
+
+### Notes
+- `nos_send` live two-runtime loopback is opt-in (`LITEP2P_NOS_LIVE=1`);
+  CI-default is SKIP pending the device session (underlying paths green in
+  P2/P5 suites). This is the first thing to re-check on the provided phones.
+- SDK version stays **0.4.0** for this release train (Network OS surface ships
+  as a 0.x minor feature set); bump to 0.5.0 together with ChatP2P adoption.
 
 ## 11. Risks & mitigations
 
@@ -176,24 +183,32 @@ Run in this order; record every run in §10.
 
 ## 12. Definition of Done — v1 success criteria (Appendix C)
 
-- [ ] Three Android phones complete sender-offline store-and-forward delivery.
-- [ ] Every protocol stage survives process death.
-- [ ] Duplicate frames do not duplicate application delivery.
-- [ ] Sender receives a verifiable final receipt.
-- [ ] TTL remains fixed across forwarding.
-- [ ] Storage is strictly bounded.
-- [ ] Carrier refusal is explicit.
-- [ ] No mandatory central server for an already connected/discoverable
-      component.
-- [ ] Idle CPU/network activity close to zero; normal operation needs no
-      frequent polling.
-- [ ] Protocol state inspectable/debuggable (diagnostics).
-- [ ] Multiple SDK/application versions negotiate safely.
-- [ ] Simulated churn demonstrates measured (not assumed) reliability.
-- [ ] Artifacts published to Maven local; portable distribution refreshed.
-- [ ] Status table in `METHODOLOGY.md` updated (Phase 12 done).
-- [ ] Committed with message:
+- [x] Stable C ABI + JNI/Kotlin API shipped (`litep2p_nos_*`, `NetworkOs`) —
+      additive, snapshot-gated.
+- [ ] Three Android phones complete sender-offline store-and-forward delivery —
+      **awaiting the two physical devices** (desktop loopback of every
+      underlying stage is green).
+- [x] Every protocol stage survives process death (P3–P8 suites + migration
+      fixtures; re-verified on devices when available).
+- [x] Duplicate frames do not duplicate application delivery (inv 3/18 green).
+- [x] Sender receives a verifiable final receipt (P5 suite; receipts always on).
+- [x] TTL remains fixed across forwarding (P5/P7 suites).
+- [x] Storage is strictly bounded (P3/P10 suites; namespace quotas enforced).
+- [x] Carrier refusal is explicit (backpressure outcomes §28/§68).
+- [x] No mandatory central server (Gate A / invariant 19 green).
+- [x] Idle CPU/network close to zero (P8/P11 measurements; event-driven).
+- [x] Protocol state inspectable/debuggable — `litep2p_nos_diagnostics()` /
+      `NetworkOs.diagnostics()` with stable keys + config fingerprint.
+- [x] Multiple SDK/application versions negotiate safely (inv 13 + compat_test).
+- [x] Simulated churn demonstrates measured reliability (P11 report numbers).
+- [x] Artifacts published to Maven local; portable distribution refreshed.
+- [x] Status table in `METHODOLOGY.md` updated (Phase 12 done).
+- [x] Committed with message:
       `Network OS P12: public general-purpose SDK + compatibility contract`.
+
+> Device-gated items (three-phone Appendix C scenario, §86 compatibility
+> matrix, final bench comparison) are the remaining work for the hardware
+> session and are tracked in §10 as DEFER.
 
 ## 13. Final note
 This completes the Network OS v1. The master doc's §100 long-term vision
