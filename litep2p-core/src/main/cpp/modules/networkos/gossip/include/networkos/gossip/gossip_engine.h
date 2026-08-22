@@ -104,7 +104,6 @@ public:
     std::string telemetryJson() const;
 
 private:
-    void noteAcceptedLocked_(const PeerRecord& r, uint64_t now_utc);
     void evictIfNeededLocked_();
 
     Config m_cfg;
@@ -125,7 +124,7 @@ private:
     void poolAddLocked_(const std::string& url);
     // Counters (telemetry).
     uint64_t m_delta_sent{0}, m_delta_recv{0}, m_accepted_total{0};
-    uint64_t m_find_sent{0}, m_find_hit{0}, m_find_miss{0};
+    uint64_t m_find_hit{0}, m_find_miss{0};
     int64_t m_dirty_since_ms{0};
 };
 

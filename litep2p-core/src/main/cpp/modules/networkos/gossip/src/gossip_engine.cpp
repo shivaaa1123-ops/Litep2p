@@ -51,16 +51,16 @@ void GossipEngine::setSendFn(SendFn fn) { m_send = std::move(fn); }
 void GossipEngine::setAcceptedFn(AcceptedFn fn) { m_accepted = std::move(fn); }
 
 void GossipEngine::setLocalPushToken(const std::string& token, uint64_t now_utc) {
+    if (token.empty()) return;  // never burn a token_version on a clear
     std::lock_guard<std::mutex> lock(m_mu);
     if (token == m_local.fcm_token_id) return;
     m_local.fcm_token_id = token;
     m_local.token_version += 1;
     m_local.last_seen_utc = now_utc;
     normalize_flags(m_local);
-    if (!m_cfg.local_peer_id.empty()) {
-        PeerRecord self = m_local;
-        noteAcceptedLocked_(self, now_utc);
-    }
+    // Self is NOT inserted into m_records: buildDeltaFor already carries
+    // m_local as its own candidate; a directory copy would duplicate it on
+    // the wire every batch.
     m_dirty_since_ms = now_ms();
 }
 
@@ -119,16 +119,20 @@ std::string GossipEngine::buildDeltaFor(const std::string& peer_id,
         candidates.push_back(&m_local);
     }
     for (const auto& kv : m_records) {
-        if (kv.second.token_version > seen_through && kv.first != peer_id) {
+        if (kv.second.token_version > seen_through &&
+            kv.first != peer_id && kv.first != m_cfg.local_peer_id) {
             candidates.push_back(&kv.second);
         }
     }
+    // Ascending selection: the watermark may only advance past records that
+    // were actually sent. Descending order + truncation would orphan every
+    // record below the new watermark forever.
     if (candidates.size() > m_cfg.delta_batch_max) {
         std::partial_sort(candidates.begin(),
                           candidates.begin() + static_cast<long>(m_cfg.delta_batch_max),
                           candidates.end(),
                           [](const PeerRecord* a, const PeerRecord* b) {
-                              return a->token_version > b->token_version;
+                              return a->token_version < b->token_version;
                           });
         candidates.resize(m_cfg.delta_batch_max);
     }
@@ -319,16 +323,6 @@ void GossipEngine::tick(const std::vector<std::string>& connected_peers,
     }
 }
 
-void GossipEngine::noteAcceptedLocked_(const PeerRecord& r, uint64_t /*now*/) {
-    auto it = m_records.find(r.peer_id);
-    if (it == m_records.end()) {
-        m_records.emplace(r.peer_id, r);
-    } else {
-        merge_record(it->second, r);
-    }
-    evictIfNeededLocked_();
-}
-
 void GossipEngine::evictIfNeededLocked_() {
     while (m_records.size() > m_cfg.max_records) {
         auto oldest = m_records.begin();
@@ -411,10 +405,25 @@ bool GossipEngine::load() {
     size_t arr = j.find("\"records\":[");
     if (arr == std::string::npos) return true;
     arr += 11;
+    // Quote-aware scan for the array-closing ']' — a naive find(']') would
+    // stop at ']' inside an IPv6 endpoint like "[::1]:6" and silently drop
+    // every record after it.
+    size_t arr_end = std::string::npos;
+    for (size_t i = arr; i < j.size(); ++i) {
+        if (j[i] == '"') {
+            // skip the quoted string wholesale (writer never emits escapes
+            // inside these fields, but stay robust anyway)
+            size_t e = j.find('"', i + 1);
+            if (e == std::string::npos) break;
+            i = e;
+        } else if (j[i] == ']') {
+            arr_end = i;
+            break;
+        }
+    }
     while (true) {
         PeerRecord r;
         size_t p2 = j.find("{\"id\":\"", arr);
-        const size_t arr_end = j.find(']', arr);
         if (p2 == std::string::npos || (arr_end != std::string::npos && p2 > arr_end)) break;
         p2 = extract_str("id", p2, r.peer_id);
         p2 = extract_str("ep", p2, r.primary_endpoint);
@@ -424,7 +433,10 @@ bool GossipEngine::load() {
         r.token_version = num_after("ver", arr);
         r.last_seen_utc = num_after("seen", arr);
         r.flags = static_cast<uint8_t>(num_after("fl", arr));
-        m_records.emplace(r.peer_id, r);
+        normalize_flags(r);  // trust the fields, not a possibly stale flag byte
+        if (r.peer_id != m_cfg.local_peer_id) {  // never re-load self
+            m_records.emplace(r.peer_id, r);
+        }
         arr = p2;
     }
     return true;

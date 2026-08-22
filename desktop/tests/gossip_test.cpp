@@ -8,6 +8,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <sodium.h>
 
 using namespace networkos;
@@ -168,6 +169,92 @@ static void test_engine_delta_and_pool() {
     std::remove("/tmp/litep2p_gossip_test_dir.json");
 }
 
+// Regression tests for audit fixes: IPv6-safe persistence reload, delta
+// convergence under batch truncation, no self-record on the wire, and
+// empty-token rejection.
+static void test_engine_audit_regressions() {
+    // (1) A record whose endpoint contains ']' (IPv6 literal) followed by
+    // another record: the naive find(']') reload dropped everything after it.
+    GossipEngine::Config pcfg;
+    pcfg.local_peer_id = "p";
+    pcfg.persist_path = "/tmp/litep2p_gossip_test_dir2.json";
+    GossipEngine pe(pcfg);
+    PeerRecord v6;
+    v6.peer_id = "v6-peer";
+    v6.primary_endpoint = "[2001:db8::1]:4500";
+    v6.token_version = 3;
+    v6.last_seen_utc = NOW;
+    normalize_flags(v6);
+    PeerRecord after;
+    after.peer_id = "after-v6";
+    after.primary_endpoint = "9.9.9.9:9";
+    after.token_version = 4;
+    after.last_seen_utc = NOW;
+    normalize_flags(after);
+    std::string two(1, '\x02');
+    two.append(encode_peer_record(v6));
+    two.append(encode_peer_record(after));
+    CHECK(pe.ingestDelta(two, NOW) == 2, "audit: both records ingested");
+    CHECK(pe.save(NOW), "audit: saved");
+    GossipEngine::Config lcfg;
+    lcfg.local_peer_id = "p";
+    lcfg.persist_path = pcfg.persist_path;
+    GossipEngine le(lcfg);
+    CHECK(le.load(), "audit: reloaded");
+    PeerRecord got;
+    CHECK(le.lookup("v6-peer", got) &&
+              got.primary_endpoint == "[2001:db8::1]:4500",
+          "audit: IPv6-endpoint record restored");
+    CHECK(le.lookup("after-v6", got) && got.primary_endpoint == "9.9.9.9:9",
+          "audit: record after IPv6 record restored");
+    CHECK(le.size() == 2, "audit: no self record reloaded");
+    std::remove("/tmp/litep2p_gossip_test_dir2.json");
+
+    // (2) Batch truncation must converge: with delta_batch_max=2 and 5 pending
+    // records, successive deltas to the same peer must eventually carry all 5.
+    GossipEngine::Config bcfg;
+    bcfg.local_peer_id = "src";
+    bcfg.delta_batch_max = 2;
+    GossipEngine be(bcfg);
+    for (int i = 1; i <= 5; ++i) {
+        PeerRecord r;
+        r.peer_id = "bulk-" + std::to_string(i);
+        r.primary_endpoint = "10.1.0." + std::to_string(i) + ":1";
+        r.token_version = static_cast<uint64_t>(i);
+        r.last_seen_utc = NOW;
+        normalize_flags(r);
+        std::string b(1, '\x01');
+        b.append(encode_peer_record(r));
+        CHECK(be.ingestDelta(b, NOW) == 1, "audit: bulk ingest");
+    }
+    std::set<std::string> delivered;
+    for (int round = 0; round < 4; ++round) {
+        const std::string delta = be.buildDeltaFor("downstream", NOW);
+        const size_t cnt = static_cast<uint8_t>(delta[0]);
+        size_t off = 1;
+        for (size_t i = 0; i < cnt; ++i) {
+            PeerRecord r;
+            CHECK(decode_peer_record_at(delta, off, r), "audit: delta decodes");
+            delivered.insert(r.peer_id);
+        }
+        if (delivered.size() == 5) break;
+    }
+    CHECK(delivered.size() == 5,
+          "audit: truncated batches converge (no starvation)");
+
+    // (3) Self must ride the wire exactly once per fresh peer (m_local only,
+    // never a directory copy), and an empty token must not bump the version.
+    GossipEngine::Config scfg;
+    scfg.local_peer_id = "selfy";
+    GossipEngine se2(scfg);
+    se2.setLocalPushToken("", NOW);  // must be ignored
+    CHECK(se2.localRecord().token_version == 0, "audit: empty token no bump");
+    se2.setLocalPushToken("real-token", NOW);
+    CHECK(se2.size() == 0, "audit: self not stored in directory");
+    const std::string sd = se2.buildDeltaFor("friend", NOW);
+    CHECK(static_cast<uint8_t>(sd[0]) == 1, "audit: self appears once");
+}
+
 static void test_cascade() {
     DiscoveryCascade c;
     PeerRecord out;
@@ -304,6 +391,7 @@ static void test_qr_and_keepalive() {
 int main() {
     test_peer_record_codec();
     test_engine_delta_and_pool();
+    test_engine_audit_regressions();
     test_cascade();
     test_push_payload();
     test_qr_and_keepalive();

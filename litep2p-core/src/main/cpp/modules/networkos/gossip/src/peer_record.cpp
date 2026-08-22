@@ -132,6 +132,7 @@ bool merge_record(PeerRecord& into, const PeerRecord& incoming) {
     PeerRecord next = incoming;
     // Preserve locally-known fields the sender legitimately omitted.
     if (!next.has_signaling() && had) next.signaling_addr = into.signaling_addr;
+    if (!next.has_new_token() && had) next.fcm_token_id = into.fcm_token_id;
     normalize_flags(next);
     into = std::move(next);
     return true;
