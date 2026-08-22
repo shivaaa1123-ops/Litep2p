@@ -107,7 +107,7 @@ per delivered object (§44).
 ## 8. Deliverables
 - `modules/networkos/anti_entropy/` + tests `desktop/tests/anti_entropy_test`.
 - Inventory format spec + Bloom filter design note for the future.
-- `docs/network-os/12-anti-entropy.md`.
+- `docs/network-os/19-anti-entropy.md`.
 - Codec fuzz coverage: `desktop/tools/anti_entropy_fuzz_smoke.cpp` (standalone
   substitute, runnable on Apple clang) + INVENTORY/OBJECT_WANT decoders fed in
   `desktop/fuzz/fuzz_wire_codec.cpp` (libFuzzer target).

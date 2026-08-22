@@ -25,6 +25,7 @@
 13. [Chat application integration guide](#13-chat-application-integration-guide)
 14. [Worked examples](#14-worked-examples)
 15. [Error code quick reference](#15-error-code-quick-reference)
+16. [Network OS object runtime (Phase 12, v0.4 feature set)](#16-network-os-object-runtime-phase-12-v04-feature-set)
 
 ---
 
@@ -351,6 +352,11 @@ Notes:
 - `comms_mode`: `"TCP"`, `"UDP"`, `"QUIC"`, `"ALL"` (listen on all three
   transports simultaneously), or `"AUTO"` (engine choice). The Kotlin
   `CommsMode` enum mirrors these values.
+- In `config.json`, `communication.default_protocol` additionally accepts the
+  legacy synonyms `"HETEROGENEOUS"`, `"HYBRID"`, and `"BOTH"` — all mapped to
+  `ALL` — and falls back to the engine default (`UDP`) for unknown values.
+  The programmatic API (`litep2p_config.comms_mode` / `CommsMode`) accepts
+  only the five canonical strings.
 - `files_dir` is where the engine discovers `config.json`, reads/writes the
   Noise keystore, and (when enabled) the peer DB. On Android it must be a
   writable app-private directory.
@@ -423,6 +429,9 @@ typedef struct litep2p_peer_info {
     char connection_path[32];    /* "LAN_DIRECT" | "WAN_HOLE_PUNCH" | "TURN_RELAY"
                                   * | "SIGNALING_RELAY" | "UNKNOWN" */
     char fsm_state[32];          /* best-effort peer FSM state string */
+    int64_t last_seen_ms;        /* v0.4: epoch ms when the peer was last observed
+                                  * online (session, discovery, or signaling);
+                                  * 0 when never seen */
 } litep2p_peer_info_t;
 
 typedef struct litep2p_callbacks {
@@ -607,7 +616,16 @@ litep2p_result_t litep2p_reliable_cancel(const char* msg_id);
   `OK` | `PEER_OFFLINE` | `TIMEOUT` | `TTL_EXPIRED` | `CANCELLED` |
   `QUEUE_FULL` | `NO_ROUTE`.
 - Receive-side dedup: `on_message_received` fires **at most once per msg_id**
-  within a 1-hour window, so retries never surface as duplicates.
+  within a 1-hour window, so retries never surface as duplicates. The dedup
+  table is in-memory (bounded at 4096 ids, oldest-expired first) and is
+  rebuilt on restart — a retry arriving after an engine restart within the
+  hour can therefore surface twice.
+- Reliable sends ride a JSON envelope on the ordinary message channel:
+  `{"type":"LP_RELIABLE","msg_id":"…","body_b64":"…"}` with the receiver
+  answering `{"type":"LP_RELIABLE_ACK","msg_id":"…"}`. The durable outbox is
+  `reliable_outbox.json` under `filesDir`. Retries are **fixed-interval**
+  (every `retry_timeout_ms`, no exponential backoff) — sized for chat-scale
+  traffic, not bulk transfer.
 - The engine also recognizes the **LP_APP / LP_APP_ACK envelope protocol**
   for application-level delivery confirmation — see
   [§6 Messaging model](#6-messaging-model).
@@ -739,8 +757,9 @@ litep2p_result_t litep2p_send_voice_frame(const char* call_id,
   (`detail`: "connected", "declined by peer", "ended", "ring timeout", "no
   media activity", ...).
 - `litep2p_send_voice_frame` is fire-and-forget and only succeeds while the
-  call is `IN_CALL`; keep frames small (≤ ~8 KB) so each rides one UDP datagram
-  without IP fragmentation (the default 20 ms PCM frame is 640 B).
+  call is `IN_CALL`; frames larger than **8192 bytes are dropped** with a
+  warning (the default 20 ms PCM frame is 640 B, so each rides one UDP
+  datagram without IP fragmentation).
 - Unanswered offers auto-decline after 60 s; a connected call with no frames or
   control traffic for 5 minutes ends locally ("no media activity") so a peer
   that vanishes cannot orphan the call.
@@ -1148,6 +1167,19 @@ object LiteP2P {
     // arrive via LiteP2PListener.onTelemetry.
     fun telemetrySnapshot(): String
 
+    // --- Field diagnostics / anomaly reporting (v0.4) ------------------------
+    // Push platform device facts (a JSON object string with brand/model/os/
+    // abi/sdk keys) into the engine's anomaly reporter so incident files
+    // identify the device. LiteP2PRuntime calls this automatically; call it
+    // once yourself when you manage the engine lifecycle manually.
+    // Idempotent, safe at any time.
+    fun setAnomalyDeviceInfo(json: String)
+
+    // Absolute path of the incident-log directory ("" while the anomaly
+    // reporter is disabled). Inspect it from a terminal or via
+    // `adb shell run-as <pkg> ls files/anomalies`.
+    fun anomaliesDirectory(): String
+
     // --- Backpressure metrics (v0.4) -----------------------------------------
     // Plain-send events queued in the engine event loop (not yet handed to the
     // transport). send() starts returning QUEUE_FULL at max_pending_sends.
@@ -1285,6 +1317,11 @@ enum class ConnectionPath {
     LAN_DIRECT, WAN_HOLE_PUNCH, TURN_RELAY, SIGNALING_RELAY, UNKNOWN;
     companion object { fun fromWire(wire: String?): ConnectionPath }
 }
+// fromWire accepts the canonical ABI names plus the engine's short forms
+// ("LAN", "WAN_DIRECT", "TURN", "SIGNALING"); anything else → UNKNOWN.
+// Note: the C ABI struct (litep2p_peer_info.connection_path) and
+// litep2p_peer_get_connection_path always return the canonical names — the
+// short forms appear only in telemetry JSON's connection_path field.
 
 // Logging verbosity (0=DEBUG 1=INFO 2=WARN 3=ERROR).
 enum class LogLevel(val level: Int) {
@@ -1481,8 +1518,12 @@ Notes:
 - Events are dispatched on **engine threads**; collect with the dispatcher you
   prefer (e.g. `Flow.flowOn(Dispatchers.Default)` or `lifecycleScope.launch`).
 - Buffer policy: `peersFlow` and `telemetryFlow` replay the latest value
-  (`replay = 1`); the others buffer a bounded number of events and drop the
-  oldest under pressure. For lossless handling use the
+  (`replay = 1`); all the others buffer a bounded number of events and drop
+  the **oldest** under pressure. Exact capacities: `logsFlow` 256,
+  `messagesFlow` 64, `transfersFlow` / `deliveryStatusFlow` / `presenceFlow`
+  64, `messageAcksFlow` / `overlayDeliveriesFlow` / `pingResultFlow` /
+  `lookupResultFlow` / `inviteFlow` 32, `peersFlow` 8 (+replay),
+  `telemetryFlow` 4 (+replay). For lossless handling use the
   `LiteP2PListener` callbacks directly.
 - `startAndAwait` / `stopAndAwait` return the immediate `EngineResult` when the
   request itself failed, `EngineResult.TIMEOUT` when the engine did not reach
@@ -1577,7 +1618,9 @@ when (LiteP2P.sendReliable(peerId, msgId, text.toByteArray(Charsets.UTF_8))) {
    (fire-once) and delivered on the peer's next connect, while direct retries
    continue in parallel.
 4. **Deduplicates on the receiver:** `onMessageReceived` fires **at most once
-   per `msg_id`** (1-hour window), so retries never duplicate in the UI.
+   per `msg_id`** within a 1-hour in-memory window (bounded at 4096 ids; the
+   window is not persisted, so a retry racing an engine restart can surface
+   twice), so retries never duplicate in the UI.
 5. **Reports every transition** via `onDeliveryStatus` /
    `deliveryStatusFlow`:
 
@@ -1711,6 +1754,9 @@ Field notes:
 
 - `reason` values: `"periodic"` (scheduled flush), `"snapshot"`,
   `"shutdown"`, and `"c_api"` (manual `telemetrySnapshot()`/`litep2p_telemetry_snapshot`).
+  Two more appear only inside anomaly incident files:
+  `"anomaly"` (snapshot embedded in a single incident) and
+  `"anomaly-summary"` (frequency summary of suppressed repeats).
 - `include_peer_ids` reflects `monitoring.telemetry.include_peer_ids` in
   `config.json`. When false, the `peers` array is still present but
   `peer_id` is redacted (`""`). The `connection_summary` counts remain intact.
@@ -1794,7 +1840,7 @@ chat application is most likely to care about:
 | `overlay.pex_interval_ms` | `60000` | Relay-list exchange (PEX) interval (0=off) |
 | `overlay.require_origin_auth` | `true` | Enforce Ed25519 origin signatures (drop unsigned payloads) |
 | `monitoring.telemetry.enabled` | `true` | Telemetry collection |
-| `monitoring.telemetry.flush_interval_ms` | `2000` | Telemetry flush cadence |
+| `monitoring.telemetry.flush_interval_ms` | `30000` | Telemetry flush cadence (the shipped Android assets config overrides it to `2000`) |
 | `monitoring.telemetry.include_peer_ids` | `true` | Include peer ids in telemetry (false = redact) |
 | `anomaly_reporter.enabled` | `true` | v0.4 field diagnostics: write an incident file for every anomaly |
 | `anomaly_reporter.directory` | `"anomalies"` | Incident subdir under the config dir / `filesDir` (`<dir>/anomalies/`) |
@@ -2114,6 +2160,69 @@ LiteP2PRuntime.start(context, myLiteP2PConfig)
 LiteP2PRuntime.stop(context)
 ```
 
+Full `LiteP2PRuntime` surface (`object`, all members safe from any thread):
+
+```kotlin
+object LiteP2PRuntime {
+    // Start the engine inside LiteP2PService (foreground). Safe to call
+    // repeatedly: a second call while running with a null config is a no-op;
+    // with a non-null config it restarts the engine under it. Must be called
+    // while the app is in the foreground (Android restricts background
+    // foreground-service starts on API 31+).
+    //   activity — optional; used only to present the one-shot battery-
+    //              optimization exemption dialog (see below).
+    fun start(context: Context,
+              config: LiteP2PConfig? = null,
+              activity: Activity? = null)
+
+    // Stop the engine and the foreground service. Idempotent; completion via
+    // LiteP2PListener.onEngineStopped.
+    fun stop(context: Context)
+
+    // The zero-config default: app filesDir + a stable persisted peer id +
+    // the bundled default config.json (extracted on first run). Useful to
+    // inspect or derive from before calling start(context).
+    fun defaultConfig(context: Context): LiteP2PConfig
+
+    // State passthrough (same values as LiteP2P.state / LiteP2P.stateFlow).
+    val state: EngineState
+    val stateFlow: StateFlow<EngineState>
+    val isRunning: Boolean                  // true while STARTING or RUNNING
+
+    // True if the last start() request is still in effect (the sticky
+    // restore decision used after process death).
+    fun isDesiredRunning(context: Context): Boolean
+
+    // The stable per-device peer id the runtime would use (generating and
+    // persisting one on first call). Once the engine is running prefer
+    // LiteP2P.peerId, which returns the resolved id.
+    fun peerId(context: Context): String
+
+    // Intent actions understood by the SDK-owned LiteP2PService (for apps
+    // that start/stop the service themselves):
+    //   ACTION_START = "com.zeengal.litep2p.core.action.START_ENGINE"
+    //   ACTION_STOP  = "com.zeengal.litep2p.core.action.STOP_ENGINE"
+    const val ACTION_START: String
+    const val ACTION_STOP: String
+
+    // Notification customization (set any time before start()):
+    var notificationSmallIconResId: Int       // defaults to the SDK glyph
+    var notificationTitle: CharSequence?      // null = "LiteP2P engine"
+    var notificationText: CharSequence?       // null = per-state default text
+    var launchActivity: Class<*>?             // tapped-notification content intent
+    var notificationCustomizer: ((NotificationCompat.Builder) -> Unit)?
+
+    // Set false to never auto-prompt for the battery-optimization allowlist
+    // (request it yourself via LiteP2PBatteryOptimization.requestExemption).
+    var autoRequestBatteryExemption: Boolean
+}
+```
+
+The runtime persists the last-started config in its own
+`SharedPreferences` (`litep2p_sdk_prefs`); after a process kill the sticky
+restart reconstructs the config from it — that is what makes
+`START_STICKY` restoration work without any code in your app.
+
 `LiteP2PRuntime` (in `com.zeengal.litep2p.core`) starts the SDK-owned
 `LiteP2PService` — a `START_STICKY` foreground service (`dataSync` type) that:
 
@@ -2284,6 +2393,95 @@ int main(void) {
 }
 ```
 
+### 14.3 Kotlin — Network OS object send with delivery tracking
+
+A minimal durable-object exchange between two peers using the `NetworkOs`
+facade ([§16](#16-network-os-object-runtime-phase-12-v04-feature-set)).
+The engine must already be started (§2.2 or `LiteP2PRuntime.start`) and both
+peers must have discovered/connected at least once for direct delivery, or
+run with store-and-forward enabled so carriers hold the object.
+
+```kotlin
+import com.zeengal.litep2p.core.NetworkOs
+import com.zeengal.litep2p.core.SendResult
+
+// 1. Register a namespace policy once per process, before the first send.
+//    Values are clamped natively: quota >= 4096 bytes, max object 16 MiB,
+//    priority ceiling <= 255.
+NetworkOs.registerNamespace(
+    NetworkOs.NamespacePolicy(
+        namespaceId = "chat",
+        quotaBytes = 32L * 1024 * 1024,   // 32 MB of durable storage
+        priorityCeiling = 200,
+        maxObjectBytes = 1 shl 20,        // 1 MB per object
+        allowCarrier = true,              // this device may carry for others
+        protocolVersion = 1               // your app-level protocol tag
+    )
+)
+
+// 2. Collect delivery events BEFORE sending so early events are not missed.
+//    Event lines are fixed-prefix records (see §16.3): the quoted keys up
+//    through "at_ms" are strict JSON; the trailing "data" value is emitted
+//    verbatim ({} when empty, otherwise a raw token such as an ObjectId hex,
+//    optionally "hex:REASON"), so substring/regex parsing is the intended
+//    consumption style.
+launch {
+    NetworkOs.deliveryEvents.collect { line ->
+        when {
+            "\"kind\":\"CONFIRMED\"" in line ->
+                showDoubleTick(objectIdOf(line))   // signed receipt reached us
+            "\"kind\":\"DELIVERY_STARTED\"" in line ->
+                markInFlight(objectIdOf(line))
+            "\"kind\":\"TTL_EXPIRED\"" in line ->
+                markExpired(objectIdOf(line))
+        }
+    }
+}
+
+// 3. Publish an object addressed to the destination peer id.
+val payload = "durable hello".toByteArray(Charsets.UTF_8)
+val result: SendResult = NetworkOs.send(
+    destination = bobPeerId,
+    namespaceId = "chat",
+    payload     = payload,
+    policy      = NetworkOs.DeliveryPolicy(          // all fields optional;
+        ttlMs = 86_400_000L,                         // live for 24 h
+        priority = 100,
+        minRemoteCopies = 1,                         // repair if replicas drop
+        desiredRemoteCopies = 2,
+        allowStoreAndForward = true                  // false = direct-only
+    )
+)
+when {
+    result.ok        -> persistMapping(result.objectId, myUiMessage)   // hex ObjectId
+    // INVALID_STATE: engine not RUNNING · NOT_FOUND: direct-only without a
+    // route · INVALID_ARG: payload over namespace cap / blank ids · IO.
+    else             -> renderSendError(result.result)
+}
+
+// 4. Pull the current state of one object at any time (JSON; see §16.5).
+println(NetworkOs.status(result.objectId))
+// {"object_id":"…","present":true,"destination":"bob","namespace":"chat",
+//  "ttl_ms":86400000,"priority":100,"durability":"D2",
+//  "desired_remote_copies":2}
+
+// 5. Cancel while it has not yet reached the destination (NOT_FOUND when
+// unknown, INVALID_STATE once delivered).
+if (userTappedUndo) NetworkOs.cancel(result.objectId)
+
+// 6. Diagnostics snapshot for support tickets (privacy-safe, no payloads).
+println(NetworkOs.diagnostics())
+
+fun objectIdOf(eventLine: String): String =
+    eventLine.substringAfterLast("\"data\":").trim().trimEnd('}')
+```
+
+Delivery is **accepted ≠ delivered**: `result.ok` only means the object was
+signed, committed locally, and admitted to the delivery/replication pipeline.
+The terminal states arrive as events — `CONFIRMED` (a signed receipt from the
+destination reached us) is the success signal; `TTL_EXPIRED` is the terminal
+failure. See [§16.3](#163-delivery-event-stream) for every kind.
+
 ---
 
 ## 15. Error code quick reference
@@ -2352,12 +2550,27 @@ litep2p_result_t litep2p_nos_cancel(const char* object_id);
 litep2p_result_t litep2p_nos_status(const char* object_id, char** out_json);
 litep2p_result_t litep2p_nos_set_delivery_event_cb(litep2p_delivery_event_cb, void*);
 litep2p_result_t litep2p_nos_diagnostics(char** out_json);
+litep2p_result_t litep2p_nos_platform_signal(const char* signal, const char* value);
 ```
 
 Semantics:
 - `nos_send` is **accepted ≠ delivered** (same contract as `send`). On OK it
   returns the hex ObjectId; final state arrives through the delivery-event
   callback or `nos_status`.
+- `nos_platform_signal` (Phase 8 lifecycle bridge) pushes a platform signal
+  into the NOS runtime. Signals: `connectivity` (`wifi|cellular|ethernet|none`),
+  `metered` (`1|0`), `battery` (`0..100`), `charging` (`1|0`), `storage`
+  (`low|ok`), `foreground` (`1|0`), `wakeup_window` (budget hint in ms).
+  Every signal immediately recomputes resource budgets (ECO/BALANCED/
+  RELIABLE/CRITICAL); `wakeup_window` and connectivity changes additionally
+  run one bounded scheduler reconcile burst (scheduler drain, handoff lease
+  sweep, replication retry) — the opportunistic-background-mode reconcile
+  that makes process death/freeze survivable. The Kotlin SDK forwards
+  connectivity/metered/battery/charging/Doze automatically via
+  `EnvironmentHints`; apps may call `LiteP2PRuntime.notifyAppForeground()`
+  for Active-mode switching. Native scheduler wakeup requests flow the other
+  way: `IPlatformAdapter::requestWakeup()` → JNI → WorkManager one-shot jobs
+  (survive process death) → `wakeup_window` signal on grant.
 - Every policy value is clamped (ttl `[60 s, 30 d]`, priority `[0, ceiling]`,
   replicas `[0,4]`, payload ≤ namespace cap ≤ 16 MiB). Unsafe values can never
   reach the engine.
@@ -2365,31 +2578,217 @@ Semantics:
   `NOT_FOUND` when the destination has no direct route.
 - Receipts are always on in v1 (`require_receipt` is clamped true).
 - The NOS runtime is created lazily on first use while the engine is RUNNING
-  and listens on `main_port + 11`.
+  and listens on **`main_port + 11`** (fixed offset; when `listen_port` is 0
+  the engine default 30001 is used, so NOS binds 30012). It runs a
+  direct/known-peer model — LAN discovery is disabled on the NOS port; peers
+  reach it over the same discovery/signaling paths as the main engine.
 
-### 16.3 Kotlin additions (`com.zeengal.litep2p.core.NetworkOs`)
+**Namespace rules** (`litep2p_nos_register_namespace` /
+`NetworkOs.registerNamespace`):
+
+| Rule | Value |
+|---|---|
+| `namespace_id` charset | `[a-zA-Z0-9_-]`, length 1–32 — anything else → `INVALID_ARG` |
+| `quota_bytes` | clamped to a minimum of **4096** bytes |
+| `max_object_bytes` | clamped to `[1 .. 16 MiB]` |
+| `priority_ceiling` | clamped to `[0 .. 255]`; per-send `priority` is further clamped to `[0, ceiling]` |
+| Re-registration | replaces the previous policy for that id (idempotent) |
+
+Sending into a **never-registered namespace** still works: the engine then
+uses permissive defaults (16 MiB object cap) **but a priority ceiling of 0**,
+so every send in that namespace is clamped to priority 0. Register your
+namespaces explicitly to get real priorities.
+
+**Error mapping:**
+
+| Call | Condition | Result |
+|---|---|---|
+| `nos_send` | blank destination/namespace, `len` over the (clamped) cap, `buf_len` too small for the ObjectId | `INVALID_ARG` |
+| `nos_send` | engine not `RUNNING` (runtime not yet created) | `INVALID_STATE` |
+| `nos_send` | direct-only policy and destination has no route | `NOT_FOUND` |
+| `nos_send` | local commit / signing key unavailable / runtime busy | `INVALID_STATE` / `BUSY` / `IO` |
+| `nos_cancel` | malformed hex id | `INVALID_ARG` |
+| `nos_cancel` | unknown object | `NOT_FOUND` |
+| `nos_cancel` | already delivered (`D4` or beyond) | `INVALID_STATE` |
+| `nos_status` | unknown object id | `NOT_FOUND` |
+| all `nos_*` | engine not `RUNNING` | `INVALID_STATE` |
+
+Quota behavior: a **carrier** that has no storage headroom answers a
+store-and-forward request with a signed `REJECTED_QUOTA` (with
+`retry_after_ms`); the origin treats that as a transient no-carrier state and
+keeps retrying — quota exhaustion never silently drops an accepted object.
+The local namespace `quota_bytes` bounds how much *this* device stores.
+
+### 16.3 Delivery-event stream
+
+All runtime activity is published on a **single event stream**. In C you
+register a `litep2p_delivery_event_cb`; in Kotlin it surfaces as the
+`SharedFlow<String>` `NetworkOs.deliveryEvents`. Each element is one line:
+
+```
+{"type":"<type>","kind":"<kind>","peer":"<peer_id>","at_ms":<epoch_ms>,"data":<payload-or-{}>}
+```
+
+| Field | Meaning |
+|---|---|
+| `type` | `lifecycle` · `peer_state` · `message` · `delivery` · `platform` |
+| `kind` | event name, see tables below |
+| `peer` | peer id when the event concerns a specific peer, else `""` |
+| `at_ms` | epoch milliseconds when the runtime emitted the event |
+| `data` | emitted **verbatim**: `{}` when empty; otherwise a raw token — most often the hex ObjectId, sometimes `hex:REASON`, or free text for lifecycle failures |
+
+> **Parsing note:** the quoted keys up through `"at_ms"` are strict JSON,
+> but `data` is written raw (not JSON-quoted). Treat each line as a
+> fixed-prefix record: extract the quoted fields with your JSON parser or
+> substring logic, then read everything after `"data":` as an opaque token.
+> The set of `kind` values is **additive** — ignore kinds you do not know.
+
+**`delivery` kinds** (the ones applications react to):
+
+| Kind | Fired when | `data` |
+|---|---|---|
+| `OBJECT_CREATED` | object signed + admitted locally | ObjectId hex |
+| `LOCAL_COMMIT` | durably committed to the local store | ObjectId hex |
+| `DELIVERY_LOCAL_COMMIT_FAILED` | local commit failed (will retry) | ObjectId hex |
+| `DESTINATION_DISCOVERED` | destination has a direct session | ObjectId hex |
+| `DELIVERY_STARTED` | offer sent to destination/carrier | ObjectId hex |
+| `DELIVERY_NO_CARRIER` | no connected peer can carry/store now | ObjectId hex |
+| `REMOTE_STORAGE_REQUEST` / `_ACCEPTED` / `_REJECTED` / `_NO_CARRIER` / `_RETRY` | store-and-forward handshake with carriers | ObjectId hex (`_REJECTED`: `hex:REASON`) |
+| `STORED_ACK_SENT` / `_RECEIVED` | signed storage lease ack sent by carrier / verified by origin | ObjectId hex |
+| `STORED_ACK_INVALID` / `_INVALID_TERMS` | lease failed signature / terms check | ObjectId hex |
+| `RECEIVED_ACK` | destination committed the object (destination side) | ObjectId hex |
+| `DESTINATION_COMMIT` / `_COMMIT_FAILED` / `_COMMIT_INVALID` | destination-side commit outcome | ObjectId hex |
+| `RECEIPT_CREATED` / `RECEIPT_RECEIVED` / `RECEIPT_INVALID` | signed receipt generated (destination) / verified (origin) / rejected | ObjectId hex |
+| `CONFIRMED` | **terminal success**: origin holds a valid receipt | ObjectId hex |
+| `TTL_EXPIRED` | **terminal failure**: TTL passed before delivery | ObjectId hex |
+| `REPLICA_RELEASED` | surplus replica released after delivery | ObjectId hex |
+| `LEASE_EXPIRING` | carrier lease nearing expiry → repair scheduled | `hex:carrier_peer_id` |
+| `LEASE_EXPIRED_REPAIR` / `EVICTED_EARLY_REPAIR` | replication planner repairing lost copies | ObjectId hex |
+| `AUTH_FAILED` / `AUTH_FAILED_HASH` | envelope/receipt signature check failed | ObjectId hex |
+| `OBJECT_DATA_INVALID` | undecodable object payload received | ObjectId hex |
+| `RECON_SESSION_START` / `RECON_WANT` / `RECON_TRANSFER` | anti-entropy reconciliation with a peer | peer id / peer id / ObjectId hex |
+
+The typical happy path traces one object as:
+`OBJECT_CREATED → LOCAL_COMMIT → DESTINATION_DISCOVERED → DELIVERY_STARTED →
+RECEIVED_ACK → RECEIPT_CREATED → RECEIPT_RECEIVED → CONFIRMED`
+(with `REMOTE_STORAGE_*`/`LEASE_*` events interleaved when the destination is
+offline and carriers hold copies).
+
+Other `type`s:
+
+| Type | Kinds | Notes |
+|---|---|---|
+| `lifecycle` | `starting`, `started`, `stopping`, `stopped`, `start_failed` (data = error text), `restored`, `restore_no_identity` | NOS runtime state machine |
+| `peer_state` | `peer_ready`, `peer_disconnected` (peer field set) | NOS-port sessions |
+| `message` | `message` (data = message bytes) | raw inbound message on the NOS port |
+| `platform` | `connectivity`, `metered`, `battery`, `charging`, `storage`, `foreground`, `wakeup_window` | hints pushed into the runtime |
+
+Events arrive on engine threads; the Kotlin flow buffers 64 events and never
+blocks the emitter — collect promptly or move parsing off the hot path.
+
+### 16.4 Kotlin additions (`com.zeengal.litep2p.core.NetworkOs`)
 
 ```kotlin
-NetworkOs.registerNamespace(NamespacePolicy("chat", quotaBytes = 32 shl 20))
-val res: SendResult = NetworkOs.send(dest, "chat", bytes)
-if (res.ok) { /* collect NetworkOs.deliveryEvents for final state */ }
-NetworkOs.cancel(res.objectId)
-NetworkOs.status(res.objectId)   // JSON status string
-NetworkOs.diagnostics()          // snapshot JSON (§48/§87)
-NetworkOs.deliveryEvents         // SharedFlow<String> of event lines
+object NetworkOs {
+    // Wire protocol version of this build (negotiated per connection).
+    val wireProtocolVersion: Int
+
+    // Delivery/diagnostic event lines from the runtime (SharedFlow<String>,
+    // extraBufferCapacity = 64; never blocks the emitter). See §16.3.
+    val deliveryEvents: SharedFlow<String>
+
+    // Register or replace a namespace policy. Values are clamped natively
+    // (see the namespace rules in §16.2). Returns INVALID_ARG when
+    // namespaceId is empty/over-long/has illegal characters.
+    fun registerNamespace(policy: NamespacePolicy): EngineResult
+
+    // Sign + publish an object addressed to destination. Returns OK with the
+    // hex ObjectId in SendResult.objectId on acceptance. Accepted is NOT
+    // delivered — collect deliveryEvents for final state.
+    fun send(destination: String,
+             namespaceId: String,
+             payload: ByteArray,
+             policy: DeliveryPolicy = DeliveryPolicy()): SendResult
+
+    // Cancel a not-yet-delivered object (INVALID_STATE once delivered).
+    fun cancel(objectId: String): EngineResult
+
+    // Delivery status JSON for one object (null when the engine/runtime is
+    // not runnable or the id is malformed; an unknown but well-formed id
+    // returns JSON with present=false).
+    fun status(objectId: String): String?
+
+    // Public diagnostics snapshot JSON (§16.5).
+    fun diagnostics(): String?
+
+    data class DeliveryPolicy(
+        val ttlMs: Long = 3_600_000L,            // clamped [60 s .. 30 d]
+        val priority: Int = 64,                  // clamped [0 .. ns ceiling]
+        val minRemoteCopies: Int = 0,            // clamped [0 .. 4]
+        val desiredRemoteCopies: Int = 2,        // clamped [min .. 4]
+        val requireReceipt: Boolean = true,      // always on in v1
+        val allowStoreAndForward: Boolean = true,// false = direct-only
+        val maxPayloadBytes: Int = 262_144,      // ≤ ns cap ≤ 16 MiB
+    )
+
+    data class NamespacePolicy(
+        val namespaceId: String,                 // [a-zA-Z0-9_-]{1,32}
+        val quotaBytes: Long = 16L * 1024 * 1024,// ≥ 4096
+        val priorityCeiling: Int = 200,          // ≤ 255
+        val maxObjectBytes: Int = 1 shl 20,      // ≤ 16 MiB
+        val allowCarrier: Boolean = true,        // third-party carriage permitted
+        val protocolVersion: Int = 1,            // app-level protocol tag
+    )
+}
+
+/** Result of [NetworkOs.send]: code plus hex ObjectId when OK. */
+data class SendResult(val result: EngineResult, val objectId: String) {
+    val ok: Boolean get() = result == EngineResult.OK
+}
 ```
 
 The wrapper stays thin: no routing/replication/dedup logic exists in Kotlin.
+`send()` rejects blank destination/namespace locally with `INVALID_ARG`
+(no JNI round-trip); all policy clamping happens natively.
 
-### 16.4 Diagnostics snapshot
+### 16.5 Status and diagnostics snapshots
 
-`litep2p_nos_diagnostics()` / `NetworkOs.diagnostics()` return stable-key JSON:
-`sdk_version`, `wire_protocol_version`, `config_fingerprint` (FNV-1a over the
-runtime config), `state`, `peer_id`, `connected_peers`, `objects_d0..d3plus`,
-and subsystem telemetry objects. Privacy-safe: identifiers only, never
-payloads or keys.
+`litep2p_nos_status()` / `NetworkOs.status(objectId)` return flat JSON:
 
-### 16.5 Compatibility & migration
+```json
+{"object_id":"9af3…c1","present":true,"destination":"bob","namespace":"chat",
+ "ttl_ms":86400000,"priority":100,"durability":"D2","desired_remote_copies":2}
+```
+
+- `destination`, `namespace`, `ttl_ms`, `priority` are present only when
+  `present` is `true` (the object meta exists locally); an unknown id yields
+  `present:false` plus `"durability":"NOT_FOUND"`.
+- `durability` names the highest reached level:
+
+| Name | Meaning |
+|---|---|
+| `D0_LOCAL` | local copy only |
+| `D1` / `D2` / `D3` | 1 / 2 / 3 confirmed **remote** copies (signed leases) |
+| `D4_DELIVERED` | destination durably committed the object |
+| `D5_ACKED` | destination's signed receipt verified by the origin |
+
+  The default replication target is D2 (`desiredRemoteCopies = 2`).
+
+`litep2p_nos_diagnostics()` / `NetworkOs.diagnostics()` return a
+privacy-safe aggregate snapshot (identifiers only, never payloads or keys):
+
+| Key | Meaning |
+|---|---|
+| `sdk_version` | e.g. `"0.4.0"` |
+| `wire_protocol_version` | `1` |
+| `config_fingerprint` | FNV-1a hash over the runtime config (compare across devices to spot config drift) |
+| `state` | `STOPPED` · `STARTING` · `RUNNING` · `STOPPING` · `RESTORING` · `FAILED` |
+| `peer_id` | this node's NOS peer id |
+| `connected_peers` | count of live NOS-port sessions |
+| `objects_d0`, `objects_d1`, `objects_d2`, `objects_d3plus` | how many stored objects sit at each durability band |
+| `delivery`, `anti_entropy`, `replication`, `resources` | subsystem telemetry objects (counters/budgets; `{}` while that subsystem is down) |
+
+### 16.6 Compatibility & migration
 
 - Schema migrations ship with fixture tests (`desktop/tests/compat_test`):
   v1-era databases upgrade to v4 with data intact; a future schema is refused

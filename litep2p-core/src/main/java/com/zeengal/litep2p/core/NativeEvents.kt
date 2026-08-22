@@ -150,4 +150,15 @@ object NativeEvents {
     fun onNosDeliveryEvent(json: String) {
         NetworkOs.dispatchDeliveryEvent(json)
     }
+
+    /**
+     * Phase 8 lifecycle bridge — the native central scheduler asked for
+     * deferred work to run in [delayMs] ms. Forwarded into
+     * [EngineWakeupScheduler], which schedules a durable WorkManager job
+     * (survives process death + Doze). Called from a native thread.
+     */
+    @JvmStatic
+    fun onWakeupRequested(reason: String, delayMs: Long) {
+        EngineWakeupScheduler.onEngineWakeupRequested(reason, delayMs)
+    }
 }

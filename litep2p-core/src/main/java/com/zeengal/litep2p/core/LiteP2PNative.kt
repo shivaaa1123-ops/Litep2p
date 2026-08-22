@@ -69,6 +69,14 @@ internal object LiteP2PNative {
     /** Resolved incident-log directory ("" when the reporter is disabled). */
     external fun nativeGetAnomalyDirectory(): String
 
+    /**
+     * Phase 8 lifecycle bridge: push a platform signal into the NOS runtime
+     * ("connectivity"/"metered"/"battery"/"charging"/"storage"/"foreground"/
+     * "wakeup_window"). Returns a `litep2p_result_t` code; safe from any
+     * thread. Lazily creates the NOS runtime like every litep2p_nos_* call.
+     */
+    external fun nativeNosPlatformSignal(signal: String, value: String): Int
+
     /* ------------------------------------------------------------------ */
     /* Peer operations                                                      */
     /* ------------------------------------------------------------------ */

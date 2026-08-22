@@ -115,7 +115,7 @@ None (harness exercises existing protocol).
 - Device chaos scripts `tools/harness/chaos/`.
 - Expanded fuzz targets.
 - Invariant manifest suite `desktop/tests/invariants_test`.
-- Reliability report `docs/network-os/16-reliability-report.md` + metrics
+- Reliability report `docs/network-os/20-reliability-report.md` + metrics
   baseline.
 
 ## 9. Verification Plan (repeated cycles — required)
@@ -150,7 +150,7 @@ Run in this order; record every run in §10.
 | 2026-08-22 | partition/heal | 5 | PASS | converge post-heal; dup=0; P(del)=1.000 |
 | 2026-08-22 | malicious peers | 5 | PASS | forgeries rejected every run (inv 1/8/9/16 hold) |
 | 2026-08-22 | Android chaos | 0 | SKIP | no device attached; harness ready (`tools/harness/chaos/`), release-gated on device |
-| 2026-08-22 | reliability report | 1 | PASS | `docs/network-os/17-reliability-report.md` committed |
+| 2026-08-22 | reliability report | 1 | PASS | `docs/network-os/20-reliability-report.md` committed |
 | 2026-08-22 | regression sweep | 5 | PASS | all suites ×5 rounds = 0 failures (P2–P10) |
 | 2026-08-22 | native build | 1 | PASS | `externalNativeBuildMultiThreadDebug` BUILD SUCCESSFUL |
 | 2026-08-22 | determinism | 2 | PASS | same seed ⇒ identical behavior (CPU-timing fields excluded) |
@@ -181,7 +181,7 @@ Run in this order; record every run in §10.
 
 - [x] Reliability metrics instrumented and reported
       (`modules/networkos/metrics/ReliabilityMetrics` + simulator JSON;
-      `docs/network-os/17-reliability-report.md`).
+      `docs/network-os/20-reliability-report.md`).
 - [x] Simulator/churn harness scales to 1,000 peers (exact mode) and
       10,000 peers (scaled hot-200 carrier model); deterministic runs proven
       (same seed => byte-identical JSON).
@@ -201,7 +201,7 @@ Run in this order; record every run in §10.
       `Network OS P11: simulator, chaos lab, reliability gates + invariant manifest`.
 
 ### Notes / deviations
-- The reliability report lives at `docs/network-os/17-reliability-report.md`
+- The reliability report lives at `docs/network-os/20-reliability-report.md`
   (`16-` is taken by Phase 10's large-object doc).
 - Replica-survival sampling needs runs whose window reaches TTL/2; use
   `churn_simulator --ttl-ms` to shorten virtual TTL in short windows.

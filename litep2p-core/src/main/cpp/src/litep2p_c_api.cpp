@@ -1507,6 +1507,21 @@ litep2p_result_t litep2p_nos_register_namespace(
                : LITEP2P_ERR_INVALID_ARG;
 }
 
+litep2p_result_t litep2p_nos_platform_signal(const char* signal,
+                                             const char* value) {
+    if (!signal || !*signal) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    switch (rt->onPlatformSignal(signal, value ? value : "")) {
+        case networkos::Result::kOk:
+            return LITEP2P_OK;
+        case networkos::Result::kInvalidArg:
+            return LITEP2P_ERR_INVALID_ARG;
+        default:
+            return LITEP2P_ERR_INTERNAL;
+    }
+}
+
 litep2p_result_t litep2p_nos_send(const char* destination,
                                   const char* namespace_id,
                                   const uint8_t* payload, uint32_t len,

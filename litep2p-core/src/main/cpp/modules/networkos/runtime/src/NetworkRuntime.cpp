@@ -761,9 +761,15 @@ public:
                 m_discovery->setIntensity(m_resources->budget().discovery_intensity);
             }
         }
-        // Any connectivity/foreground/charging signal is a scheduler event.
+        // Any connectivity/foreground/charging/wakeup-window signal is a
+        // scheduler event. A wakeup_window is the §7 opportunistic background
+        // mode: Android granted CPU (WorkManager job or Doze maintenance
+        // pass), so run one bounded reconcile burst now — drain deferred
+        // scheduler work, sweep expired handoff leases, retry backed-off
+        // replication. This is what makes process death/freeze survivable:
+        // durable state is the source of truth, this burst reconciles it.
         if (s == PlatformSignal::kConnectivity || s == PlatformSignal::kForeground ||
-            s == PlatformSignal::kCharging) {
+            s == PlatformSignal::kCharging || s == PlatformSignal::kWakeupWindow) {
             if (m_scheduler) m_scheduler->process(now_ms());
             // Step 4.6: envoy-triggered lease-expiry sweep (emits
             // LEASE_EXPIRING so the Phase 7 planner can renew/replicate).

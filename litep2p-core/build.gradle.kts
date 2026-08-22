@@ -114,6 +114,11 @@ dependencies {
     // The core library deliberately avoids AndroidX UI dependencies; only annotations.
     implementation(libs.androidx.annotation)
 
+    // Phase 8 lifecycle bridge: the engine's central scheduler maps deferred
+    // work onto WorkManager (the only mechanism that survives process death
+    // and Doze batching on Android). Runtime-only; not part of the public API.
+    implementation(libs.androidx.work.runtime.ktx)
+
     // Used by the SDK runtime (LiteP2PService / LiteP2PRuntime / EnvironmentHints)
     // for NotificationCompat / ContextCompat / ServiceCompat, and exposed in
     // LiteP2PRuntime's public API (notificationCustomizer receives a

@@ -93,7 +93,7 @@ typedef struct litep2p_config {
     uint32_t struct_size;        /* = sizeof(litep2p_config); set by caller */
 
     const char* peer_id;         /* stable identity; NULL = engine generates one */
-    const char* comms_mode;      /* "TCP" | "UDP" | "AUTO" */
+    const char* comms_mode;      /* "TCP" | "UDP" | "QUIC" | "ALL" | "AUTO" */
     int listen_port;             /* 0 = engine default */
     const char* files_dir;       /* writable dir for config.json, keystore, peer DB */
     const char* config_path;     /* optional explicit config.json path; NULL = auto */
@@ -561,6 +561,21 @@ litep2p_result_t litep2p_nos_set_delivery_event_cb(
  *  "peer_id","connected_peers","objects_d0..d3plus","delivery",
  *  "anti_entropy","replication","resources"} (*out_json → litep2p_free). */
 litep2p_result_t litep2p_nos_diagnostics(char** out_json);
+
+/* Push a platform signal into the NOS runtime (Phase 8 lifecycle bridge):
+ *   "connectivity"  value: "wifi" | "cellular" | "ethernet" | "none"
+ *   "metered"       value: "1" | "0"
+ *   "battery"       value: percent "0".."100"
+ *   "charging"      value: "1" | "0"
+ *   "storage"       value: "low" | "ok"
+ *   "foreground"    value: "1" | "0"
+ *   "wakeup_window" value: budget hint in milliseconds ("2500")
+ * Signals recompute resource budgets immediately (ECO/BALANCED/RELIABLE/
+ * CRITICAL) and "wakeup_window"/connectivity changes run one bounded
+ * scheduler reconcile burst (opportunistic background mode §7.2). Safe from
+ * any thread; unknown signals are rejected with LITEP2P_ERR_INVALID_ARG. */
+litep2p_result_t litep2p_nos_platform_signal(const char* signal,
+                                             const char* value);
 
 #ifdef __cplusplus
 } /* extern "C" */

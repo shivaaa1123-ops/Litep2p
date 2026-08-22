@@ -138,6 +138,14 @@ object LiteP2PRuntime {
             action = ACTION_START
         })
 
+        // Phase 8 lifecycle bridge: the WorkManager heartbeat gives the engine
+        // a bounded reconcile burst at least every 15 minutes even while the
+        // process is Doze-deferred or was restarted after a kill (opportunistic
+        // background mode §7.2). Durable one-shot wakeups from the native
+        // scheduler are enqueued on demand via NativeEvents.onWakeupRequested.
+        EngineWakeupScheduler.ensureInitialized(app)
+        EngineWakeupScheduler.scheduleHeartbeat(app)
+
         // Doze defers the engine's sockets while idle even with the foreground
         // service. Ask the user once per install to exempt the app (never if
         // already exempt, never a second time, and never when the integrator
@@ -163,6 +171,22 @@ object LiteP2PRuntime {
 
     /** True if the last thing requested via [start] is still in effect. */
     fun isDesiredRunning(context: Context): Boolean = desiredRunning(context.applicationContext)
+
+    /**
+     * Phase 8 lifecycle bridge: report app foreground/background transitions.
+     *
+     * Foreground = Active mode (§7.1): full budgets, immediate reconciliation.
+     * Background = Opportunistic/Dormant (§7.2/§7.3): budgets collapse to the
+     * background shape; delivery continues via durable store-and-forward and
+     * WorkManager maintenance windows.
+     *
+     * Call from your own lifecycle tracking (e.g. ProcessLifecycleOwner or
+     * Activity.onResume/onPause). Safe before start / after stop; no-ops.
+     */
+    fun notifyAppForeground(active: Boolean) {
+        runCatching { LiteP2PNative.nativeNosPlatformSignal("foreground", if (active) "1" else "0") }
+            .onFailure { Log.w(TAG, "foreground signal failed: ${it.message}") }
+    }
 
     /**
      * The stable per-device peer id the runtime would use (generating and
@@ -253,6 +277,7 @@ object LiteP2PRuntime {
     fun stop(context: Context) {
         val app = context.applicationContext
         setDesired(app, false)
+        EngineWakeupScheduler.cancelAll(app)
         ContextCompat.startForegroundService(app, Intent(app, LiteP2PService::class.java).apply {
             action = ACTION_STOP
         })

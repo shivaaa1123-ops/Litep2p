@@ -111,16 +111,24 @@ internal class EnvironmentHints(context: Context) {
         // network for devices where the callback misses e.g. VPNs.
         val available = tracked.isNotEmpty() || cm.activeNetwork != null
         var isWifi = false
+        var metered = false
         for (network in tracked) {
             val caps = cm.getNetworkCapabilities(network) ?: continue
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) isWifi = true
+            if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) metered = true
         }
         if (tracked.isEmpty()) {
             cm.getNetworkCapabilities(cm.activeNetwork)?.let { caps ->
                 isWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) metered = true
             }
         }
         LiteP2P.setNetworkInfo(isWifi, available)
+        // Phase 8 lifecycle bridge: feed the NOS ResourceManager so budgets
+        // (replication fan-out, discovery intensity, storage acceptance)
+        // react to transport/metering changes immediately.
+        pushNosSignal("connectivity", if (!available) "none" else if (isWifi) "wifi" else "cellular")
+        pushNosSignal("metered", if (metered) "1" else "0")
     }
 
 
@@ -182,6 +190,14 @@ internal class EnvironmentHints(context: Context) {
         LiteP2P.setReconnectMode(
             if (constrained) ReconnectMode.POWER_SAVER else ReconnectMode.AUTO
         )
+        // Doze entering means this process may be frozen at any moment: tell
+        // the NOS runtime it is no longer foreground so budgets go dormant.
+        if (pm.isDeviceIdleMode) pushNosSignal("foreground", "0")
+    }
+
+    /** One-shot NOS platform-signal push; never throws into system callbacks. */
+    private fun pushNosSignal(signal: String, value: String) {
+        runCatching { LiteP2PNative.nativeNosPlatformSignal(signal, value) }
     }
 
     /* ------------------------------------------------------------------ */

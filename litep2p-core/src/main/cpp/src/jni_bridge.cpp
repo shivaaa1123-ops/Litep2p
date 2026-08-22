@@ -36,6 +36,7 @@
 
 #ifdef __ANDROID__
 #include <android/log.h>
+#include "../modules/networkos/platform/android/AndroidPlatformAdapter.h"
 #endif
 
 namespace {
@@ -75,6 +76,8 @@ static jclass g_eventsClass = nullptr;
 static jmethodID g_onPeersUpdated = nullptr;
 // Phase 12: Network OS delivery/diagnostic events (optional convenience).
 static jmethodID g_onNosDeliveryEvent = nullptr;
+// Phase 8 lifecycle bridge: engine wakeup request → WorkManager (optional).
+static jmethodID g_onWakeupRequested = nullptr;
 static jmethodID g_onEngineStartComplete = nullptr;
 static jmethodID g_onEngineStopComplete = nullptr;
 static jmethodID g_onMessageReceived = nullptr;
@@ -152,6 +155,25 @@ void cabi_on_nos_delivery_event(const char* json, void* /*user*/) {
     env->DeleteLocalRef(jjson);
     if (env->ExceptionCheck()) {
         nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onNosDeliveryEvent");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+
+// Phase 8 lifecycle bridge: engine wakeup request → NativeEvents →
+// EngineWakeupScheduler (WorkManager job; survives process death + Doze).
+// Runs on engine threads; getJNIEnv() attaches them to the VM. Optional
+// surface: no-op until jniBridgeInit() resolves the Kotlin method.
+void emit_wakeup_requested(const char* reason, int64_t delay_ms) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onWakeupRequested) return;
+    jstring jreason = env->NewStringUTF(reason ? reason : "unspecified");
+    if (!jreason) return;
+    env->CallStaticVoidMethod(g_eventsClass, g_onWakeupRequested, jreason,
+                              static_cast<jlong>(delay_ms));
+    env->DeleteLocalRef(jreason);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onWakeupRequested");
         env->ExceptionDescribe();
         env->ExceptionClear();
     }
@@ -653,6 +675,18 @@ void register_cabi_callbacks() {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// JNI entry points — Network OS lifecycle bridge (Phase 8).
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nativeNosPlatformSignal(
+    JNIEnv* env, jobject /*thiz*/, jstring signal, jstring value) {
+    const std::string sig = jstring_to_utf8(env, signal);
+    const std::string val = jstring_to_utf8(env, value);
+    return static_cast<jint>(
+        litep2p_nos_platform_signal(sig.c_str(), val.c_str()));
+}
+
+// ---------------------------------------------------------------------------
 // Library load/unload
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -1016,6 +1050,22 @@ bool jniBridgeInit(JNIEnv* env) {
         nativeLog("JNI_BRIDGE: NativeEvents.onNosDeliveryEvent not found (NOS events disabled)");
         clear_any_exception(env);
     }
+    // Phase 8 lifecycle bridge (optional): engine wakeup request → Kotlin
+    // EngineWakeupScheduler → WorkManager. Missing method only disables
+    // background scheduling; the engine keeps running.
+    g_onWakeupRequested =
+        env->GetStaticMethodID(newEventsClass, "onWakeupRequested",
+                               "(Ljava/lang/String;J)V");
+    if (!g_onWakeupRequested) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onWakeupRequested not found (background scheduling disabled)");
+        clear_any_exception(env);
+    }
+#if defined(__ANDROID__)
+    // Register the wakeup emitter with the Android platform adapter. Safe to
+    // call repeatedly (idempotent); flushes any wakeups requested before the
+    // JNI cache was initialized.
+    networkos::android::setWakeBridge(&emit_wakeup_requested);
+#endif
     if (!newOnOverlayDeliveryMethod) {
         nativeLog("JNI_BRIDGE: NativeEvents.onOverlayDelivery not found (overlay ACK UI disabled)");
         clear_any_exception(env);

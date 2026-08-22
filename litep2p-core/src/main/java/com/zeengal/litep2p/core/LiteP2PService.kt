@@ -44,8 +44,14 @@ open class LiteP2PService : Service() {
         Thread(r, "litep2p-engine").apply { isDaemon = false }
     }
 
+    // Lock policy (Phase 8 / master doc §78 "background reality"): NO
+    // permanent wakelock and NO low-latency Wi-Fi lock. Those are OEM-killer
+    // bait, drain battery, and Doze ignores them anyway — liveness comes from
+    // START_STICKY restore + durable store-and-forward + WorkManager
+    // maintenance windows instead. Only the multicast lock stays held while
+    // running (UDP broadcast discovery beacons require it); a short burst
+    // wakelock covers bounded engine operations like start/stop.
     private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private var hints: EnvironmentHints? = null
 
@@ -108,6 +114,7 @@ open class LiteP2PService : Service() {
 
     private fun requestStart(config: LiteP2PConfig) {
         engineExecutor.execute {
+            burstWake()
             try {
                 acquireLocks()
                 Log.i(TAG, "Starting engine (${config.commsMode})")
@@ -147,6 +154,7 @@ open class LiteP2PService : Service() {
 
     private fun requestStop() {
         engineExecutor.execute {
+            burstWake()
             try {
                 Log.i(TAG, "Stopping engine")
                 hints?.stop()
@@ -195,42 +203,38 @@ open class LiteP2PService : Service() {
     /* ------------------------------------------------------------------ */
 
     /**
-     * Keeps the CPU and Wi-Fi radio available while the engine is running.
-     *
-     * Without these, Doze and Wi-Fi power saving suspend packet delivery,
-     * which shows up as peers silently going stale. The multicast lock is
-     * required specifically for the UDP broadcast discovery beacons.
+     * Short CPU window for bounded engine operations (start/stop handshakes).
+     * Never held steady-state — if Doze defers it, we accept the slowdown and
+     * reconcile later via the WorkManager maintenance windows instead of
+     * fighting the OS for resources.
+     */
+    private fun burstWake(timeoutMs: Long = 15_000L) {
+        runCatching {
+            if (wakeLock?.isHeld != true) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "litep2p:burst").apply {
+                    setReferenceCounted(false)
+                    acquire(timeoutMs)
+                }
+            }
+        }
+    }
+
+    /**
+     * Multicast lock only (required for UDP broadcast discovery beacons on
+     * Wi-Fi). No permanent CPU/Wi-Fi locks: see the field policy note above
+     * and master doc §7 (execution modes) / §78 (background reality).
      */
     private fun acquireLocks() {
         try {
-            if (wakeLock == null) {
-                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "litep2p:runtime").apply {
-                    setReferenceCounted(false)
-                    acquire()
-                }
-            }
-
             val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            if (wifiLock == null) {
-                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                } else {
-                    @Suppress("DEPRECATION")
-                    WifiManager.WIFI_MODE_FULL_HIGH_PERF
-                }
-                wifiLock = wm.createWifiLock(mode, "litep2p:runtime").apply {
-                    setReferenceCounted(false)
-                    acquire()
-                }
-            }
             if (multicastLock == null) {
                 multicastLock = wm.createMulticastLock("litep2p:runtime").apply {
                     setReferenceCounted(false)
                     acquire()
                 }
             }
-            Log.i(TAG, "Locks acquired")
+            Log.i(TAG, "Locks acquired (multicast only; no permanent wakelock)")
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to acquire locks: ${t.message}")
         }
@@ -238,10 +242,8 @@ open class LiteP2PService : Service() {
 
     private fun releaseLocks() {
         runCatching { wakeLock?.takeIf { it.isHeld }?.release() }
-        runCatching { wifiLock?.takeIf { it.isHeld }?.release() }
         runCatching { multicastLock?.takeIf { it.isHeld }?.release() }
         wakeLock = null
-        wifiLock = null
         multicastLock = null
     }
 

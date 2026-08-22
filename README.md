@@ -9,7 +9,8 @@ engine with a Kotlin API, distributed as an AAR.
 
 > **Status:** `0.x` pre-release. The public contract is the C ABI
 > (`litep2p.h`) + the Kotlin wrapper; expect breaking changes until `1.0`.
-> The full integration reference lives in **[docs/api-spec.md](docs/api-spec.md)**.
+> The full integration reference lives in **[docs/api-spec.md](docs/api-spec.md)**;
+> the full documentation index is **[docs/README.md](docs/README.md)**.
 
 ---
 
@@ -192,7 +193,9 @@ litep2p-core/          The SDK (Kotlin API + JNI + C++ engine) → AAR
   src/main/cpp/include/litep2p.h   Public C ABI contract
 app/                   Development/test harness app (not part of the SDK surface)
 desktop/               Linux/macOS build of the same engine; C ABI test suites
-docs/api-spec.md       SDK reference (THE integration document)
+docs/                   SDK reference & docs index (start at docs/README.md)
+  api-spec.md           SDK reference (THE integration document)
+  desktop-peer.md       Desktop CLI peer guide (interop testing)
 tools/                 Harness scripts, signaling server, connectivity tests
 third_party/           Vendored picoquic/picotls (fetched/built separately)
 .github/workflows/     CI: build/test/publish, nightly stress + WAN suites

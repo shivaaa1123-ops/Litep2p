@@ -138,7 +138,7 @@ latency, retransmissions.
 - `modules/networkos/delivery/` (direct delivery, state machine, receipt
   manager) + tests `desktop/tests/delivery_test`.
 - Receipt reverse-path integration.
-- `docs/network-os/11-delivery-receipts.md`.
+- `docs/network-os/18-delivery-receipts.md`.
 - End-to-end script `tools/harness/p5_milestone_scenario.sh` implementing
   the §99 scenario with kill-at-every-arrow automation.
 
