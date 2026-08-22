@@ -37,6 +37,7 @@
 #ifdef __ANDROID__
 #include <android/log.h>
 #include "../modules/networkos/platform/android/AndroidPlatformAdapter.h"
+#include "../modules/networkos/gossip/include/networkos/gossip/push_bridge.h"
 #endif
 
 namespace {
@@ -78,6 +79,8 @@ static jmethodID g_onPeersUpdated = nullptr;
 static jmethodID g_onNosDeliveryEvent = nullptr;
 // Phase 8 lifecycle bridge: engine wakeup request → WorkManager (optional).
 static jmethodID g_onWakeupRequested = nullptr;
+// Phase 13 push trigger: engine → app FCM relay (optional).
+static jmethodID g_onPushTrigger = nullptr;
 static jmethodID g_onEngineStartComplete = nullptr;
 static jmethodID g_onEngineStopComplete = nullptr;
 static jmethodID g_onMessageReceived = nullptr;
@@ -174,6 +177,29 @@ void emit_wakeup_requested(const char* reason, int64_t delay_ms) {
     env->DeleteLocalRef(jreason);
     if (env->ExceptionCheck()) {
         nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onWakeupRequested");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+}
+
+// Phase 13 push trigger: engine asks the app to deliver an FCM data message
+// to a peer (NAT candidate exchange). Runs on engine threads. No-op until
+// jniBridgeInit() resolves the Kotlin method and registers this emitter.
+void emit_push_trigger(const char* peer_id, const char* candidates_json) {
+    JNIEnv* env = getJNIEnv();
+    if (!env || !g_eventsClass || !g_onPushTrigger) return;
+    jstring jpeer = env->NewStringUTF(peer_id ? peer_id : "");
+    jstring jcand = env->NewStringUTF(candidates_json ? candidates_json : "[]");
+    if (!jpeer || !jcand) {
+        if (jpeer) env->DeleteLocalRef(jpeer);
+        if (jcand) env->DeleteLocalRef(jcand);
+        return;
+    }
+    env->CallStaticVoidMethod(g_eventsClass, g_onPushTrigger, jpeer, jcand);
+    env->DeleteLocalRef(jpeer);
+    env->DeleteLocalRef(jcand);
+    if (env->ExceptionCheck()) {
+        nativeLog("JNI_BRIDGE: Exception calling NativeEvents.onPushTriggerRequested");
         env->ExceptionDescribe();
         env->ExceptionClear();
     }
@@ -686,6 +712,44 @@ Java_com_zeengal_litep2p_core_LiteP2PNative_nativeNosPlatformSignal(
         litep2p_nos_platform_signal(sig.c_str(), val.c_str()));
 }
 
+// ---- Phase 13: push bridge + QR contacts ------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nativePushTokenUpdate(
+    JNIEnv* env, jobject /*thiz*/, jstring token) {
+    const std::string tok = jstring_to_utf8(env, token);
+    return static_cast<jint>(litep2p_push_token_update(tok.c_str()));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nativePushPayload(
+    JNIEnv* env, jobject /*thiz*/, jstring json) {
+    const std::string j = jstring_to_utf8(env, json);
+    return static_cast<jint>(litep2p_push_payload(j.c_str()));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nativeContactsBuild(
+    JNIEnv* env, jobject /*thiz*/) {
+    char* out = nullptr;
+    if (litep2p_contacts_build(&out) != LITEP2P_OK || !out) return nullptr;
+    jstring result = env->NewStringUTF(out);
+    litep2p_free(out);
+    return result;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_zeengal_litep2p_core_LiteP2PNative_nativeContactsParse(
+    JNIEnv* env, jobject /*thiz*/, jstring b64) {
+    const std::string payload = jstring_to_utf8(env, b64);
+    char* out = nullptr;
+    if (litep2p_contacts_parse(payload.c_str(), &out) != LITEP2P_OK || !out) {
+        return nullptr;
+    }
+    jstring result = env->NewStringUTF(out);
+    litep2p_free(out);
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // Library load/unload
 // ---------------------------------------------------------------------------
@@ -1065,6 +1129,18 @@ bool jniBridgeInit(JNIEnv* env) {
     // call repeatedly (idempotent); flushes any wakeups requested before the
     // JNI cache was initialized.
     networkos::android::setWakeBridge(&emit_wakeup_requested);
+#endif
+
+    // Phase 13 push trigger bridge (optional): engine → app FCM relay.
+    g_onPushTrigger =
+        env->GetStaticMethodID(newEventsClass, "onPushTriggerRequested",
+                               "(Ljava/lang/String;Ljava/lang/String;)V");
+    if (!g_onPushTrigger) {
+        nativeLog("JNI_BRIDGE: NativeEvents.onPushTriggerRequested not found (push triggers disabled)");
+        clear_any_exception(env);
+    }
+#if defined(__ANDROID__)
+    networkos::gossip::setPushTriggerBridge(&emit_push_trigger);
 #endif
     if (!newOnOverlayDeliveryMethod) {
         nativeLog("JNI_BRIDGE: NativeEvents.onOverlayDelivery not found (overlay ACK UI disabled)");

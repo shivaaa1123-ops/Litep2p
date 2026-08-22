@@ -24,6 +24,7 @@ namespace anti_entropy { class AntiEntropyManager; }  // networkos/anti_entropy/
 namespace replication { class ReplicaPlanner; }  // networkos/replication/ReplicaPlanner.h
 namespace resources { class ResourceManager; }  // networkos/resources/ResourceManager.h
 namespace discovery { class DiscoveryManager; }  // networkos/discovery/DiscoveryManager.h
+namespace gossip { class GossipEngine; }  // networkos/gossip/GossipEngine.h
 
 // ---------------------------------------------------------------------------
 // Result codes (engine-internal; the C ABI keeps its own litep2p_result_t).
@@ -204,6 +205,29 @@ public:
     // bootstrap+relay backends, graceful degradation, NAT layering). Owned by
     // the runtime. Valid once constructed.
     virtual discovery::DiscoveryManager* discovery() { return nullptr; }
+
+    // Phase 13: peer routing-directory gossip engine (signalling.md §1/§2).
+    // Owned by the runtime; valid once start() built it.
+    virtual gossip::GossipEngine* gossipEngine() { return nullptr; }
+
+    // Phase 13 push lifecycle bridge (signalling.md §4): the app forwards its
+    // FCM token and inbound push payloads; the engine treats pushes as
+    // out-of-band candidate delivery / wake events. Non-pure defaults keep
+    // test runtimes compilable.
+    virtual Result onPushTokenUpdate(const std::string& /*token*/) {
+        return Result::kNotImplemented;
+    }
+    virtual Result onPushPayload(const std::string& /*json*/) {
+        return Result::kNotImplemented;
+    }
+    // Offline QR contact exchange (signalling.md Phase 4).
+    virtual Result buildContactQr(std::string& /*out_b64*/) {
+        return Result::kNotImplemented;
+    }
+    virtual Result parseContactQr(const std::string& /*b64*/,
+                                  std::string& /*out_json*/) {
+        return Result::kNotImplemented;
+    }
 
     // Poke the runtime with an event (used by the platform adapter and
     // external triggers, e.g. network change -> scheduler wakeup).

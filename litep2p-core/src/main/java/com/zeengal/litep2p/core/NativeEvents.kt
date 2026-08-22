@@ -161,4 +161,14 @@ object NativeEvents {
     fun onWakeupRequested(reason: String, delayMs: Long) {
         EngineWakeupScheduler.onEngineWakeupRequested(reason, delayMs)
     }
+
+    /**
+     * Phase 13 push trigger — the engine asked the app to deliver an FCM data
+     * message to [peerId] carrying [candidatesJson] (NAT candidate exchange).
+     * Forwarded to [LiteP2PPush.triggerListener]. Called from a native thread.
+     */
+    @JvmStatic
+    fun onPushTriggerRequested(peerId: String, candidatesJson: String) {
+        LiteP2PPush.dispatchTrigger(peerId, candidatesJson)
+    }
 }

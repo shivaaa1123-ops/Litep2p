@@ -1522,6 +1522,67 @@ litep2p_result_t litep2p_nos_platform_signal(const char* signal,
     }
 }
 
+/* ---- Phase 13: push bridge + QR contacts -------------------------------- */
+
+litep2p_result_t litep2p_push_token_update(const char* token) {
+    if (!token || !*token) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    switch (rt->onPushTokenUpdate(token)) {
+        case networkos::Result::kOk: return LITEP2P_OK;
+        case networkos::Result::kInvalidArg: return LITEP2P_ERR_INVALID_ARG;
+        default: return LITEP2P_ERR_INTERNAL;
+    }
+}
+
+litep2p_result_t litep2p_push_payload(const char* json) {
+    if (!json || !*json) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    switch (rt->onPushPayload(json)) {
+        case networkos::Result::kOk: return LITEP2P_OK;
+        case networkos::Result::kInvalidArg: return LITEP2P_ERR_INVALID_ARG;
+        default: return LITEP2P_ERR_INTERNAL;
+    }
+}
+
+namespace {
+char* dup_to_c_string_(const std::string& s) {
+    char* out = static_cast<char*>(std::malloc(s.size() + 1));
+    if (!out) return nullptr;
+    std::memcpy(out, s.c_str(), s.size() + 1);
+    return out;
+}
+}  // namespace
+
+litep2p_result_t litep2p_contacts_build(char** out_b64) {
+    if (!out_b64) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    std::string b64;
+    switch (rt->buildContactQr(b64)) {
+        case networkos::Result::kOk:
+            *out_b64 = dup_to_c_string_(b64);
+            return *out_b64 ? LITEP2P_OK : LITEP2P_ERR_INTERNAL;
+        case networkos::Result::kInvalidState: return LITEP2P_ERR_INVALID_STATE;
+        default: return LITEP2P_ERR_IO;
+    }
+}
+
+litep2p_result_t litep2p_contacts_parse(const char* b64, char** out_json) {
+    if (!b64 || !*b64 || !out_json) return LITEP2P_ERR_INVALID_ARG;
+    networkos::Runtime* rt = nos_get_runtime();
+    if (!rt) return LITEP2P_ERR_INVALID_STATE;
+    std::string json;
+    switch (rt->parseContactQr(b64, json)) {
+        case networkos::Result::kOk:
+            *out_json = dup_to_c_string_(json);
+            return *out_json ? LITEP2P_OK : LITEP2P_ERR_INTERNAL;
+        case networkos::Result::kInvalidArg: return LITEP2P_ERR_INVALID_ARG;
+        default: return LITEP2P_ERR_IO;
+    }
+}
+
 litep2p_result_t litep2p_nos_send(const char* destination,
                                   const char* namespace_id,
                                   const uint8_t* payload, uint32_t len,

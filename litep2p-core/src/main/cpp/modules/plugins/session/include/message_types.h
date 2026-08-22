@@ -52,5 +52,12 @@ enum class MessageType : uint8_t {
 
     // Realtime voice-call frames (control + audio, not batched). Frames are
     // fire-and-forget: the app tolerates loss instead of retransmitting.
-    VOICE_STREAM         = 0x21
+    VOICE_STREAM         = 0x21,
+
+    // Network OS Phase 13: peer routing-directory gossip (signalling.md §2,
+    // delta updates with flag-based field omission). Rides the encrypted
+    // session channel; every batch is bounded and strictly decoded.
+    PEER_RECORDS_DELTA   = 0x3C,   // bounded batch of delta PeerRecords
+    FIND_PEER_QUERY      = 0x3D,   // neighborhood lookup (target id + nonce)
+    FIND_PEER_REPLY      = 0x3E    // reply: matched record or explicit miss
 };

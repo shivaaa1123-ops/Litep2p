@@ -127,6 +127,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/replication/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/resources/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/discovery/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/gossip/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/largeobject/include
     ${CMAKE_CURRENT_SOURCE_DIR}/modules/networkos/metrics/include
 )
@@ -361,6 +362,10 @@ set(NETWORKOS_SOURCES
     "modules/networkos/discovery/src/DiscoveryManager.cpp"
     "modules/networkos/largeobject/src/largeobject.cpp"
     "modules/networkos/metrics/src/ReliabilityMetrics.cpp"
+    "modules/networkos/gossip/src/peer_record.cpp"
+    "modules/networkos/gossip/src/gossip_engine.cpp"
+    "modules/networkos/gossip/src/cascade_push.cpp"
+    "modules/networkos/gossip/src/qr_bootstrap.cpp"
 )
 add_library(litep2p_networkos STATIC ${NETWORKOS_SOURCES})
 target_link_libraries(litep2p_networkos litep2p_corep2p litep2p_session)

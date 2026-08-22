@@ -77,6 +77,20 @@ internal object LiteP2PNative {
      */
     external fun nativeNosPlatformSignal(signal: String, value: String): Int
 
+    /* ---- Phase 13: push bridge + QR contacts ----------------------------- */
+
+    /** App forwarded a fresh FCM token (LiteP2PPush). */
+    external fun nativePushTokenUpdate(token: String): Int
+
+    /** App forwarded an inbound FCM data payload JSON (LiteP2PPush). */
+    external fun nativePushPayload(json: String): Int
+
+    /** Signed QR contact card for this device (base64url), or null. */
+    external fun nativeContactsBuild(): String?
+
+    /** Verify + parse a scanned contact card; flat JSON, or null on reject. */
+    external fun nativeContactsParse(b64: String): String?
+
     /* ------------------------------------------------------------------ */
     /* Peer operations                                                      */
     /* ------------------------------------------------------------------ */

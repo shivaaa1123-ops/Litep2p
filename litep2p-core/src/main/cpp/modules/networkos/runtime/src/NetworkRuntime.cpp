@@ -27,6 +27,11 @@
 #include "networkos/capability.h"
 #include "networkos/object/envelope.h"
 #include "networkos/object/object_id.h"
+#include "networkos/gossip/gossip_engine.h"
+#include "networkos/gossip/push_bridge.h"
+#include "networkos/gossip/qr_bootstrap.h"
+
+#include <sodium.h>
 
 #include "litep2p.h"   // LITEP2P_VERSION_STRING (public SDK version)
 
@@ -311,6 +316,15 @@ public:
                             if (m_anti_entropy)
                                 m_anti_entropy->onFrame(peer_id, type, payload);
                             break;
+                        case MessageType::PEER_RECORDS_DELTA:
+                        case MessageType::FIND_PEER_QUERY:
+                        case MessageType::FIND_PEER_REPLY:
+                            // Phase 13: routing-directory gossip frames.
+                            if (m_gossip) {
+                                m_gossip->onFrame(peer_id, type, payload,
+                                                  static_cast<uint64_t>(now_ms() / 1000));
+                            }
+                            break;
                         default:
                             break;
                     }
@@ -364,6 +378,31 @@ public:
             m_anti_entropy->setEventFn(
                 [this](const std::string& kind, const std::string& payload) {
                     emit_(RuntimeEventType::kDelivery, kind, "", payload);
+                });
+
+            // Phase 13: peer routing-directory gossip (signalling.md). Deltas
+            // ride the encrypted session channel; the directory feeds
+            // DiscoveryManager so known-peer reconnect benefits immediately.
+            gossip::GossipEngine::Config gcfg;
+            gcfg.local_peer_id = m_peer_id;
+            if (!cfg.files_dir.empty()) {
+                gcfg.persist_path = cfg.files_dir + "/gossip_directory.json";
+            }
+            m_gossip = std::make_unique<gossip::GossipEngine>(gcfg);
+            m_gossip->load();
+            m_gossip->setSendFn(
+                [this](const std::string& peer_id, MessageType type,
+                       const std::string& payload) -> bool {
+                    return m_session && m_session->send_handoff_frame(
+                                            peer_id, type, payload);
+                });
+            m_gossip->setAcceptedFn(
+                [this](const gossip::PeerRecord& r) {
+                    if (m_discovery) {
+                        m_discovery->notePeerSeen(
+                            r.peer_id,
+                            static_cast<int64_t>(r.last_seen_utc) * 1000);
+                    }
                 });
 
             // Phase 7: target-driven adaptive replication + peer scoring.
@@ -448,6 +487,11 @@ public:
         m_delivery.reset();
         m_anti_entropy.reset();
         m_replication.reset();
+        if (m_gossip) {
+            // Durable-state doctrine: flush the routing directory on shutdown.
+            m_gossip->save(static_cast<uint64_t>(now_ms() / 1000));
+            m_gossip.reset();
+        }
         m_resources.reset();
         m_discovery.reset();
         m_session_facade.reset();
@@ -777,8 +821,128 @@ public:
             // Phase 7: a connectivity change is an event-triggered retry for
             // any backed-off replication work (Step 5.7).
             if (m_replication) m_replication->onConnectivityChange(now_ms());
+            // Phase 13: opportunistic gossip tick — bounded delta batches to
+            // connected peers, stale purge, directory persistence. Event-driven
+            // only (wakeup windows / connectivity), never a timer (§9).
+            if (m_gossip) {
+                std::vector<std::string> peers;
+                if (m_session) peers = m_session->getConnectedPeerIds();
+                m_gossip->tick(peers, static_cast<uint64_t>(now_ms() / 1000));
+                m_gossip->purgeStale(static_cast<uint64_t>(now_ms() / 1000));
+                m_gossip->save(static_cast<uint64_t>(now_ms()));
+            }
         }
         emit_(RuntimeEventType::kPlatform, signal, "", value);
+        return Result::kOk;
+    }
+
+    // ---- Phase 13: gossip / push / contacts ---------------------------------
+    gossip::GossipEngine* gossipEngine() override { return m_gossip.get(); }
+
+    Result onPushTokenUpdate(const std::string& token) override {
+        if (!m_gossip) return Result::kInvalidState;
+        m_gossip->setLocalPushToken(token, static_cast<uint64_t>(now_ms() / 1000));
+        emit_(RuntimeEventType::kPlatform, "push_token_updated", "", "");
+        return Result::kOk;
+    }
+
+    Result onPushPayload(const std::string& json) override {
+        gossip::PushPayload p;
+        if (!gossip::parse_push_payload(json, p)) return Result::kInvalidArg;
+        if (!m_gossip) return Result::kInvalidState;
+        if (p.type == gossip::PushPayload::Type::kCandidates &&
+            !p.candidates.empty()) {
+            // Seed the directory tier with the pushed candidate endpoints so
+            // the next resolve()/connect hits the cache. Version = now secs.
+            gossip::PeerRecord r;
+            r.peer_id = p.peer_id;
+            r.primary_endpoint = p.candidates.front();
+            r.token_version = static_cast<uint64_t>(now_ms() / 1000);
+            r.last_seen_utc = static_cast<uint64_t>(now_ms() / 1000);
+            gossip::normalize_flags(r);
+            std::string batch(1, '\x01');
+            batch.append(gossip::encode_peer_record(r));
+            m_gossip->ingestDelta(batch, r.last_seen_utc);
+        }
+        emit_(RuntimeEventType::kPlatform,
+              p.type == gossip::PushPayload::Type::kCandidates
+                  ? "push_candidates"
+                  : "push_wake",
+              p.peer_id, json);
+        return Result::kOk;
+    }
+
+    Result buildContactQr(std::string& out_b64) override {
+        if (!m_gossip || m_peer_id.empty()) return Result::kInvalidState;
+        // Contact signing seed: created once, persisted atomically next to the
+        // identity (same create-once discipline as FileIdentityStore).
+        std::string seed_hex;
+        {
+            const std::string path =
+                (m_cfg.files_dir.empty() ? "." : m_cfg.files_dir) +
+                "/contact_seed.hex";
+            std::ifstream in(path, std::ios::binary);
+            if (in.good()) {
+                std::stringstream ss;
+                ss << in.rdbuf();
+                seed_hex = ss.str();
+            }
+            if (seed_hex.size() != 64) {
+                seed_hex.resize(32);
+                if (sodium_init() < 0) return Result::kIo;
+                randombytes_buf(reinterpret_cast<unsigned char*>(&seed_hex[0]),
+                                32);
+                std::string seed_raw;
+                for (int i = 0; i < 32; ++i) {
+                    seed_raw.push_back(seed_hex[i]);
+                }
+                // Store hex of the raw 32 bytes.
+                static const char* kHex = "0123456789abcdef";
+                std::string hx;
+                hx.reserve(64);
+                for (unsigned char c : seed_raw) {
+                    hx.push_back(kHex[c >> 4]);
+                    hx.push_back(kHex[c & 0x0F]);
+                }
+                const std::string tmp = path + ".tmp";
+                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                if (out.good()) {
+                    out << hx;
+                    out.flush();
+                }
+                if (out.good() && std::rename(tmp.c_str(), path.c_str()) == 0) {
+                    seed_hex = hx;
+                } else {
+                    seed_hex = hx;  // in-memory fallback still works this run
+                }
+            }
+        }
+        gossip::PeerRecord rec;
+        rec.peer_id = m_peer_id;
+        if (!m_gossip->lookup(m_peer_id, rec)) rec = m_gossip->localRecord();
+        out_b64 = gossip::build_contact_qr(seed_hex, rec);
+        return out_b64.empty() ? Result::kIo : Result::kOk;
+    }
+
+    Result parseContactQr(const std::string& b64, std::string& out_json) override {
+        gossip::ContactCard card;
+        if (!gossip::parse_contact_qr(b64, card)) return Result::kInvalidArg;
+        // Scanning seeds the cache tier immediately.
+        if (m_gossip) {
+            gossip::PeerRecord r = card.record;
+            r.token_version = static_cast<uint64_t>(now_ms() / 1000);
+            r.last_seen_utc = static_cast<uint64_t>(now_ms() / 1000);
+            gossip::normalize_flags(r);
+            std::string batch(1, '\x01');
+            batch.append(gossip::encode_peer_record(r));
+            m_gossip->ingestDelta(batch, r.last_seen_utc);
+        }
+        std::ostringstream o;
+        o << "{\"peer_id\":\"" << card.record.peer_id << "\",\"endpoint\":\""
+          << card.record.primary_endpoint << "\",\"signaling\":\""
+          << card.record.signaling_addr << "\",\"signer_pk\":\""
+          << card.signer_pk_hex << "\"}";
+        out_json = o.str();
         return Result::kOk;
     }
 
@@ -815,6 +979,7 @@ private:
     std::unique_ptr<replication::ReplicaPlanner> m_replication;
     std::unique_ptr<resources::ResourceManager> m_resources;
     std::unique_ptr<discovery::DiscoveryManager> m_discovery;
+    std::unique_ptr<gossip::GossipEngine> m_gossip;
 
     // Phase 12: namespace policy registry + its lock.
     std::mutex m_nos_mu_;

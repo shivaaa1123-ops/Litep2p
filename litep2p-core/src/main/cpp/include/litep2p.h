@@ -577,6 +577,26 @@ litep2p_result_t litep2p_nos_diagnostics(char** out_json);
 litep2p_result_t litep2p_nos_platform_signal(const char* signal,
                                              const char* value);
 
+/* Phase 13 push lifecycle bridge (signalling.md §4). The HOST APP owns the
+ * Firebase connection (the SDK carries no Firebase dependency); it forwards:
+ *   - new FCM registration tokens -> litep2p_push_token_update(token)
+ *   - inbound data payloads       -> litep2p_push_payload(json)
+ * Push payloads carry NAT candidate lists / wake events and seed the peer
+ * routing directory so discovery cascade tier 3 works offline-first.
+ * Errors: INVALID_ARG (bad json), INVALID_STATE (engine not initialized). */
+litep2p_result_t litep2p_push_token_update(const char* token);
+litep2p_result_t litep2p_push_payload(const char* json);
+
+/* Phase 13 offline QR contact exchange (signalling.md Phase 4, "LPQ1").
+ * build: signs the local contact card with the engine's contact keypair
+ * (created once, persisted next to the identity) -> *out_b64 (base64url,
+ * QR-safe; free with litep2p_free).
+ * parse: verifies signature + bounds; seeds the routing directory on success
+ * and returns flat JSON {"peer_id","endpoint","signaling","signer_pk"} via
+ * *out_json (free with litep2p_free). Errors: INVALID_ARG, IO. */
+litep2p_result_t litep2p_contacts_build(char** out_b64);
+litep2p_result_t litep2p_contacts_parse(const char* b64, char** out_json);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

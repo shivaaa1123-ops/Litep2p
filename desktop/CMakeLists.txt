@@ -292,6 +292,10 @@ set(NETWORKOS_SOURCES
     ../litep2p-core/src/main/cpp/modules/networkos/discovery/src/DiscoveryManager.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/largeobject/src/largeobject.cpp
     ../litep2p-core/src/main/cpp/modules/networkos/metrics/src/ReliabilityMetrics.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/gossip/src/peer_record.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/gossip/src/gossip_engine.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/gossip/src/cascade_push.cpp
+    ../litep2p-core/src/main/cpp/modules/networkos/gossip/src/qr_bootstrap.cpp
 )
 
 set(ENGINE_SOURCES
@@ -352,6 +356,7 @@ target_include_directories(litep2p_engine PUBLIC
     ../litep2p-core/src/main/cpp/modules/networkos/replication/include
     ../litep2p-core/src/main/cpp/modules/networkos/resources/include
     ../litep2p-core/src/main/cpp/modules/networkos/discovery/include
+    ../litep2p-core/src/main/cpp/modules/networkos/gossip/include
     ../litep2p-core/src/main/cpp/modules/networkos/largeobject/include
     ../litep2p-core/src/main/cpp/modules/networkos/metrics/include
 )
@@ -573,6 +578,12 @@ target_link_libraries(resource_manager_test PRIVATE litep2p_engine)
 add_executable(discovery_manager_test tests/discovery_manager_test.cpp)
 target_include_directories(discovery_manager_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(discovery_manager_test PRIVATE litep2p_engine)
+
+# Network OS Phase 13 test: peer-record delta gossip, signaling pool,
+# discovery cascade, push payload parse, QR contact codec, adaptive keepalive.
+add_executable(gossip_test tests/gossip_test.cpp)
+target_include_directories(gossip_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(gossip_test PRIVATE litep2p_engine)
 
 # Network OS Phase 10 test: large object layer (manifest, chunks, resume, bulk).
 add_executable(large_object_test tests/large_object_test.cpp)
