@@ -26,6 +26,7 @@
 14. [Worked examples](#14-worked-examples)
 15. [Error code quick reference](#15-error-code-quick-reference)
 16. [Network OS object runtime (Phase 12, v0.4 feature set)](#16-network-os-object-runtime-phase-12-v04-feature-set)
+17. [Push lifecycle, gossip directory & offline contacts (Phase 13)](#17-push-lifecycle-gossip-directory--offline-contacts-phase-13-v04-feature-set)
 
 ---
 
@@ -2796,6 +2797,117 @@ privacy-safe aggregate snapshot (identifiers only, never payloads or keys):
 - The ABI symbol set is snapshotted in `desktop/tests/c_abi_reference.txt`;
   removing any frozen symbol fails the gate. Additions require regenerating
   the reference as part of the release process.
+
+---
+
+## 17. Push lifecycle, gossip directory & offline contacts (Phase 13, v0.4 feature set)
+
+The mobile-first signalling roadmap adds three pieces of public surface on top
+of §16: a **push lifecycle bridge** (out-of-band FCM wake channel), a
+**gossip peer-routing directory** (delta gossip over the encrypted session
+channel), and **signed QR contact exchange** (offline bootstrap). The SDK
+carries **no Firebase dependency** — the host app owns Firebase and forwards
+events into the engine.
+
+### 17.1 C ABI additions
+
+```c
+/* Push lifecycle bridge (§4 of the signalling roadmap). */
+litep2p_result_t litep2p_push_token_update(const char* token);
+litep2p_result_t litep2p_push_payload(const char* json);
+
+/* Offline QR contact exchange ("LPQ1" signed contact cards). */
+litep2p_result_t litep2p_contacts_build(char** out_b64);
+litep2p_result_t litep2p_contacts_parse(const char* b64, char** out_json);
+```
+
+| Function | Behavior | Errors |
+|---|---|---|
+| `litep2p_push_token_update` | Records the app's fresh FCM registration token; bumps the local `token_version` and flags the local record dirty so the next delta gossip carries it. Empty tokens are rejected without burning a version. | `INVALID_ARG`, `INVALID_STATE` (engine not started) |
+| `litep2p_push_payload` | Feeds an inbound FCM data payload (schema below) into the engine: seeds NAT candidates / wake state and the peer routing directory. | `INVALID_ARG` (bad JSON), `INVALID_STATE` |
+| `litep2p_contacts_build` | Signs the local contact card with the engine's contact keypair (created once, persisted next to the identity) and returns base64url (`*out_b64`, QR-safe alphabet; free with `litep2p_free`). | `INVALID_ARG`, `IO` |
+| `litep2p_contacts_parse` | Verifies signature + bounds, seeds the routing directory, returns flat JSON `{"peer_id","endpoint","signaling","signer_pk"}` via `*out_json` (free with `litep2p_free`). `signer_pk` is the 64-hex-char signer public key, for pinning. Tampered cards are rejected. | `INVALID_ARG`, `IO` |
+
+### 17.2 Inbound push payload schema (strict)
+
+The string the app received as the FCM `data["lp"]` field must be one of:
+
+```json
+{"type":"candidates","peer_id":"<hex>","nonce":<u32>,
+ "candidates":["ip:port", ...]}
+{"type":"wake","peer_id":"<hex>"}
+```
+
+- `candidates`: at most 8 entries, each at most 128 chars; IPv6 literals in
+  `[...]:port` form are supported.
+- Anything else (unknown `type`, missing `peer_id`, malformed JSON) is
+  rejected with `INVALID_ARG`.
+
+### 17.3 Outbound push triggers (Kotlin)
+
+When the engine needs an out-of-band wake delivered to a peer (discovery
+cascade tier 3), it invokes the registered trigger listener with the target
+peer id and a flat JSON array of candidate endpoints. The app usually POSTs
+this to its own FCM admin relay.
+
+```kotlin
+// Forward Firebase events into the engine:
+class MyFirebaseMessagingService : FirebaseMessagingService() {
+    override fun onNewToken(token: String) = LiteP2PPush.onNewToken(token)
+    override fun onMessageReceived(msg: RemoteMessage) {
+        msg.data["lp"]?.let { LiteP2PPush.onPayload(it) }
+    }
+}
+
+// Deliver engine-initiated pushes through your backend:
+LiteP2PPush.triggerListener = { peerId, candidatesJson ->
+    myBackend.sendFcmData(peerId, candidatesJson)
+}
+```
+
+Both `LiteP2PPush.onNewToken(token)` and `LiteP2PPush.onPayload(json)` return
+an `EngineResult`.
+
+### 17.4 Gossip wire frames
+
+Three session frame types carry the routing directory between connected
+peers (riding the encrypted Noise channel):
+
+| Type | Value | Payload |
+|---|---|---|
+| `PEER_RECORDS_DELTA` | `0x3C` | `[u8 count][record]…` — bounded batch (`count ≤ 2× batch max`) |
+| `FIND_PEER_QUERY` | `0x3D` | `[u8 len][target peer_id][u32 nonce LE]` |
+| `FIND_PEER_REPLY` | `0x3E` | `[u8 found][u32 nonce LE][record — present iff found=1]` |
+
+PeerRecord binary layout (little-endian, strictly bounded, trailing garbage
+rejected). Long strings are carried only when their flag bit is set; peers
+assume unchanged values otherwise (version-gated merge on `token_version`):
+
+```
+[u8  len][peer_id bytes]
+[u8  len][primary_endpoint bytes]
+[u64 token_version]
+[u64 last_seen_utc seconds]
+[u8  flags]                      // 0x01 = has token, 0x02 = has signaling
+[u16 len][fcm_token_id]          // present iff flags & 0x01
+[u16 len][signaling_addr]        // present iff flags & 0x02
+```
+
+Merge rule: an incoming record wins only when its `token_version` is strictly
+greater (or the peer is new); locally-known token/signaling fields are
+preserved when the sender omits them.
+
+### 17.5 Discovery cascade & persistence
+
+Connection attempts resolve through ordered tiers: **1** local cache →
+**2** FIND_PEER gossip to active neighbors → **3** push trigger →
+**4** gossiped community signaling pool (ranked round-robin, bad-node
+marking). Exhaustion is reported honestly.
+
+The directory persists atomically (tmp + rename) at
+`<files_dir>/gossip_directory.json`, survives process death, and is reloaded
+on start (self records are never re-loaded; stale entries purge after 7 days
+unseen).
 
 ---
 

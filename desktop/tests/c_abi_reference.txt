@@ -4,6 +4,8 @@ litep2p_add_peer
 litep2p_cancel_transfer
 litep2p_config_init
 litep2p_connect
+litep2p_contacts_build
+litep2p_contacts_parse
 litep2p_decline_file_transfer
 litep2p_decline_voice_call
 litep2p_delivery_policy_clamp
@@ -20,6 +22,7 @@ litep2p_invite_peer
 litep2p_lookup_peer
 litep2p_nos_cancel
 litep2p_nos_diagnostics
+litep2p_nos_platform_signal
 litep2p_nos_register_namespace
 litep2p_nos_send
 litep2p_nos_set_delivery_event_cb
@@ -33,6 +36,8 @@ litep2p_peer_get_connection_path
 litep2p_peer_is_connected
 litep2p_pending_send_count
 litep2p_ping
+litep2p_push_payload
+litep2p_push_token_update
 litep2p_register_alias
 litep2p_register_peer_key
 litep2p_reliable_cancel
